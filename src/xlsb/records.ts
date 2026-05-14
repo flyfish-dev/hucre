@@ -22,6 +22,13 @@ export const BRT_FMLA_STRING = 0x0008
 export const BRT_FMLA_NUM = 0x0009
 export const BRT_FMLA_BOOL = 0x000a
 export const BRT_FMLA_ERROR = 0x000b
+export const BRT_SHORT_BLANK = 0x000c
+export const BRT_SHORT_RK = 0x000d
+export const BRT_SHORT_ERROR = 0x000e
+export const BRT_SHORT_BOOL = 0x000f
+export const BRT_SHORT_REAL = 0x0010
+export const BRT_SHORT_ST = 0x0011
+export const BRT_SHORT_ISST = 0x0012
 export const BRT_SST_ITEM = 0x0013
 export const BRT_MERGE_CELL = 0x00b0
 export const BRT_WS_DIM = 0x0094
@@ -127,6 +134,18 @@ export function readCellHeader(data: Uint8Array): { col: number; style: number; 
   const col = u32(data, 0)
   const style = (data[4] ?? 0) | ((data[5] ?? 0) << 8) | ((data[6] ?? 0) << 16)
   return { col, style, offset: 8 }
+}
+
+/**
+ * Short XLSB cell records carry the current BrtRowHdr row and a compact
+ * column/value payload without an explicit cell XF. Treat them as style 0
+ * while preserving the cached value. This covers the BrtShort* family in
+ * MS-XLSB and is harmless for regular BrtCell* records, which continue to
+ * use {@link readCellHeader}.
+ */
+export function readShortCellHeader(data: Uint8Array): { col: number; style: number; offset: number } | null {
+  if (data.length < 4) return null
+  return { col: u32(data, 0), style: 0, offset: 4 }
 }
 
 export function decodeRk(raw: number): number {

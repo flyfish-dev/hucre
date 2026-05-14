@@ -24,6 +24,7 @@ const BIFF_FILEPASS = 0x002f
 const BIFF_DIMENSIONS = 0x0200
 const BIFF_NUMBER = 0x0203
 const BIFF_LABEL = 0x0204
+const BIFF_RSTRING = 0x00d6
 const BIFF_BOOLERR = 0x0205
 const BIFF_FORMULA = 0x0006
 const BIFF_STRING = 0x0207
@@ -756,7 +757,8 @@ function parseWorksheet(stream: Uint8Array, sheetInfo: BiffSheetInfo, globals: P
         setCell(sheet, row, col, globals.sharedStrings[idx] ?? "", "string", xf, globals, readStyles)
         break
       }
-      case BIFF_LABEL: {
+      case BIFF_LABEL:
+      case BIFF_RSTRING: {
         if (record.data.length < 8) break
         const row = u16(record.data, 0)
         const col = u16(record.data, 2)

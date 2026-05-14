@@ -26,6 +26,13 @@ import {
   BRT_FMLA_ERROR,
   BRT_FMLA_NUM,
   BRT_FMLA_STRING,
+  BRT_SHORT_BLANK,
+  BRT_SHORT_BOOL,
+  BRT_SHORT_ERROR,
+  BRT_SHORT_ISST,
+  BRT_SHORT_REAL,
+  BRT_SHORT_RK,
+  BRT_SHORT_ST,
   BRT_BEGIN_CELL_XFS,
   BRT_END_CELL_XFS,
   BRT_FMT,
@@ -39,6 +46,7 @@ import {
   decodeRk,
   f64,
   readCellHeader,
+  readShortCellHeader,
   readXlsbRecords,
   readXlsbWideString,
   u16,
@@ -354,6 +362,50 @@ function parseWorksheetBin(
       }
       case BRT_CELL_ST: {
         const h = readCellHeader(record.data)
+        if (!h) break
+        const text = readXlsbWideString(record.data, h.offset).value
+        setCell(rows, cells, currentRow, h.col, text, "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_BLANK: {
+        const h = readShortCellHeader(record.data)
+        if (!h) break
+        setBlank(rows, cells, currentRow, h.col, h.style, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_RK: {
+        const h = readShortCellHeader(record.data)
+        if (!h || record.data.length < h.offset + 4) break
+        setCell(rows, cells, currentRow, h.col, decodeRk(u32(record.data, h.offset)), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_REAL: {
+        const h = readShortCellHeader(record.data)
+        if (!h || record.data.length < h.offset + 8) break
+        setCell(rows, cells, currentRow, h.col, f64(record.data, h.offset), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_BOOL: {
+        const h = readShortCellHeader(record.data)
+        if (!h || record.data.length <= h.offset) break
+        setCell(rows, cells, currentRow, h.col, record.data[h.offset] === 1, "boolean", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_ERROR: {
+        const h = readShortCellHeader(record.data)
+        if (!h || record.data.length <= h.offset) break
+        setCell(rows, cells, currentRow, h.col, decodeError(record.data[h.offset] ?? 0), "error", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_ISST: {
+        const h = readShortCellHeader(record.data)
+        if (!h || record.data.length < h.offset + 4) break
+        const idx = u32(record.data, h.offset)
+        setCell(rows, cells, currentRow, h.col, sharedStrings[idx] ?? "", "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        break
+      }
+      case BRT_SHORT_ST: {
+        const h = readShortCellHeader(record.data)
         if (!h) break
         const text = readXlsbWideString(record.data, h.offset).value
         setCell(rows, cells, currentRow, h.col, text, "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
