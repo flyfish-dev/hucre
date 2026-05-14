@@ -907,10 +907,8 @@ function parseTwoCellAnchor(
   altText?: string
   title?: string
 } | null {
-  let fromRow = 0
-  let fromCol = 0
-  let toRow = 0
-  let toCol = 0
+  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
+  let to: NonNullable<SheetImage["anchor"]["to"]> = { row: 0, col: 0 }
   let embedId: string | undefined
   let altText: string | undefined
   let title: string | undefined
@@ -926,13 +924,9 @@ function parseTwoCellAnchor(
     const local = c.local || c.tag
 
     if (local === "from") {
-      const pos = parseAnchorPosition(c)
-      fromRow = pos.row
-      fromCol = pos.col
+      from = parseAnchorPosition(c)
     } else if (local === "to") {
-      const pos = parseAnchorPosition(c)
-      toRow = pos.row
-      toCol = pos.col
+      to = parseAnchorPosition(c)
     } else if (local === "pic") {
       embedId = findBlipEmbed(c)
       const meta = findCNvPrMeta(c, "nvPicPr")
@@ -960,8 +954,8 @@ function parseTwoCellAnchor(
     mediaPath,
     type: imageType,
     anchor: {
-      from: { row: fromRow, col: fromCol },
-      to: { row: toRow, col: toCol },
+      from,
+      to,
     },
   }
   if (altText) result.altText = altText
@@ -971,10 +965,8 @@ function parseTwoCellAnchor(
 
 /** Parse a twoCellAnchor element that contains a textbox shape (sp with txBox="1") */
 function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextBox | null {
-  let fromRow = 0
-  let fromCol = 0
-  let toRow = 0
-  let toCol = 0
+  let from: SheetTextBox["anchor"]["from"] = { row: 0, col: 0 }
+  let to: NonNullable<SheetTextBox["anchor"]["to"]> = { row: 0, col: 0 }
   let spElement: any = null
 
   for (const child of el.children) {
@@ -988,13 +980,9 @@ function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextB
     const local = c.local || c.tag
 
     if (local === "from") {
-      const pos = parseAnchorPosition(c)
-      fromRow = pos.row
-      fromCol = pos.col
+      from = parseAnchorPosition(c)
     } else if (local === "to") {
-      const pos = parseAnchorPosition(c)
-      toRow = pos.row
-      toCol = pos.col
+      to = parseAnchorPosition(c)
     } else if (local === "sp") {
       // Check if this is a textbox shape
       const nvSpPr = findChildEl(c, "nvSpPr")
@@ -1063,8 +1051,8 @@ function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextB
   const tb: SheetTextBox = {
     text,
     anchor: {
-      from: { row: fromRow, col: fromCol },
-      to: { row: toRow, col: toCol },
+      from,
+      to,
     },
   }
 
@@ -1186,8 +1174,7 @@ function parseOneCellAnchor(
   altText?: string
   title?: string
 } | null {
-  let fromRow = 0
-  let fromCol = 0
+  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
   let widthEmu = 0
   let heightEmu = 0
   let embedId: string | undefined
@@ -1205,9 +1192,7 @@ function parseOneCellAnchor(
     const local = c.local || c.tag
 
     if (local === "from") {
-      const pos = parseAnchorPosition(c)
-      fromRow = pos.row
-      fromCol = pos.col
+      from = parseAnchorPosition(c)
     } else if (local === "ext") {
       // <xdr:ext cx="..." cy="..."/>
       widthEmu = Number(c.attrs["cx"]) || 0
@@ -1240,7 +1225,7 @@ function parseOneCellAnchor(
     mediaPath,
     type: imageType,
     anchor: {
-      from: { row: fromRow, col: fromCol },
+      from,
     },
   }
 
@@ -1277,9 +1262,13 @@ function findCNvPrMeta(
 }
 
 /** Parse row/col from an anchor position element (from or to) */
-function parseAnchorPosition(el: { children: Array<unknown> }): { row: number; col: number } {
+function parseAnchorPosition(el: {
+  children: Array<unknown>
+}): { row: number; col: number; rowOff?: number; colOff?: number } {
   let row = 0
   let col = 0
+  let rowOff: number | undefined
+  let colOff: number | undefined
 
   for (const child of el.children) {
     if (typeof child === "string") continue
@@ -1291,10 +1280,16 @@ function parseAnchorPosition(el: { children: Array<unknown> }): { row: number; c
       row = Number(text) || 0
     } else if (local === "col") {
       col = Number(text) || 0
+    } else if (local === "rowOff") {
+      const n = Number(text)
+      if (Number.isFinite(n)) rowOff = n
+    } else if (local === "colOff") {
+      const n = Number(text)
+      if (Number.isFinite(n)) colOff = n
     }
   }
 
-  return { row, col }
+  return { row, col, ...(rowOff !== undefined ? { rowOff } : {}), ...(colOff !== undefined ? { colOff } : {}) }
 }
 
 /** Find the r:embed attribute on the blip element inside a pic element */

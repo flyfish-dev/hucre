@@ -449,8 +449,8 @@ export interface Sparkline {
 export interface SheetTextBox {
   text: string
   anchor: {
-    from: { row: number; col: number }
-    to?: { row: number; col: number }
+    from: { row: number; col: number; rowOff?: number; colOff?: number }
+    to?: { row: number; col: number; rowOff?: number; colOff?: number }
   }
   width?: number
   height?: number
@@ -525,8 +525,8 @@ export interface SheetImage {
   type: "png" | "jpeg" | "gif" | "svg" | "webp"
   /** Anchor to cell */
   anchor: {
-    from: { row: number; col: number }
-    to?: { row: number; col: number }
+    from: { row: number; col: number; rowOff?: number; colOff?: number }
+    to?: { row: number; col: number; rowOff?: number; colOff?: number }
   }
   width?: number
   height?: number

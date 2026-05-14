@@ -5966,9 +5966,9 @@ export interface ChartDataLabelsInfo {
  */
 export interface ChartAnchor {
   /** Top-left cell (`<xdr:from>`). */
-  from: { row: number; col: number }
+  from: { row: number; col: number; rowOff?: number; colOff?: number }
   /** Bottom-right cell (`<xdr:to>`). Omitted for one-cell anchors. */
-  to?: { row: number; col: number }
+  to?: { row: number; col: number; rowOff?: number; colOff?: number }
 }
 
 /**
