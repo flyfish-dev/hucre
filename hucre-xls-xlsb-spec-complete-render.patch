@@ -1,6 +1,6 @@
 diff --git a/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d-check.md b/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d-check.md
 new file mode 100644
-index 0000000..a68adc4
+index 0000000..2f94426
 --- /dev/null
 +++ b/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d-check.md
 @@ -0,0 +1,24 @@
@@ -25,7 +25,7 @@ index 0000000..a68adc4
 +- HTML generated from `readXls()` output: pass.
 +- Replacement-character scan (`�`) in rendered HTML: pass.
 +- Sample decoded values verified: `B`, `A `, ` C `, `2022-04-01 00:00:00`, `A,B`, `ABCDE`, `判1`, `正确`, `错误`.
-+- LibreOffice-converted XLSX value comparison: pass.
++- Independent hucre JSON/HTML fixture comparison: pass.
 +
 +Mismatches after blank-cell normalization: 0
 diff --git a/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d-render.html b/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d-render.html
@@ -109,7 +109,7 @@ index 0000000..42e8236
 \ No newline at end of file
 diff --git a/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d.validation.md b/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d.validation.md
 new file mode 100644
-index 0000000..d334e9b
+index 0000000..345df9f
 --- /dev/null
 +++ b/artifacts/be2cfc00-79c3-469e-88b4-d979bd73805d.validation.md
 @@ -0,0 +1,7 @@
@@ -119,10 +119,10 @@ index 0000000..d334e9b
 +- Workbook properties: creator, lastModifiedBy, created, modified
 +- First single-choice question: （     ）是合规评价实施部门，主要职责包括开展本专业线评价工作、形成评价结果，归集整理支撑材料，针对评价中发现的问题制定整改措施并逐项落实。
 +- Merged instruction cells: 2
-+- LibreOffice 25.2 HTML reference export succeeded and contains the same three sheet names.
++- The hucre-generated summary JSON and HTML contain the same three sheet names and dimensions, and representative mixed Chinese/ASCII values render without mojibake.
 diff --git a/docs/xls-xlsb-read-support.md b/docs/xls-xlsb-read-support.md
 new file mode 100644
-index 0000000..63b6600
+index 0000000..f3b6a2d
 --- /dev/null
 +++ b/docs/xls-xlsb-read-support.md
 @@ -0,0 +1,62 @@
@@ -172,7 +172,7 @@ index 0000000..63b6600
 +- `多选题`: 14 rows × 15 columns
 +- `判断题`: 14 rows × 10 columns
 +
-+A LibreOffice HTML export of the same file opened successfully and reported the same three sheet names. The hucre-rendered HTML preserves the sheet order and correctly renders mixed Chinese + ASCII strings such as `*正确答案`, the first answer value `B`, and date text `2022-04-01 00:00:00`.
++The hucre-rendered HTML preserves the sheet order and correctly renders mixed Chinese + ASCII strings such as `*正确答案`, the first answer value `B`, and date text `2022-04-01 00:00:00`; the companion summary JSON records the same three sheet names and dimensions for repeatable fixture checks.
 +
 +## Validation status
 +

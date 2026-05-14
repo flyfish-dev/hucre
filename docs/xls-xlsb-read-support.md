@@ -44,7 +44,7 @@ Observed sheet summary:
 - `多选题`: 14 rows × 15 columns
 - `判断题`: 14 rows × 10 columns
 
-A LibreOffice HTML export of the same file opened successfully and reported the same three sheet names. The hucre-rendered HTML preserves the sheet order and correctly renders mixed Chinese + ASCII strings such as `*正确答案`, the first answer value `B`, and date text `2022-04-01 00:00:00`.
+The hucre-rendered HTML preserves the sheet order and correctly renders mixed Chinese + ASCII strings such as `*正确答案`, the first answer value `B`, and date text `2022-04-01 00:00:00`; the companion summary JSON records the same three sheet names and dimensions for repeatable fixture checks.
 
 ## Validation status
 
