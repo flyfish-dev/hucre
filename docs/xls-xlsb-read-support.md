@@ -13,7 +13,7 @@ This branch adds zero-dependency readers for legacy BIFF `.xls` workbooks and BI
 - CFB/OLE2 FAT, DIFAT, MiniFAT, directory, root mini-stream extraction, and case-insensitive stream lookup.
 - BIFF workbook globals, sheet metadata, SST with `Continue` records, code pages, 1900/1904 date system, custom formats, and XF number-format mapping.
 - Correct BIFF8 compressed-Unicode handling: `fHighByte=0` decodes as low-byte UTF-16 code units, not as the workbook `CodePage`; this prevents ASCII/date strings from corrupting when `CodePage=1200`.
-- BIFF5/BIFF8 sheet-name and label string handling.
+- BIFF5/BIFF8 sheet-name, LABEL, and RSTRING rich-text-label value handling.
 - Numeric, RK, MulRK, string, bool/error, blank, formula cached values, formula token decompilation, merged cells, row metadata, and column metadata.
 - Defined names / built-in names, local extern-sheet references, and basic HLINK hyperlink extraction.
 - OLE Property Set document metadata from `\u0005SummaryInformation` and `\u0005DocumentSummaryInformation` streams.
@@ -23,7 +23,7 @@ This branch adds zero-dependency readers for legacy BIFF `.xls` workbooks and BI
 
 - OPC package and relationship traversal.
 - Binary workbook sheet metadata and 1904 date-system flag.
-- Binary shared strings and worksheet cell values.
+- Binary shared strings, full cell records, and compact BrtShort* worksheet cell records.
 - Binary formula cached values with formula-token decompilation from the formula payload tail.
 - Binary styles parsing for custom number formats and CellXfs, including date conversion.
 - Merged cells and basic binary hyperlink extraction.
