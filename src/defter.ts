@@ -21,6 +21,7 @@ import { readOds } from "./ods/reader"
 import { writeOds } from "./ods/writer"
 import { UnsupportedFormatError } from "./errors"
 import { isOle2Container, readInputToUint8Array } from "./_input"
+import { decryptOfficeEncryptedPackage, isOfficeEncryptedPackage } from "./crypto/office-crypto"
 import { ZipReader } from "./zip/reader"
 
 // ── Format Detection ────────────────────────────────────────────────
@@ -83,10 +84,21 @@ async function detectZipFormat(data: Uint8Array): Promise<"xlsx" | "xlsb" | "ods
  * Read any supported spreadsheet file. Auto-detects XLS, XLSX, XLSB, and ODS.
  * CSV uses parseCsv separately since it is string input.
  */
-export async function read(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
-  const data = await readInputToUint8Array(input)
+export async function read(
+  input: ReadInput,
+  options?: ReadOptions & { password?: string },
+): Promise<Workbook> {
+  let data = await readInputToUint8Array(input)
 
-  if (isOle2Container(data) || isRawBiff(data)) {
+  if (isOle2Container(data)) {
+    if (isOfficeEncryptedPackage(data)) {
+      data = await decryptOfficeEncryptedPackage(data, options?.password)
+    } else {
+      return readXls(data, options)
+    }
+  }
+
+  if (isRawBiff(data)) {
     return readXls(data, options)
   }
 
@@ -106,7 +118,7 @@ export async function write(options: WriteOptions & { format?: "xlsx" | "ods" })
 /** Quick helper: read a file and get the first sheet as array of objects. */
 export async function readObjects<T extends Record<string, CellValue> = Record<string, CellValue>>(
   input: ReadInput,
-  options?: ReadOptions,
+  options?: ReadOptions & { password?: string },
 ): Promise<T[]> {
   const workbook = await read(input, options)
   if (workbook.sheets.length === 0) return []

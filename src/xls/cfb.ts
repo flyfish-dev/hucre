@@ -143,7 +143,7 @@ export class CfbReader {
     if (!entry) return undefined
     if (entry.size === 0) return new Uint8Array(0)
 
-    if (entry.size < this.miniStreamCutoff && entry.startSector !== END_OF_CHAIN) {
+    if (entry.size < this.miniStreamCutoff && this.miniFat.length > 0 && entry.startSector !== END_OF_CHAIN) {
       return this.readMiniChain(entry.startSector, entry.size)
     }
     return this.readRegularChain(entry.startSector, entry.size)

@@ -5,8 +5,9 @@
 // direct readXls() accepts those too.
 
 import type { Workbook, ReadInput, ReadOptions } from "../_types"
-import { EncryptedFileError, ParseError } from "../errors"
+import { ParseError } from "../errors"
 import { readInputToUint8Array } from "../_input"
+import { decryptOfficeEncryptedPackage, isOfficeEncryptedPackage } from "../crypto/office-crypto"
 import { parseBiffWorkbook } from "./biff"
 import { CfbReader } from "./cfb"
 import { parseXlsProperties } from "./properties"
@@ -41,7 +42,10 @@ function isRawBiff(data: Uint8Array): boolean {
  * older exports. Password-protected workbooks are detected through FilePass
  * / encrypted-package markers and surfaced as {@link EncryptedFileError}.
  */
-export async function readXls(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
+export async function readXls(
+  input: ReadInput,
+  options?: ReadOptions & { password?: string },
+): Promise<Workbook> {
   const data = await readInputToUint8Array(input)
 
   if (!isCfb(data)) {
@@ -49,11 +53,14 @@ export async function readXls(input: ReadInput, options?: ReadOptions): Promise<
     throw new ParseError("Invalid XLS: missing OLE2/CFB header or BIFF BOF record")
   }
 
-  const cfb = new CfbReader(data)
-
-  if (cfb.hasStream("EncryptedPackage") || cfb.hasStream("EncryptionInfo")) {
-    throw new EncryptedFileError("xls")
+  if (isOfficeEncryptedPackage(data)) {
+    const decrypted = await decryptOfficeEncryptedPackage(data, options?.password, "xls")
+    if (isRawBiff(decrypted)) return parseBiffWorkbook(decrypted, options)
+    if (isCfb(decrypted)) return readXls(decrypted, options)
+    throw new ParseError("Encrypted package decrypted successfully, but it does not contain a legacy XLS BIFF workbook")
   }
+
+  const cfb = new CfbReader(data)
 
   const workbookStream = cfb.getStream("Workbook") ?? cfb.getStream("Book")
   if (!workbookStream) {

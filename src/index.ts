@@ -27,5 +27,15 @@ export { readXls } from "./xls/reader"
 // ── XLSB ────────────────────────────────────────────────────────────
 export { readXlsb } from "./xlsb/reader"
 
+
+// ── Office encryption helpers ──────────────────────────────────────
+export {
+  decryptOfficeEncryptedPackage,
+  encryptOfficeAgilePackage,
+  encryptOfficeAgilePackageParts,
+  isOfficeEncryptedPackage,
+} from "./crypto/office-crypto"
+export type { AgileEncryptionOptions, EncryptedOfficePackageParts, OfficeCryptoOptions } from "./crypto/office-crypto"
+
 // ── ODS ────────────────────────────────────────────────────────────
 export { readOds } from "./ods/reader"

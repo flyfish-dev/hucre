@@ -4,10 +4,11 @@
 // binary parts instead of XML parts.
 
 import type { Cell, CellType, CellValue, MergeRange, ReadInput, ReadOptions, Sheet, Workbook } from "../_types"
-import { EncryptedFileError, ParseError, ZipError } from "../errors"
+import { ParseError, ZipError } from "../errors"
 import { isDateFormat, serialToDate } from "../_date"
 import { decodeBiffFormula } from "../xls/formula"
 import { isOle2Container, readInputToUint8Array } from "../_input"
+import { decryptOfficeEncryptedPackage } from "../crypto/office-crypto"
 import { ZipReader } from "../zip/reader"
 import { parseContentTypes } from "../xlsx/content-types"
 import { parseRelationships } from "../xlsx/relationships"
@@ -105,10 +106,14 @@ interface ParsedXlsbHLink {
 }
 
 /** Read an Excel Binary Workbook (.xlsb) and return a Workbook. */
-export async function readXlsb(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
+export async function readXlsb(
+  input: ReadInput,
+  options?: ReadOptions & { password?: string },
+): Promise<Workbook> {
   const data = await readInputToUint8Array(input)
   if (isOle2Container(data)) {
-    throw new EncryptedFileError("xlsb")
+    const decrypted = await decryptOfficeEncryptedPackage(data, options?.password, "xlsb")
+    return readXlsb(decrypted, options)
   }
 
   let zip: ZipReader

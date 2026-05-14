@@ -47,5 +47,6 @@ The HTML render preserves Chinese text, line breaks, blank cells, correct-answer
 
 ## Remaining guardrails
 
-- Password-protected/encrypted XLS/XLSB files are detected and surfaced as `EncryptedFileError`; decryption is intentionally not performed by the zero-dependency reader.
+- Agile AES encrypted OOXML packages used by encrypted XLSB/XLSX/XLSM files are decrypted when callers pass `{ password }`; incorrect or missing passwords surface as `EncryptedFileError`.
+- Legacy BIFF `FilePass` encryption inside old XLS streams is still detected and rejected until fixture-backed XOR/RC4 record decryption is implemented.
 - Chart/drawing/pivot/comment authoring is outside the core read-value path. Existing XLSX round-trip preservation remains separate from these XLS/XLSB binary readers.
