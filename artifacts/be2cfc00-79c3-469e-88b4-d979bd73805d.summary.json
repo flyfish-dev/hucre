@@ -1,0 +1,31 @@
+{
+  "sheets": [
+    {
+      "name": "单选题",
+      "rows": 11,
+      "cols": 6,
+      "merges": 0,
+      "nonEmptyRows": 11
+    },
+    {
+      "name": "多选题",
+      "rows": 14,
+      "cols": 15,
+      "merges": 1,
+      "nonEmptyRows": 14
+    },
+    {
+      "name": "判断题",
+      "rows": 14,
+      "cols": 10,
+      "merges": 1,
+      "nonEmptyRows": 14
+    }
+  ],
+  "properties": {
+    "creator": "DingTalk",
+    "lastModifiedBy": "DingTalk",
+    "created": "2006-09-16T00:00:00.000Z",
+    "modified": "2025-10-21T15:23:14.000Z"
+  }
+}

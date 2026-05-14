@@ -1,8 +1,7 @@
 // ── Ergonomic API ───────────────────────────────────────────────────
-// Unified high-level functions that wrap the format-specific readers/writers.
-// Auto-detects format from content (magic bytes) for reading, and dispatches
-// to the correct writer based on the `format` option for writing.
-// ─────────────────────────────────────────────────────────────────────
+// Unified high-level functions that wrap format-specific readers/writers.
+// Auto-detects format from content (magic bytes / package metadata) for
+// reading, and dispatches to the correct writer based on the format option.
 
 import type {
   Workbook,
@@ -14,137 +13,122 @@ import type {
   TableDefinition,
   TableColumn,
 } from "./_types"
+import { readXls } from "./xls/reader"
 import { readXlsx } from "./xlsx/reader"
+import { readXlsb } from "./xlsb/reader"
 import { writeXlsx } from "./xlsx/writer"
 import { readOds } from "./ods/reader"
 import { writeOds } from "./ods/writer"
-import { EncryptedFileError, UnsupportedFormatError } from "./errors"
+import { UnsupportedFormatError } from "./errors"
 import { isOle2Container, readInputToUint8Array } from "./_input"
+import { decryptOfficeEncryptedPackage, isOfficeEncryptedPackage } from "./crypto/office-crypto"
+import { ZipReader } from "./zip/reader"
 
 // ── Format Detection ────────────────────────────────────────────────
 
+function isZip(data: Uint8Array): boolean {
+  return data.length >= 4 && data[0] === 0x50 && data[1] === 0x4b
+}
+
+function u16(data: Uint8Array, offset: number): number {
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(offset, true)
+}
+
+function isRawBiff(data: Uint8Array): boolean {
+  if (data.length < 4) return false
+  const sid = u16(data, 0)
+  return sid === 0x0809 || sid === 0x0009 || sid === 0x0209 || sid === 0x0409
+}
+
 /**
- * Detect whether a ZIP archive is XLSX or ODS by inspecting the first
- * local file entry. ODS archives store "mimetype" as the first file
- * with content "application/vnd.oasis.opendocument.spreadsheet".
- * XLSX archives are also ZIP but never have "mimetype" as the first entry.
+ * Detect whether a ZIP archive is XLSX, XLSB, or ODS by inspecting the
+ * package metadata rather than the extension.
  */
-function detectFormat(data: Uint8Array): "xlsx" | "ods" {
-  // Both XLSX and ODS start with PK (ZIP magic: 0x504B0304)
-  if (data.length < 4 || data[0] !== 0x50 || data[1] !== 0x4b) {
+async function detectZipFormat(data: Uint8Array): Promise<"xlsx" | "xlsb" | "ods"> {
+  if (!isZip(data)) {
     throw new UnsupportedFormatError("unknown (not a ZIP archive)")
   }
 
-  // Read the first local file header to get the filename
-  // Local file header: offset 26 = filename length (2 bytes LE), offset 30+ = filename
   if (data.length < 30) {
     throw new UnsupportedFormatError("unknown (ZIP too short)")
   }
 
-  const filenameLen = data[26]! | (data[27]! << 8)
-  if (data.length < 30 + filenameLen) {
-    throw new UnsupportedFormatError("unknown (ZIP truncated)")
-  }
-
   const decoder = new TextDecoder("utf-8")
-  const firstName = decoder.decode(data.subarray(30, 30 + filenameLen))
-
-  if (firstName === "mimetype") {
-    // Read the extra field length to find where file data starts
-    const extraLen = data[28]! | (data[29]! << 8)
-    const dataOffset = 30 + filenameLen + extraLen
-
-    // Read the uncompressed size from the local header (offset 22, 4 bytes LE)
-    const uncompSize = data[22]! | (data[23]! << 8) | (data[24]! << 16) | (data[25]! << 24)
-
-    if (uncompSize > 0 && data.length >= dataOffset + uncompSize) {
-      const mimeContent = decoder.decode(data.subarray(dataOffset, dataOffset + uncompSize))
-      if (mimeContent.trim() === "application/vnd.oasis.opendocument.spreadsheet") {
-        return "ods"
+  const filenameLen = data[26]! | (data[27]! << 8)
+  if (data.length >= 30 + filenameLen) {
+    const firstName = decoder.decode(data.subarray(30, 30 + filenameLen))
+    if (firstName === "mimetype") {
+      const extraLen = data[28]! | (data[29]! << 8)
+      const dataOffset = 30 + filenameLen + extraLen
+      const uncompSize = data[22]! | (data[23]! << 8) | (data[24]! << 16) | (data[25]! << 24)
+      if (uncompSize > 0 && data.length >= dataOffset + uncompSize) {
+        const mimeContent = decoder.decode(data.subarray(dataOffset, dataOffset + uncompSize))
+        if (mimeContent.trim() === "application/vnd.oasis.opendocument.spreadsheet") return "ods"
       }
+      return "ods"
     }
-
-    // Even if we couldn't read the content, "mimetype" as first entry is ODS convention
-    return "ods"
   }
 
-  // Default: assume XLSX for any other ZIP
+  const zip = new ZipReader(data)
+  if (zip.has("[Content_Types].xml")) {
+    const contentTypes = decoder.decode(await zip.extract("[Content_Types].xml"))
+    if (/application\/vnd\.ms-excel\.sheet\.binary/i.test(contentTypes)) return "xlsb"
+  }
+
   return "xlsx"
 }
 
 // ── Public API ──────────────────────────────────────────────────────
 
 /**
- * Read any supported spreadsheet file. Auto-detects format from content.
- * Supports: XLSX, ODS (CSV uses parseCsv separately since it's string input).
- *
- * Input can be Uint8Array, ArrayBuffer, or ReadableStream&lt;Uint8Array&gt;.
- * ReadableStream input is buffered fully before format detection runs.
+ * Read any supported spreadsheet file. Auto-detects XLS, XLSX, XLSB, and ODS.
+ * CSV uses parseCsv separately since it is string input.
  */
-export async function read(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
-  const data = await readInputToUint8Array(input)
+export async function read(
+  input: ReadInput,
+  options?: ReadOptions & { password?: string },
+): Promise<Workbook> {
+  let data = await readInputToUint8Array(input)
 
-  // Surface password-protected workbooks (OLE2/CFB envelope) before
-  // `detectFormat` rejects them as "not a ZIP archive". The container
-  // alone doesn't tell us whether the encrypted package inside is XLSX
-  // or ODS, so we leave `format` unset on the error. Decryption is
-  // tracked in #156.
   if (isOle2Container(data)) {
-    throw new EncryptedFileError()
+    if (isOfficeEncryptedPackage(data)) {
+      data = await decryptOfficeEncryptedPackage(data, options?.password)
+    } else {
+      return readXls(data, options)
+    }
   }
 
-  const format = detectFormat(data)
-
-  if (format === "ods") {
-    return readOds(data, options)
+  if (isRawBiff(data)) {
+    return readXls(data, options)
   }
+
+  const format = await detectZipFormat(data)
+  if (format === "ods") return readOds(data, options)
+  if (format === "xlsb") return readXlsb(data, options)
   return readXlsx(data, options)
 }
 
-/**
- * Write a workbook to the specified format.
- */
-export async function write(
-  options: WriteOptions & { format?: "xlsx" | "ods" },
-): Promise<WriteOutput> {
+/** Write a workbook to the specified format. */
+export async function write(options: WriteOptions & { format?: "xlsx" | "ods" }): Promise<WriteOutput> {
   const format = options.format ?? "xlsx"
-  if (format === "ods") {
-    return writeOds(options)
-  }
+  if (format === "ods") return writeOds(options)
   return writeXlsx(options)
 }
 
-/**
- * Quick helper: read a file and get the first sheet as array of objects.
- * Assumes first row is headers.
- */
+/** Quick helper: read a file and get the first sheet as array of objects. */
 export async function readObjects<T extends Record<string, CellValue> = Record<string, CellValue>>(
   input: ReadInput,
-  options?: ReadOptions,
+  options?: ReadOptions & { password?: string },
 ): Promise<T[]> {
   const workbook = await read(input, options)
-
-  if (workbook.sheets.length === 0) {
-    return []
-  }
+  if (workbook.sheets.length === 0) return []
 
   const sheet = workbook.sheets[0]!
   const rows = sheet.rows
+  if (rows.length === 0) return []
 
-  if (rows.length === 0) {
-    return []
-  }
-
-  // First row is headers
-  const headerRow = rows[0]!
-  const headers = headerRow.map((h) => {
-    if (h === null || h === undefined) return ""
-    return String(h).trim()
-  })
-
-  if (headers.length === 0) {
-    return []
-  }
+  const headers = rows[0]!.map((h) => (h === null || h === undefined ? "" : String(h).trim()))
+  if (headers.length === 0) return []
 
   const data: T[] = []
   for (let i = 1; i < rows.length; i++) {
@@ -161,35 +145,22 @@ export async function readObjects<T extends Record<string, CellValue> = Record<s
   return data
 }
 
-/** Options for writeObjects table generation */
+/** Options for writeObjects table generation. */
 export interface WriteObjectsTableOption {
-  /** Table name (must be unique in workbook) */
   name: string
-  /** Table style (e.g. "TableStyleMedium2") */
   style?: string
-  /** Show totals row */
   showTotalRow?: boolean
-  /** Show auto-filter. Default: true */
   showAutoFilter?: boolean
-  /** Show banded rows. Default: true */
   showRowStripes?: boolean
-  /** Totals per column key: { revenue: "sum", margin: "average" } */
-  totals?: Record<
-    string,
-    "sum" | "average" | "count" | "min" | "max" | "countNums" | "stdDev" | "var"
-  >
+  totals?: Record<string, "sum" | "average" | "count" | "min" | "max" | "countNums" | "stdDev" | "var">
 }
 
-/**
- * Quick helper: write an array of objects to a spreadsheet format.
- * Infers column headers from the keys of the first object.
- */
+/** Write an array of objects to a spreadsheet format. */
 export async function writeObjects(
   data: Array<Record<string, CellValue>>,
   options?: {
     sheetName?: string
     format?: "xlsx" | "ods"
-    /** Wrap output in a native Excel table (ListObject) */
     table?: WriteObjectsTableOption
   },
 ): Promise<WriteOutput> {
@@ -197,47 +168,26 @@ export async function writeObjects(
   const format = options?.format ?? "xlsx"
 
   if (data.length === 0) {
-    return write({
-      sheets: [{ name: sheetName, rows: [] }],
-      format,
-    })
+    return write({ sheets: [{ name: sheetName, rows: [] }], format })
   }
 
-  // Infer columns from first object's keys
   const keys = Object.keys(data[0]!)
-
-  // Build rows: header row + data rows
-  const rows: CellValue[][] = []
-
-  // Header row
-  rows.push(keys)
-
-  // Data rows
+  const rows: CellValue[][] = [keys]
   for (const item of data) {
-    const row: CellValue[] = keys.map((key) => {
-      const val = item[key]
-      return val === undefined ? null : val
-    })
-    rows.push(row)
+    rows.push(keys.map((key) => (item[key] === undefined ? null : item[key]!)))
   }
 
-  // Build Excel table if requested
   let tables: TableDefinition[] | undefined
   if (options?.table) {
     const t = options.table
     const colCount = keys.length
-    const rowCount = data.length + 1 // +1 for header
+    const rowCount = data.length + 1
     const endCol = colToLetterSimple(colCount - 1)
     const range = `A1:${endCol}${rowCount + (t.showTotalRow ? 1 : 0)}`
-
-    const tableColumns: TableColumn[] = keys.map((key) => {
-      const totalFn = t.totals?.[key]
-      return {
-        name: key,
-        ...(totalFn ? { totalFunction: totalFn } : {}),
-      }
-    })
-
+    const tableColumns: TableColumn[] = keys.map((key) => ({
+      name: key,
+      ...(t.totals?.[key] ? { totalFunction: t.totals[key] } : {}),
+    }))
     tables = [
       {
         name: t.name,
@@ -252,13 +202,9 @@ export async function writeObjects(
     ]
   }
 
-  return write({
-    sheets: [{ name: sheetName, rows, tables }],
-    format,
-  })
+  return write({ sheets: [{ name: sheetName, rows, tables }], format })
 }
 
-/** Simple column index to letter (0-based) */
 function colToLetterSimple(col: number): string {
   let result = ""
   let n = col

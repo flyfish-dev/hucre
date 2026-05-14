@@ -1,0 +1,7 @@
+{
+  "feature": "MS-OFFCRYPTO Agile AES encrypted OOXML package",
+  "dependency_model": "zero npm dependencies; Web Crypto / node:crypto runtime primitives",
+  "roundtrip_lengths": [22, 4096, 4097],
+  "wrong_password": "EncryptedFileError",
+  "bundle_checkout_validation": "performed after final bundle creation"
+}

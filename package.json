@@ -15,7 +15,9 @@
     "tree-shakeable",
     "typescript",
     "write",
+    "xls",
     "xlsx",
+    "xlsb",
     "zero-dependency"
   ],
   "homepage": "https://github.com/productdevbook/hucre",
@@ -46,6 +48,14 @@
     "./xlsx": {
       "types": "./dist/xlsx.d.mts",
       "default": "./dist/xlsx.mjs"
+    },
+    "./xls": {
+      "types": "./dist/xls.d.mts",
+      "default": "./dist/xls.mjs"
+    },
+    "./xlsb": {
+      "types": "./dist/xlsb.d.mts",
+      "default": "./dist/xlsb.mjs"
     },
     "./csv": {
       "types": "./dist/csv.d.mts",

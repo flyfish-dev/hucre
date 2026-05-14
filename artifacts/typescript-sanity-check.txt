@@ -1,0 +1,10 @@
+TypeScript sanity check passed for:
+- src/xls/filepass.ts
+- src/xls/biff.ts
+- src/xls/reader.ts
+- src/xlsb/reader.ts
+
+Command:
+tsc --noEmit --module esnext --target es2022 --moduleResolution node --skipLibCheck src/xls/filepass.ts src/xls/biff.ts src/xls/reader.ts src/xlsb/reader.ts
+
+The check used local temporary stubs for host hucre modules that are present in the real repository but not included in this standalone bundle snapshot.
