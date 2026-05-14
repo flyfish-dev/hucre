@@ -1,0 +1,13 @@
+git bundle verify /mnt/data/hucre-xls-xlsb-remaining-gaps-verified.bundle
+
+Result:
+- bundle is okay
+- contains HEAD and refs/heads/main
+- records a complete history
+
+git clone /mnt/data/hucre-xls-xlsb-remaining-gaps-verified.bundle /mnt/data/work/bundle-check
+
+Result:
+- clone succeeded
+- checked out branch: main
+- HEAD: 788eaeb chore: refresh remaining-gap verification patch

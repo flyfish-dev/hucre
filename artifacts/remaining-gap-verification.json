@@ -32,12 +32,17 @@
     {
       "item": "XLSB styles/date formats from binary styles.bin",
       "status": "implemented",
-      "details": ["BrtFmt and BrtXF parsing maps cell style indexes to number formats", "date-formatted numeric cells convert to Date"]
+      "details": [
+        "BrtFmt and BrtXF parsing maps cell style indexes to number formats",
+        "date-formatted numeric cells convert to Date"
+      ]
     },
     {
       "item": "XLSB rich shared-string formatting runs",
       "status": "implemented",
-      "details": ["BrtSSTItem run boundaries are surfaced as Cell.richText spans"]
+      "details": [
+        "BrtSSTItem run boundaries are surfaced as Cell.richText spans"
+      ]
     },
     {
       "item": "charts, drawings, comments, tables, pivots, defined names, hyperlinks, document properties for XLS/XLSB parity",
@@ -51,13 +56,15 @@
     {
       "item": "macro/VBA project surfacing or round-trip preservation for .xls / .xlsb",
       "status": "surfaced",
-      "details": ["VBA-related CFB streams and OPC parts are exposed through workbook.vbaProject.parts and binaryParts/packageParts"]
+      "details": [
+        "VBA-related CFB streams and OPC parts are exposed through workbook.vbaProject.parts and binaryParts/packageParts"
+      ]
     }
   ],
   "validation": {
     "typescript_sanity_check": "pass",
     "uploaded_xls_render_artifacts_present": true,
-    "bundle_verify": "performed after final bundle creation",
-    "bundle_clone_checkout": "performed after final bundle creation"
+    "bundle_verify": "pass: bundle records a complete history and contains HEAD + refs/heads/main",
+    "bundle_clone_checkout": "pass: git clone checked out branch main at HEAD 788eaeb"
   }
 }
