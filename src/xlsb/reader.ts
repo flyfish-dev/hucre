@@ -11,6 +11,7 @@ import { isOle2Container, readInputToUint8Array } from "../_input"
 import { ZipReader } from "../zip/reader"
 import { parseContentTypes } from "../xlsx/content-types"
 import { parseRelationships } from "../xlsx/relationships"
+import { parseCoreProperties, parseAppProperties, parseCustomProperties } from "../xlsx/doc-props-reader"
 import type { Relationship } from "../xlsx/relationships"
 import {
   BRT_BUNDLE_SH,
@@ -171,7 +172,26 @@ export async function readXlsb(input: ReadInput, options?: ReadOptions): Promise
     sheets.push(sheet)
   }
 
-  return { sheets, dateSystem: workbookInfo.dateSystem }
+  let properties: import("../_types").WorkbookProperties | undefined
+  if (zip.has("docProps/core.xml")) {
+    const coreProps = parseCoreProperties(decodeUtf8(await zip.extract("docProps/core.xml")))
+    if (Object.keys(coreProps).length > 0) properties = { ...coreProps }
+  }
+  if (zip.has("docProps/app.xml")) {
+    const appProps = parseAppProperties(decodeUtf8(await zip.extract("docProps/app.xml")))
+    if (Object.keys(appProps).length > 0) properties = { ...properties, ...appProps }
+  }
+  if (zip.has("docProps/custom.xml")) {
+    const customProps = parseCustomProperties(decodeUtf8(await zip.extract("docProps/custom.xml")))
+    if (Object.keys(customProps).length > 0) {
+      if (!properties) properties = {}
+      properties.custom = customProps
+    }
+  }
+
+  const workbook: Workbook = { sheets, dateSystem: workbookInfo.dateSystem }
+  if (properties) workbook.properties = properties
+  return workbook
 }
 
 function parseWorkbookBin(data: Uint8Array): XlsbWorkbookInfo {

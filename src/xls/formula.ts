@@ -354,6 +354,13 @@ function decodeUtf16Le(bytes: Uint8Array): string {
   }
 }
 
+
+function decodeCompressedUnicode(bytes: Uint8Array): string {
+  let s = ""
+  for (const b of bytes) s += String.fromCharCode(b)
+  return s
+}
+
 function colToLetter(col: number): string {
   let result = ""
   let n = Math.max(0, col)
@@ -544,7 +551,7 @@ export function decodeBiffFormula(tokens: Uint8Array, ctx: FormulaDecodeContext)
         const bytes = cch * (is16 ? 2 : 1)
         const raw = tokens.subarray(pos, Math.min(pos + bytes, tokens.length))
         pos = skipBytes(pos, bytes, tokens.length)
-        stack.push(escapeString(is16 ? decodeUtf16Le(raw) : new TextDecoder("windows-1252").decode(raw)))
+        stack.push(escapeString(is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw)))
         break
       }
       case 0x19: {

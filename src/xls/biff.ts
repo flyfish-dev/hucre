@@ -113,6 +113,7 @@ function decodeUtf16Le(bytes: Uint8Array): string {
   }
 }
 
+
 function decodeCodePage(bytes: Uint8Array, codePage: number): string {
   const label = codePageToEncoding(codePage)
   try {
@@ -125,6 +126,20 @@ function decodeCodePage(bytes: Uint8Array, codePage: number): string {
     for (const b of bytes) s += String.fromCharCode(b)
     return s
   }
+}
+
+/**
+ * Decode BIFF8 compressed Unicode character payloads. In MS-XLS BIFF8
+ * XLUnicodeString records, fHighByte=0 means each character is stored as the
+ * low byte of a UTF-16 code unit (the high byte is implicitly zero). It is
+ * not encoded with the workbook CodePage record, even when CodePage=1200.
+ * Decoding through TextDecoder("utf-16le") corrupts common ASCII payloads
+ * such as "A", "1", and "2022-04-10" into replacement characters.
+ */
+function decodeCompressedUnicode(bytes: Uint8Array): string {
+  let s = ""
+  for (const b of bytes) s += String.fromCharCode(b)
+  return s
 }
 
 function codePageToEncoding(codePage: number): string {
@@ -195,7 +210,7 @@ function readBiff8UnicodeString(data: Uint8Array, offset: number, codePage: numb
   const byteLen = cch * (is16 ? 2 : 1)
   const raw = data.subarray(pos, Math.min(pos + byteLen, data.length))
   pos += byteLen
-  const value = is16 ? decodeUtf16Le(raw) : decodeCodePage(raw, codePage)
+  const value = is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw)
 
   // Skip rich formatting runs and phonetic data when present.
   pos += richRuns * 4 + extSize
@@ -211,7 +226,7 @@ function readShortBiff8UnicodeString(data: Uint8Array, offset: number, codePage:
   const byteLen = cch * (is16 ? 2 : 1)
   const raw = data.subarray(pos, Math.min(pos + byteLen, data.length))
   return {
-    value: is16 ? decodeUtf16Le(raw) : decodeCodePage(raw, codePage),
+    value: is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw),
     offset: Math.min(pos + byteLen, data.length),
   }
 }
@@ -267,7 +282,7 @@ class SstCursor {
       const raw = chunk.subarray(this.pos, this.pos + byteLen)
       this.pos += byteLen
       remainingChars -= takeChars
-      out += is16 ? decodeUtf16Le(raw) : decodeCodePage(raw, codePage)
+      out += is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw)
 
       if (takeChars === 0) this.nextChunk()
     }
@@ -363,7 +378,7 @@ function readBiff8NameText(data: Uint8Array, offset: number, cch: number, codePa
   const start = offset + 1
   const byteLen = cch * (is16 ? 2 : 1)
   const raw = data.subarray(start, Math.min(start + byteLen, data.length))
-  return { value: is16 ? decodeUtf16Le(raw) : decodeCodePage(raw, codePage), offset: Math.min(start + byteLen, data.length) }
+  return { value: is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw), offset: Math.min(start + byteLen, data.length) }
 }
 
 const BUILTIN_NAMES: Record<number, string> = {

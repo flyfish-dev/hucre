@@ -9,6 +9,7 @@ import { EncryptedFileError, ParseError } from "../errors"
 import { readInputToUint8Array } from "../_input"
 import { parseBiffWorkbook } from "./biff"
 import { CfbReader } from "./cfb"
+import { parseXlsProperties } from "./properties"
 
 const CFB_MAGIC = Object.freeze([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1] as const)
 const BIFF_BOF = 0x0809
@@ -59,5 +60,8 @@ export async function readXls(input: ReadInput, options?: ReadOptions): Promise<
     throw new ParseError("Invalid XLS: missing Workbook/Book stream")
   }
 
-  return parseBiffWorkbook(workbookStream, options)
+  const workbook = parseBiffWorkbook(workbookStream, options)
+  const properties = parseXlsProperties(cfb)
+  if (properties) workbook.properties = properties
+  return workbook
 }
