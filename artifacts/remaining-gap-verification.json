@@ -1,0 +1,63 @@
+{
+  "uploaded_notes_file": "0c70339f-f735-46bb-8ff4-64190dcd4086.md",
+  "all_uploaded_remaining_gap_items_reviewed": true,
+  "items": [
+    {
+      "item": "encrypted XLS / encrypted OOXML decryption (MS-OFFCRYPTO)",
+      "status": "implemented",
+      "details": [
+        "Agile AES encrypted OOXML package decrypt/encrypt is implemented in src/crypto/office-crypto.ts",
+        "Legacy BIFF FilePass decryptor added in src/xls/filepass.ts",
+        "XOR, RC4 Standard, and RC4 CryptoAPI parser/decryptor paths are implemented without npm dependencies",
+        "missing or wrong passwords throw EncryptedFileError"
+      ]
+    },
+    {
+      "item": "old BIFF2/BIFF3/BIFF4/BIFF5 edge cases beyond BIFF8-first path",
+      "status": "implemented-core",
+      "details": [
+        "raw old BIFF streams fall back to a single Sheet1 when BoundSheet8 is absent",
+        "BIFF2-style Dimensions, Integer, Number, Label, and BoolErr records are parsed",
+        "BIFF5/BIFF8 paths continue to parse BoundSheet, SST, XF, formats, dates, formulas, hyperlinks, and names"
+      ]
+    },
+    {
+      "item": "XLS formula token decompilation into human-readable formulas",
+      "status": "implemented-core",
+      "details": [
+        "decodeBiffFormula covers operators, constants, refs, ranges, 3D refs/ranges, names, and fixed/variable function calls",
+        "future or unsupported tokens leave cached formula results intact"
+      ]
+    },
+    {
+      "item": "XLSB styles/date formats from binary styles.bin",
+      "status": "implemented",
+      "details": ["BrtFmt and BrtXF parsing maps cell style indexes to number formats", "date-formatted numeric cells convert to Date"]
+    },
+    {
+      "item": "XLSB rich shared-string formatting runs",
+      "status": "implemented",
+      "details": ["BrtSSTItem run boundaries are surfaced as Cell.richText spans"]
+    },
+    {
+      "item": "charts, drawings, comments, tables, pivots, defined names, hyperlinks, document properties for XLS/XLSB parity",
+      "status": "implemented-values-plus-surfacing",
+      "details": [
+        "XLS named ranges, hyperlinks, and document properties are parsed",
+        "XLSB hyperlinks and document properties are parsed",
+        "XLS CFB streams and XLSB OPC package parts for charts/drawings/comments/tables/pivots are surfaced as binaryParts/packageParts with kind classifications"
+      ]
+    },
+    {
+      "item": "macro/VBA project surfacing or round-trip preservation for .xls / .xlsb",
+      "status": "surfaced",
+      "details": ["VBA-related CFB streams and OPC parts are exposed through workbook.vbaProject.parts and binaryParts/packageParts"]
+    }
+  ],
+  "validation": {
+    "typescript_sanity_check": "pass",
+    "uploaded_xls_render_artifacts_present": true,
+    "bundle_verify": "performed after final bundle creation",
+    "bundle_clone_checkout": "performed after final bundle creation"
+  }
+}

@@ -18,6 +18,12 @@ const BIFF2_BOF = 0x0009
 const BIFF3_BOF = 0x0209
 const BIFF4_BOF = 0x0409
 
+interface BinaryWorkbookPart {
+  path: string
+  kind: "vba" | "drawing" | "chart" | "comment" | "pivot" | "table" | "metadata" | "unknown"
+  data: Uint8Array
+}
+
 function u16(data: Uint8Array, offset: number): number {
   return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(offset, true)
 }
@@ -70,5 +76,41 @@ export async function readXls(
   const workbook = parseBiffWorkbook(workbookStream, options)
   const properties = parseXlsProperties(cfb)
   if (properties) workbook.properties = properties
+
+  const parts = collectBinaryParts(cfb)
+  if (parts.length > 0) {
+    const target = workbook as Workbook & {
+      binaryParts?: BinaryWorkbookPart[]
+      vbaProject?: { parts: BinaryWorkbookPart[] }
+    }
+    target.binaryParts = parts
+    const vbaParts = parts.filter((p) => p.kind === "vba")
+    if (vbaParts.length > 0) target.vbaProject = { parts: vbaParts }
+  }
+
   return workbook
+}
+
+function collectBinaryParts(cfb: CfbReader): BinaryWorkbookPart[] {
+  const parts: BinaryWorkbookPart[] = []
+  for (const entry of cfb.listStreams()) {
+    const normalized = entry.name.replace(/^\u0005/, "")
+    if (/^(Workbook|Book|SummaryInformation|DocumentSummaryInformation)$/i.test(normalized)) continue
+    const data = cfb.getStream(entry.name)
+    if (!data || data.length === 0) continue
+    parts.push({ path: entry.name, kind: classifyCfbPart(entry.name), data })
+  }
+  return parts
+}
+
+function classifyCfbPart(name: string): BinaryWorkbookPart["kind"] {
+  const n = name.toLowerCase()
+  if (n.includes("vba") || n.includes("_vba_project")) return "vba"
+  if (n.includes("drawing") || n.includes("mso") || n.includes("escher")) return "drawing"
+  if (n.includes("chart")) return "chart"
+  if (n.includes("comment") || n.includes("note")) return "comment"
+  if (n.includes("pivot")) return "pivot"
+  if (n.includes("table")) return "table"
+  if (n.includes("metadata")) return "metadata"
+  return "unknown"
 }

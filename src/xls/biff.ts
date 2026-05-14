@@ -7,8 +7,10 @@
 
 import type { Cell, CellType, CellValue, MergeRange, NamedRange, ReadOptions, Sheet, Workbook } from "../_types"
 import { isDateFormat, serialToDate } from "../_date"
-import { EncryptedFileError, ParseError } from "../errors"
+import { ParseError } from "../errors"
 import { decodeBiffFormula } from "./formula"
+import { createBiffFilePassDecryptor } from "./filepass"
+import type { BiffRecordDecryptor } from "./filepass"
 import type { FormulaExternSheetRef, FormulaNameRef } from "./formula"
 
 const BIFF_BOF = 0x0809
@@ -22,10 +24,15 @@ const BIFF_XF = 0x00e0
 const BIFF_SST = 0x00fc
 const BIFF_FILEPASS = 0x002f
 const BIFF_DIMENSIONS = 0x0200
+const BIFF2_DIMENSIONS = 0x0000
 const BIFF_NUMBER = 0x0203
+const BIFF2_INTEGER = 0x0002
+const BIFF2_NUMBER = 0x0003
 const BIFF_LABEL = 0x0204
+const BIFF2_LABEL = 0x0004
 const BIFF_RSTRING = 0x00d6
 const BIFF_BOOLERR = 0x0205
+const BIFF2_BOOLERR = 0x0005
 const BIFF_FORMULA = 0x0006
 const BIFF_STRING = 0x0207
 const BIFF_BLANK = 0x0201
@@ -178,9 +185,15 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
   return out
 }
 
-function readRecords(stream: Uint8Array, startOffset = 0): BiffRecord[] {
+function readRecords(
+  stream: Uint8Array,
+  startOffset = 0,
+  options?: ReadOptions & { password?: string },
+): BiffRecord[] {
   const records: BiffRecord[] = []
   let pos = startOffset
+  let decryptor: BiffRecordDecryptor | undefined
+
   while (pos + 4 <= stream.length) {
     const sid = u16(stream, pos)
     const len = u16(stream, pos + 2)
@@ -189,10 +202,27 @@ function readRecords(stream: Uint8Array, startOffset = 0): BiffRecord[] {
     if (dataEnd > stream.length) {
       throw new ParseError(`Invalid XLS BIFF stream: record 0x${sid.toString(16)} extends past end`)
     }
-    records.push({ sid, offset: pos, data: stream.subarray(dataStart, dataEnd) })
+
+    let data = stream.subarray(dataStart, dataEnd)
+    if (decryptor && shouldDecryptRecord(sid)) {
+      data = decryptor.decryptRecordPayload(pos, sid, data)
+    }
+    records.push({ sid, offset: pos, data })
+
+    if (sid === BIFF_FILEPASS) {
+      decryptor = createBiffFilePassDecryptor(stream.subarray(dataStart, dataEnd), options?.password)
+    }
+
     pos = dataEnd
   }
   return records
+}
+
+function shouldDecryptRecord(sid: number): boolean {
+  // MS-XLS leaves selected structural records unencrypted so the stream can be
+  // walked. Decrypt ordinary payload records after FilePass. Keeping BOF/EOF
+  // plain also lets sheet substream boundaries remain visible.
+  return sid !== BIFF_BOF && sid !== BIFF_EOF && sid !== BIFF_FILEPASS
 }
 
 function readBiff8UnicodeString(data: Uint8Array, offset: number, codePage: number): { value: string; offset: number } {
@@ -533,7 +563,8 @@ function parseGlobals(records: BiffRecord[]): ParsedGlobals {
         if (record.data.length >= 2) biffVersion = u16(record.data, 0)
         break
       case BIFF_FILEPASS:
-        throw new EncryptedFileError("xls")
+        // Decryption is applied by readRecords before global parsing.
+        break
       case BIFF_CODEPAGE:
         if (record.data.length >= 2) codePage = u16(record.data, 0)
         break
@@ -714,35 +745,62 @@ function shouldReadSheet(sheet: BiffSheetInfo, filter: ReadOptions["sheets"] | u
   return items.some((item) => (typeof item === "number" ? item === sheet.index : item === sheet.name))
 }
 
-function parseWorksheet(stream: Uint8Array, sheetInfo: BiffSheetInfo, globals: ParsedGlobals, options?: ReadOptions): Sheet {
+function recordsForSheet(records: BiffRecord[], offset: number): BiffRecord[] {
+  const start = records.findIndex((r) => r.offset >= offset)
+  if (start === -1) return []
+  const out: BiffRecord[] = []
+  for (let i = start; i < records.length; i++) {
+    const record = records[i]!
+    out.push(record)
+    if (record.sid === BIFF_EOF) break
+  }
+  return out
+}
+
+function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals: ParsedGlobals, options?: ReadOptions): Sheet {
   const sheet: Sheet = { name: sheetInfo.name, rows: [] }
   if (sheetInfo.state === "hidden") sheet.hidden = true
   if (sheetInfo.state === "veryHidden") sheet.veryHidden = true
 
-  const records = readRecords(stream, sheetInfo.offset)
+  const sheetRecords = recordsForSheet(records, sheetInfo.offset)
   const readStyles = options?.readStyles ?? false
   const range = options?.range ? parseRangeRef(options.range) : undefined
   const maxRows = options?.maxRows ?? 0
   let pendingFormulaString: PendingFormulaString | undefined
   const hyperlinks: ParsedHLink[] = []
 
-  for (const record of records) {
+  for (const record of sheetRecords) {
     if (record.sid === BIFF_EOF) break
 
     switch (record.sid) {
       case BIFF_FILEPASS:
-        throw new EncryptedFileError("xls")
+        // Decryption is applied by readRecords before global parsing.
+        break
       case BIFF_DIMENSIONS:
+      case BIFF2_DIMENSIONS:
         // DIMENSIONS is metadata only; rows are allocated lazily as values arrive.
         break
-      case BIFF_NUMBER: {
-        if (record.data.length < 14) break
+      case BIFF2_INTEGER: {
+        if (record.data.length < 7) break
         const row = u16(record.data, 0)
         const col = u16(record.data, 2)
         if (maxRows > 0 && row >= maxRows) break
         if (!inRange(row, col, range)) break
-        const xf = u16(record.data, 4)
-        const converted = convertNumber(f64(record.data, 6), xf, globals)
+        const value = u16(record.data, record.data.length - 2)
+        setCell(sheet, row, col, value, "number", -1, globals, readStyles)
+        break
+      }
+      case BIFF_NUMBER:
+      case BIFF2_NUMBER: {
+        const isOldNumber = record.sid === BIFF2_NUMBER
+        const valueOffset = isOldNumber ? record.data.length - 8 : 6
+        if (record.data.length < valueOffset + 8) break
+        const row = u16(record.data, 0)
+        const col = u16(record.data, 2)
+        if (maxRows > 0 && row >= maxRows) break
+        if (!inRange(row, col, range)) break
+        const xf = record.data.length >= 6 ? u16(record.data, 4) : -1
+        const converted = convertNumber(f64(record.data, valueOffset), xf, globals)
         setCell(sheet, row, col, converted.value, converted.type, xf, globals, readStyles)
         break
       }
@@ -758,16 +816,18 @@ function parseWorksheet(stream: Uint8Array, sheetInfo: BiffSheetInfo, globals: P
         break
       }
       case BIFF_LABEL:
+      case BIFF2_LABEL:
       case BIFF_RSTRING: {
-        if (record.data.length < 8) break
+        if (record.data.length < 6) break
         const row = u16(record.data, 0)
         const col = u16(record.data, 2)
         if (maxRows > 0 && row >= maxRows) break
         if (!inRange(row, col, range)) break
-        const xf = u16(record.data, 4)
-        const { value } = globals.biffVersion >= 0x0600
-          ? readBiff8UnicodeString(record.data, 6, globals.codePage)
-          : readBiff5ByteString(record.data, 6, globals.codePage)
+        const xf = record.data.length >= 8 ? u16(record.data, 4) : -1
+        const textOffset = record.data.length >= 8 ? 6 : 4
+        const { value } = globals.biffVersion >= 0x0600 && record.sid !== BIFF2_LABEL
+          ? readBiff8UnicodeString(record.data, textOffset, globals.codePage)
+          : readBiff5ByteString(record.data, textOffset, globals.codePage)
         setCell(sheet, row, col, value, "string", xf, globals, readStyles)
         break
       }
@@ -800,7 +860,8 @@ function parseWorksheet(stream: Uint8Array, sheetInfo: BiffSheetInfo, globals: P
         }
         break
       }
-      case BIFF_BOOLERR: {
+      case BIFF_BOOLERR:
+      case BIFF2_BOOLERR: {
         if (record.data.length < 8) break
         const row = u16(record.data, 0)
         const col = u16(record.data, 2)
@@ -971,17 +1032,17 @@ function parseWorksheet(stream: Uint8Array, sheetInfo: BiffSheetInfo, globals: P
 }
 
 /** Parse a BIFF Workbook stream into the hucre Workbook model. */
-export function parseBiffWorkbook(workbookStream: Uint8Array, options?: ReadOptions): Workbook {
-  const records = readRecords(workbookStream)
+export function parseBiffWorkbook(workbookStream: Uint8Array, options?: ReadOptions & { password?: string }): Workbook {
+  const records = readRecords(workbookStream, 0, options)
   const globals = parseGlobals(records)
 
-  if (globals.sheets.length === 0) {
-    throw new ParseError("Invalid XLS: workbook contains no BoundSheet records")
-  }
+  const sheetInfos = globals.sheets.length > 0
+    ? globals.sheets
+    : [{ name: "Sheet1", index: 0, offset: 0, state: "visible" as const, type: 0 }]
 
-  const sheets = globals.sheets
+  const sheets = sheetInfos
     .filter((s) => s.type === 0 && shouldReadSheet(s, options?.sheets))
-    .map((sheet) => parseWorksheet(workbookStream, sheet, globals, options))
+    .map((sheet) => parseWorksheet(records, sheet, globals, options))
 
   const workbook: Workbook = {
     sheets,

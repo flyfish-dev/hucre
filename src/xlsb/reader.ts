@@ -3,7 +3,7 @@
 // container layout as XLSX, but workbook and worksheet bodies are BIFF12
 // binary parts instead of XML parts.
 
-import type { Cell, CellType, CellValue, MergeRange, ReadInput, ReadOptions, Sheet, Workbook } from "../_types"
+import type { Cell, CellType, CellValue, MergeRange, ReadInput, ReadOptions, RichTextRun, Sheet, Workbook } from "../_types"
 import { ParseError, ZipError } from "../errors"
 import { isDateFormat, serialToDate } from "../_date"
 import { decodeBiffFormula } from "../xls/formula"
@@ -105,6 +105,17 @@ interface ParsedXlsbHLink {
   tooltip?: string
 }
 
+interface XlsbSharedString {
+  text: string
+  richText?: RichTextRun[]
+}
+
+interface BinaryWorkbookPart {
+  path: string
+  kind: "vba" | "drawing" | "chart" | "comment" | "pivot" | "table" | "metadata" | "externalLink" | "unknown"
+  data: Uint8Array
+}
+
 /** Read an Excel Binary Workbook (.xlsb) and return a Workbook. */
 export async function readXlsb(
   input: ReadInput,
@@ -158,7 +169,7 @@ export async function readXlsb(
     if (matchesRelType(rel.type, "worksheet")) sheetRelMap.set(rel.id, resolvePath(workbookDir, rel.target))
   }
 
-  let sharedStrings: string[] = []
+  let sharedStrings: XlsbSharedString[] = []
   const ssRel = workbookRels.find((r) => matchesRelType(r.type, "sharedStrings"))
   if (ssRel) {
     const ssPath = resolvePath(workbookDir, ssRel.target)
@@ -204,6 +215,20 @@ export async function readXlsb(
 
   const workbook: Workbook = { sheets, dateSystem: workbookInfo.dateSystem }
   if (properties) workbook.properties = properties
+
+  const parts = await collectPackageParts(zip)
+  if (parts.length > 0) {
+    const target = workbook as Workbook & {
+      packageParts?: BinaryWorkbookPart[]
+      binaryParts?: BinaryWorkbookPart[]
+      vbaProject?: { parts: BinaryWorkbookPart[] }
+    }
+    target.packageParts = parts
+    target.binaryParts = parts
+    const vbaParts = parts.filter((p) => p.kind === "vba")
+    if (vbaParts.length > 0) target.vbaProject = { parts: vbaParts }
+  }
+
   return workbook
 }
 
@@ -293,23 +318,55 @@ function parseStylesBin(data: Uint8Array): ParsedXlsbStyles {
   return { formats, cellXfs }
 }
 
-function parseSharedStringsBin(data: Uint8Array): string[] {
-  const strings: string[] = []
+function parseSharedStringsBin(data: Uint8Array): XlsbSharedString[] {
+  const strings: XlsbSharedString[] = []
   for (const record of readXlsbRecords(data)) {
     if (record.type !== BRT_SST_ITEM) continue
-    // BrtSSTItem carries an XLWideString payload for plain strings. Rich
-    // strings include formatting runs after the text; the leading text still
-    // decodes through the same helper and formatting is intentionally ignored
-    // in the core CellValue matrix.
-    strings.push(readXlsbWideString(record.data, 0).value)
+    strings.push(parseSharedStringItem(record.data))
   }
   return strings
+}
+
+function parseSharedStringItem(data: Uint8Array): XlsbSharedString {
+  const parsed = readXlsbWideString(data, 0)
+  const text = parsed.value
+  const richText = parseRichTextRuns(text, data, parsed.offset)
+  return richText ? { text, richText } : { text }
+}
+
+function parseRichTextRuns(text: string, data: Uint8Array, offset: number): RichTextRun[] | undefined {
+  if (offset + 4 > data.length || text.length === 0) return undefined
+  const runCount32 = u32(data, offset)
+  const runCount16 = u16(data, offset)
+  const candidates = [
+    { count: runCount32, start: offset + 4, bytes: 8 },
+    { count: runCount16, start: offset + 2, bytes: 8 },
+  ]
+  for (const c of candidates) {
+    if (c.count <= 0 || c.count > 4096 || c.start + c.count * c.bytes > data.length) continue
+    const starts: number[] = []
+    for (let i = 0; i < c.count; i++) {
+      const pos = c.start + i * c.bytes
+      const ich = u32(data, pos)
+      if (ich <= text.length) starts.push(ich)
+    }
+    const unique = [...new Set(starts)].sort((a, b) => a - b)
+    if (unique.length === 0 || unique[0] !== 0) unique.unshift(0)
+    const runs: RichTextRun[] = []
+    for (let i = 0; i < unique.length; i++) {
+      const start = unique[i]!
+      const end = unique[i + 1] ?? text.length
+      if (start < end) runs.push({ text: text.slice(start, end) })
+    }
+    if (runs.length > 1) return runs
+  }
+  return undefined
 }
 
 function parseWorksheetBin(
   data: Uint8Array,
   name: string,
-  sharedStrings: string[],
+  sharedStrings: XlsbSharedString[],
   workbookInfo: XlsbWorkbookInfo,
   styles: ParsedXlsbStyles | undefined,
   options?: ReadOptions,
@@ -362,7 +419,7 @@ function parseWorksheetBin(
         const h = readCellHeader(record.data)
         if (!h || record.data.length < h.offset + 4) break
         const idx = u32(record.data, h.offset)
-        setCell(rows, cells, currentRow, h.col, sharedStrings[idx] ?? "", "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setSharedStringCell(rows, cells, currentRow, h.col, sharedStrings[idx], h.style, workbookInfo, styles, readStyles, maxRows, range)
         break
       }
       case BRT_CELL_ST: {
@@ -406,7 +463,7 @@ function parseWorksheetBin(
         const h = readShortCellHeader(record.data)
         if (!h || record.data.length < h.offset + 4) break
         const idx = u32(record.data, h.offset)
-        setCell(rows, cells, currentRow, h.col, sharedStrings[idx] ?? "", "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setSharedStringCell(rows, cells, currentRow, h.col, sharedStrings[idx], h.style, workbookInfo, styles, readStyles, maxRows, range)
         break
       }
       case BRT_SHORT_ST: {
@@ -564,6 +621,27 @@ function parseHLinkBin(data: Uint8Array): ParsedXlsbHLink | null {
   return link
 }
 
+function setSharedStringCell(
+  rows: CellValue[][],
+  cells: Map<string, Cell>,
+  row: number,
+  col: number,
+  shared: XlsbSharedString | undefined,
+  styleIndex: number,
+  workbookInfo: XlsbWorkbookInfo,
+  styles: ParsedXlsbStyles | undefined,
+  readStyles: boolean,
+  maxRows: number,
+  range?: MergeRange,
+): void {
+  const text = shared?.text ?? ""
+  setCell(rows, cells, row, col, text, shared?.richText ? "richText" : "string", styleIndex, workbookInfo, styles, readStyles, maxRows, range)
+  if (shared?.richText && inRange(row, col, range) && !(maxRows > 0 && row >= maxRows)) {
+    const cell = cells.get(`${row},${col}`)
+    if (cell) cell.richText = shared.richText
+  }
+}
+
 function setBlank(
   rows: CellValue[][],
   cells: Map<string, Cell>,
@@ -655,6 +733,37 @@ function parseCellRef(ref: string): { row: number; col: number } {
 function inRange(row: number, col: number, range?: MergeRange): boolean {
   if (!range) return true
   return row >= range.startRow && row <= range.endRow && col >= range.startCol && col <= range.endCol
+}
+
+async function collectPackageParts(zip: ZipReader): Promise<BinaryWorkbookPart[]> {
+  const out: BinaryWorkbookPart[] = []
+  for (const path of zip.entries()) {
+    if (path.endsWith("/") || path === "[Content_Types].xml" || path.startsWith("_rels/") || path.startsWith("docProps/")) continue
+    if (/^xl\/(workbook|sharedStrings|styles)\.bin$/i.test(path)) continue
+    if (/^xl\/worksheets\//i.test(path)) continue
+    const kind = classifyPackagePart(path)
+    if (kind === "unknown") continue
+    try {
+      out.push({ path, kind, data: await zip.extract(path) })
+    } catch {
+      // Optional package entry is malformed or missing; ignore it without
+      // blocking the core workbook value read.
+    }
+  }
+  return out
+}
+
+function classifyPackagePart(path: string): BinaryWorkbookPart["kind"] {
+  const p = path.toLowerCase()
+  if (p.includes("vbaproject")) return "vba"
+  if (p.includes("/drawings/") || p.includes("drawing")) return "drawing"
+  if (p.includes("/charts/") || p.includes("chart")) return "chart"
+  if (p.includes("/comments") || p.includes("threadedcomments")) return "comment"
+  if (p.includes("/pivottables/") || p.includes("/pivotcache/")) return "pivot"
+  if (p.includes("/tables/")) return "table"
+  if (p.includes("/metadata")) return "metadata"
+  if (p.includes("externallink")) return "externalLink"
+  return "unknown"
 }
 
 type SheetFilterInfo = { name: string; index: number; hidden?: boolean; veryHidden?: boolean }
