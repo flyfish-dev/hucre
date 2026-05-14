@@ -122,7 +122,7 @@ index 0000000..345df9f
 +- The hucre-generated summary JSON and HTML contain the same three sheet names and dimensions, and representative mixed Chinese/ASCII values render without mojibake.
 diff --git a/docs/xls-xlsb-read-support.md b/docs/xls-xlsb-read-support.md
 new file mode 100644
-index 0000000..f3b6a2d
+index 0000000..d7a32a3
 --- /dev/null
 +++ b/docs/xls-xlsb-read-support.md
 @@ -0,0 +1,62 @@
@@ -141,7 +141,7 @@ index 0000000..f3b6a2d
 +- CFB/OLE2 FAT, DIFAT, MiniFAT, directory, root mini-stream extraction, and case-insensitive stream lookup.
 +- BIFF workbook globals, sheet metadata, SST with `Continue` records, code pages, 1900/1904 date system, custom formats, and XF number-format mapping.
 +- Correct BIFF8 compressed-Unicode handling: `fHighByte=0` decodes as low-byte UTF-16 code units, not as the workbook `CodePage`; this prevents ASCII/date strings from corrupting when `CodePage=1200`.
-+- BIFF5/BIFF8 sheet-name and label string handling.
++- BIFF5/BIFF8 sheet-name, LABEL, and RSTRING rich-text-label value handling.
 +- Numeric, RK, MulRK, string, bool/error, blank, formula cached values, formula token decompilation, merged cells, row metadata, and column metadata.
 +- Defined names / built-in names, local extern-sheet references, and basic HLINK hyperlink extraction.
 +- OLE Property Set document metadata from `\u0005SummaryInformation` and `\u0005DocumentSummaryInformation` streams.
@@ -151,7 +151,7 @@ index 0000000..f3b6a2d
 +
 +- OPC package and relationship traversal.
 +- Binary workbook sheet metadata and 1904 date-system flag.
-+- Binary shared strings and worksheet cell values.
++- Binary shared strings, full cell records, and compact BrtShort* worksheet cell records.
 +- Binary formula cached values with formula-token decompilation from the formula payload tail.
 +- Binary styles parsing for custom number formats and CellXfs, including date conversion.
 +- Merged cells and basic binary hyperlink extraction.
@@ -669,10 +669,10 @@ index 0000000..69f9ef7
 +export { readXls } from "./xls/reader"
 diff --git a/src/xls/biff.ts b/src/xls/biff.ts
 new file mode 100644
-index 0000000..e16b628
+index 0000000..9aaa336
 --- /dev/null
 +++ b/src/xls/biff.ts
-@@ -0,0 +1,990 @@
+@@ -0,0 +1,992 @@
 +// ── BIFF8 XLS Workbook Reader ────────────────────────────────────────
 +// Parses the Workbook/Book stream inside legacy XLS CFB containers.
 +// Implements the BIFF records needed for complete worksheet value reads:
@@ -699,6 +699,7 @@ index 0000000..e16b628
 +const BIFF_DIMENSIONS = 0x0200
 +const BIFF_NUMBER = 0x0203
 +const BIFF_LABEL = 0x0204
++const BIFF_RSTRING = 0x00d6
 +const BIFF_BOOLERR = 0x0205
 +const BIFF_FORMULA = 0x0006
 +const BIFF_STRING = 0x0207
@@ -1431,7 +1432,8 @@ index 0000000..e16b628
 +        setCell(sheet, row, col, globals.sharedStrings[idx] ?? "", "string", xf, globals, readStyles)
 +        break
 +      }
-+      case BIFF_LABEL: {
++      case BIFF_LABEL:
++      case BIFF_RSTRING: {
 +        if (record.data.length < 8) break
 +        const row = u16(record.data, 0)
 +        const col = u16(record.data, 2)
@@ -3019,10 +3021,10 @@ index 0000000..2e33978
 +export { readXlsb } from "./reader"
 diff --git a/src/xlsb/reader.ts b/src/xlsb/reader.ts
 new file mode 100644
-index 0000000..94f7afe
+index 0000000..1afeaf5
 --- /dev/null
 +++ b/src/xlsb/reader.ts
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,669 @@
 +// ── XLSB Reader ──────────────────────────────────────────────────────
 +// Reads Excel Binary Workbook files (.xlsb). XLSB uses the same OPC/ZIP
 +// container layout as XLSX, but workbook and worksheet bodies are BIFF12
@@ -3051,6 +3053,13 @@ index 0000000..94f7afe
 +  BRT_FMLA_ERROR,
 +  BRT_FMLA_NUM,
 +  BRT_FMLA_STRING,
++  BRT_SHORT_BLANK,
++  BRT_SHORT_BOOL,
++  BRT_SHORT_ERROR,
++  BRT_SHORT_ISST,
++  BRT_SHORT_REAL,
++  BRT_SHORT_RK,
++  BRT_SHORT_ST,
 +  BRT_BEGIN_CELL_XFS,
 +  BRT_END_CELL_XFS,
 +  BRT_FMT,
@@ -3064,6 +3073,7 @@ index 0000000..94f7afe
 +  decodeRk,
 +  f64,
 +  readCellHeader,
++  readShortCellHeader,
 +  readXlsbRecords,
 +  readXlsbWideString,
 +  u16,
@@ -3384,6 +3394,50 @@ index 0000000..94f7afe
 +        setCell(rows, cells, currentRow, h.col, text, "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
 +        break
 +      }
++      case BRT_SHORT_BLANK: {
++        const h = readShortCellHeader(record.data)
++        if (!h) break
++        setBlank(rows, cells, currentRow, h.col, h.style, styles, readStyles, maxRows, range)
++        break
++      }
++      case BRT_SHORT_RK: {
++        const h = readShortCellHeader(record.data)
++        if (!h || record.data.length < h.offset + 4) break
++        setCell(rows, cells, currentRow, h.col, decodeRk(u32(record.data, h.offset)), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
++        break
++      }
++      case BRT_SHORT_REAL: {
++        const h = readShortCellHeader(record.data)
++        if (!h || record.data.length < h.offset + 8) break
++        setCell(rows, cells, currentRow, h.col, f64(record.data, h.offset), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
++        break
++      }
++      case BRT_SHORT_BOOL: {
++        const h = readShortCellHeader(record.data)
++        if (!h || record.data.length <= h.offset) break
++        setCell(rows, cells, currentRow, h.col, record.data[h.offset] === 1, "boolean", h.style, workbookInfo, styles, readStyles, maxRows, range)
++        break
++      }
++      case BRT_SHORT_ERROR: {
++        const h = readShortCellHeader(record.data)
++        if (!h || record.data.length <= h.offset) break
++        setCell(rows, cells, currentRow, h.col, decodeError(record.data[h.offset] ?? 0), "error", h.style, workbookInfo, styles, readStyles, maxRows, range)
++        break
++      }
++      case BRT_SHORT_ISST: {
++        const h = readShortCellHeader(record.data)
++        if (!h || record.data.length < h.offset + 4) break
++        const idx = u32(record.data, h.offset)
++        setCell(rows, cells, currentRow, h.col, sharedStrings[idx] ?? "", "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
++        break
++      }
++      case BRT_SHORT_ST: {
++        const h = readShortCellHeader(record.data)
++        if (!h) break
++        const text = readXlsbWideString(record.data, h.offset).value
++        setCell(rows, cells, currentRow, h.col, text, "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
++        break
++      }
 +      case BRT_FMLA_NUM: {
 +        const h = readCellHeader(record.data)
 +        if (!h || record.data.length < h.offset + 8) break
@@ -3642,10 +3696,10 @@ index 0000000..94f7afe
 +}
 diff --git a/src/xlsb/records.ts b/src/xlsb/records.ts
 new file mode 100644
-index 0000000..1e8e9a2
+index 0000000..d8a77c0
 --- /dev/null
 +++ b/src/xlsb/records.ts
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,168 @@
 +// ── XLSB BIFF12 Record Utilities ────────────────────────────────────
 +// XLSB worksheet/workbook parts are streams of BIFF12 records. Record ids
 +// and payload lengths are variable-length integers followed by a payload.
@@ -3670,6 +3724,13 @@ index 0000000..1e8e9a2
 +export const BRT_FMLA_NUM = 0x0009
 +export const BRT_FMLA_BOOL = 0x000a
 +export const BRT_FMLA_ERROR = 0x000b
++export const BRT_SHORT_BLANK = 0x000c
++export const BRT_SHORT_RK = 0x000d
++export const BRT_SHORT_ERROR = 0x000e
++export const BRT_SHORT_BOOL = 0x000f
++export const BRT_SHORT_REAL = 0x0010
++export const BRT_SHORT_ST = 0x0011
++export const BRT_SHORT_ISST = 0x0012
 +export const BRT_SST_ITEM = 0x0013
 +export const BRT_MERGE_CELL = 0x00b0
 +export const BRT_WS_DIM = 0x0094
@@ -3775,6 +3836,18 @@ index 0000000..1e8e9a2
 +  const col = u32(data, 0)
 +  const style = (data[4] ?? 0) | ((data[5] ?? 0) << 8) | ((data[6] ?? 0) << 16)
 +  return { col, style, offset: 8 }
++}
++
++/**
++ * Short XLSB cell records carry the current BrtRowHdr row and a compact
++ * column/value payload without an explicit cell XF. Treat them as style 0
++ * while preserving the cached value. This covers the BrtShort* family in
++ * MS-XLSB and is harmless for regular BrtCell* records, which continue to
++ * use {@link readCellHeader}.
++ */
++export function readShortCellHeader(data: Uint8Array): { col: number; style: number; offset: number } | null {
++  if (data.length < 4) return null
++  return { col: u32(data, 0), style: 0, offset: 4 }
 +}
 +
 +export function decodeRk(raw: number): number {
