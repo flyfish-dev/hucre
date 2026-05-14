@@ -21,5 +21,11 @@ export type {
   XlsxObjectsWriteOptions,
 } from "./xlsx/objects"
 
+// ── XLS ─────────────────────────────────────────────────────────────
+export { readXls } from "./xls/reader"
+
+// ── XLSB ────────────────────────────────────────────────────────────
+export { readXlsb } from "./xlsb/reader"
+
 // ── ODS ────────────────────────────────────────────────────────────
 export { readOds } from "./ods/reader"

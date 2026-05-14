@@ -55,14 +55,19 @@ export class UnsupportedFormatError extends DefterError {
   }
 }
 
+export type WorkbookFormat = "xls" | "xlsx" | "xlsb" | "ods"
+
 export class EncryptedFileError extends DefterError {
   override name = "EncryptedFileError"
-  readonly format?: "xlsx" | "ods"
-  constructor(format?: "xlsx" | "ods", message?: string) {
+
+  /** Format hint for the encrypted container, when known. */
+  readonly format?: WorkbookFormat
+
+  constructor(format?: WorkbookFormat, message?: string) {
     super(
       message ??
         (format
-          ? `File is password-protected (${format.toUpperCase()} encrypted with the OLE2/CFB container). Reading password-protected files is not yet supported.`
+          ? `File is password-protected (${format.toUpperCase()} encrypted workbook). Reading password-protected files is not yet supported.`
           : "File is password-protected. Provide a password in options."),
     )
     this.format = format
