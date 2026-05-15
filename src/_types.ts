@@ -697,9 +697,30 @@ export interface TableColumn {
 
 // ── Row Definition ────────────────────────────────────────────────
 
+export interface SheetFormat {
+  /** Default row height in points from sheetFormatPr.defaultRowHeight */
+  defaultRowHeight?: number
+  /** Default column width in Excel character units */
+  defaultColWidth?: number
+  /** Base column width in Excel character units */
+  baseColWidth?: number
+  /** Whether rows are hidden by default (sheetFormatPr.zeroHeight) */
+  zeroHeight?: boolean
+  /** Maximum outline level used by rows */
+  outlineLevelRow?: number
+  /** Maximum outline level used by columns */
+  outlineLevelCol?: number
+  /** East Asian typography descent metric used by Excel */
+  dyDescent?: number
+}
+
 export interface RowDef {
   /** Row height in points */
   height?: number
+  /** Whether the row has an explicit/custom height flag */
+  customHeight?: boolean
+  /** Default style for the row */
+  style?: CellStyle
   /** Hide row */
   hidden?: boolean
   /** Outline level (grouping) */
@@ -716,6 +737,8 @@ export interface Sheet {
   /** Detailed cell data (keyed by "row,col" e.g. "0,2") */
   cells?: Map<string, Cell>
   columns?: ColumnDef[]
+  /** Sheet-wide formatting defaults from sheetFormatPr */
+  sheetFormat?: SheetFormat
   /** Row-level properties (keyed by 0-based row index) */
   rowDefs?: Map<number, RowDef>
   merges?: MergeRange[]
@@ -1352,6 +1375,8 @@ export interface WriteSheet {
   rowBreaks?: number[]
   /** Column page breaks (0-based column indices) */
   colBreaks?: number[]
+  /** Sheet-wide formatting defaults from sheetFormatPr */
+  sheetFormat?: SheetFormat
   /** Row-level properties (keyed by 0-based row index) */
   rowDefs?: Map<number, RowDef>
   /** Outline properties (controls summary row/column position) */

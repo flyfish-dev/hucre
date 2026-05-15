@@ -55,6 +55,7 @@ export interface WorksheetResult {
 
 const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+const NS_X14AC = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
 
 // ── Column Letter Conversion ───────────────────────────────────────
 
@@ -309,7 +310,17 @@ export function writeWorksheetXml(
   )
 
   // ── SheetFormatPr ──
-  parts.push(xmlSelfClose("sheetFormatPr", { defaultRowHeight: 15 }))
+  parts.push(
+    xmlSelfClose("sheetFormatPr", {
+      baseColWidth: sheet.sheetFormat?.baseColWidth,
+      defaultColWidth: sheet.sheetFormat?.defaultColWidth,
+      defaultRowHeight: sheet.sheetFormat?.defaultRowHeight ?? 15,
+      zeroHeight: sheet.sheetFormat?.zeroHeight ? 1 : undefined,
+      outlineLevelRow: sheet.sheetFormat?.outlineLevelRow,
+      outlineLevelCol: sheet.sheetFormat?.outlineLevelCol,
+      "x14ac:dyDescent": sheet.sheetFormat?.dyDescent,
+    }),
+  )
 
   // ── Columns ──
   if (sheet.columns && sheet.columns.length > 0) {
@@ -332,10 +343,25 @@ export function writeWorksheetXml(
         })
       }
 
-      if (effectiveWidth !== undefined || col.hidden || col.outlineLevel || col.collapsed) {
+      const colStyle =
+        col.style || col.numFmt
+          ? { ...(col.style ?? {}), numFmt: col.numFmt ?? col.style?.numFmt }
+          : undefined
+      const colStyleIndex = colStyle ? styles.addStyle(colStyle) : 0
+
+      if (
+        effectiveWidth !== undefined ||
+        col.hidden ||
+        col.outlineLevel ||
+        col.collapsed ||
+        colStyleIndex !== 0
+      ) {
         const colAttrs: Record<string, string | number | boolean> = {
           min: i + 1,
           max: i + 1,
+        }
+        if (colStyleIndex !== 0) {
+          colAttrs["style"] = colStyleIndex
         }
         if (effectiveWidth !== undefined) {
           colAttrs["width"] = effectiveWidth
@@ -366,7 +392,11 @@ export function writeWorksheetXml(
     const rowDef = sheet.rowDefs?.get(r)
     const hasRowDef =
       rowDef &&
-      (rowDef.height !== undefined || rowDef.hidden || rowDef.outlineLevel || rowDef.collapsed)
+      (rowDef.height !== undefined ||
+        rowDef.style ||
+        rowDef.hidden ||
+        rowDef.outlineLevel ||
+        rowDef.collapsed)
 
     if ((!row || row.length === 0) && !hasRowDef) continue
 
@@ -390,7 +420,16 @@ export function writeWorksheetXml(
       const rowAttrs: Record<string, string | number | boolean> = { r: r + 1 }
       if (rowDef?.height !== undefined) {
         rowAttrs["ht"] = rowDef.height
-        rowAttrs["customHeight"] = 1
+        if (rowDef.customHeight !== false) {
+          rowAttrs["customHeight"] = 1
+        }
+      }
+      if (rowDef?.style) {
+        const rowStyleIndex = styles.addStyle(rowDef.style)
+        if (rowStyleIndex !== 0) {
+          rowAttrs["s"] = rowStyleIndex
+          rowAttrs["customFormat"] = 1
+        }
       }
       if (rowDef?.hidden) {
         rowAttrs["hidden"] = 1
@@ -582,8 +621,13 @@ export function writeWorksheetXml(
     }
   }
 
+  const worksheetAttrs: Record<string, string> = { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }
+  if (sheet.sheetFormat?.dyDescent !== undefined) {
+    worksheetAttrs["xmlns:x14ac"] = NS_X14AC
+  }
+
   return {
-    xml: xmlDocument("worksheet", { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }, parts),
+    xml: xmlDocument("worksheet", worksheetAttrs, parts),
     hyperlinkRelationships,
     drawingRId,
     legacyDrawingRId,

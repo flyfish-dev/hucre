@@ -191,6 +191,7 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
 
   // Row definitions (height, hidden, outlineLevel, collapsed)
   const rowDefs = new Map<number, import("../_types").RowDef>()
+  let sheetFormat: import("../_types").SheetFormat | undefined
 
   // Column definitions (width, hidden, outlineLevel, collapsed) parsed from <col> elements
   const columnDefs: import("../_types").ColumnDef[] = []
@@ -265,6 +266,25 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
       const local = tag.includes(":") ? tag.slice(tag.indexOf(":") + 1) : tag
 
       switch (local) {
+        case "sheetFormatPr": {
+          const parsed: import("../_types").SheetFormat = {}
+          const defaultRowHeight = numberAttr(attrs, "defaultRowHeight")
+          const defaultColWidth = numberAttr(attrs, "defaultColWidth")
+          const baseColWidth = numberAttr(attrs, "baseColWidth")
+          const outlineLevelRow = numberAttr(attrs, "outlineLevelRow")
+          const outlineLevelCol = numberAttr(attrs, "outlineLevelCol")
+          const dyDescent = numberAttr(attrs, "dyDescent")
+          if (defaultRowHeight !== undefined) parsed.defaultRowHeight = defaultRowHeight
+          if (defaultColWidth !== undefined) parsed.defaultColWidth = defaultColWidth
+          if (baseColWidth !== undefined) parsed.baseColWidth = baseColWidth
+          if (outlineLevelRow !== undefined) parsed.outlineLevelRow = outlineLevelRow
+          if (outlineLevelCol !== undefined) parsed.outlineLevelCol = outlineLevelCol
+          if (dyDescent !== undefined) parsed.dyDescent = dyDescent
+          if (attrs["zeroHeight"] === "1" || attrs["zeroHeight"] === "true")
+            parsed.zeroHeight = true
+          if (Object.keys(parsed).length > 0) sheetFormat = parsed
+          break
+        }
         case "cols":
           inCols = true
           break
@@ -273,9 +293,14 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
             const minCol = Number(attrs["min"] || "0")
             const maxCol2 = Number(attrs["max"] || "0")
             const width = attrs["width"] ? Number(attrs["width"]) : undefined
+            const styleIndex = attrs["style"] !== undefined ? Number(attrs["style"]) : undefined
             const hidden = attrs["hidden"] === "1" || attrs["hidden"] === "true"
             const outlineLevel = attrs["outlineLevel"] ? Number(attrs["outlineLevel"]) : undefined
             const collapsed = attrs["collapsed"] === "1" || attrs["collapsed"] === "true"
+            const style =
+              ctx.readStyles && ctx.styles && styleIndex !== undefined && !Number.isNaN(styleIndex)
+                ? resolveStyle(ctx.styles, styleIndex)
+                : undefined
 
             // Expand column range (min and max are 1-based in OOXML)
             for (let c = minCol; c <= maxCol2; c++) {
@@ -286,6 +311,7 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               }
               const def: import("../_types").ColumnDef = {}
               if (width !== undefined && !Number.isNaN(width)) def.width = width
+              if (style && Object.keys(style).length > 0) def.style = style
               if (hidden) def.hidden = true
               if (outlineLevel !== undefined && !Number.isNaN(outlineLevel) && outlineLevel > 0) {
                 def.outlineLevel = outlineLevel
@@ -307,17 +333,44 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               break
             }
             inRow = true
-            // Parse row-level attributes: ht, customHeight, hidden
-            if (
-              attrs["ht"] &&
-              (attrs["customHeight"] === "1" || attrs["customHeight"] === "true")
-            ) {
+            // Parse row-level attributes. Excel stores row height in points
+            // on row/@ht; customHeight only marks user-customized height.
+            if (attrs["ht"]) {
               const rowNum = Number(attrs["r"]) - 1 // 0-based
               const height = Number(attrs["ht"])
               if (!Number.isNaN(rowNum) && !Number.isNaN(height)) {
                 const existing = rowDefs.get(rowNum) ?? {}
                 existing.height = height
+                if (attrs["customHeight"] === "1" || attrs["customHeight"] === "true") {
+                  existing.customHeight = true
+                } else {
+                  existing.customHeight = false
+                }
                 rowDefs.set(rowNum, existing)
+              }
+            } else if (attrs["customHeight"] === "1" || attrs["customHeight"] === "true") {
+              const rowNum = Number(attrs["r"]) - 1
+              if (!Number.isNaN(rowNum)) {
+                const existing = rowDefs.get(rowNum) ?? {}
+                existing.customHeight = true
+                rowDefs.set(rowNum, existing)
+              }
+            }
+            if (attrs["s"] !== undefined) {
+              const rowNum = Number(attrs["r"]) - 1
+              const styleIndex = Number(attrs["s"])
+              if (
+                ctx.readStyles &&
+                ctx.styles &&
+                !Number.isNaN(rowNum) &&
+                !Number.isNaN(styleIndex)
+              ) {
+                const style = resolveStyle(ctx.styles, styleIndex)
+                if (Object.keys(style).length > 0) {
+                  const existing = rowDefs.get(rowNum) ?? {}
+                  existing.style = style
+                  rowDefs.set(rowNum, existing)
+                }
               }
             }
             if (attrs["hidden"] === "1" || attrs["hidden"] === "true") {
@@ -1107,6 +1160,9 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
   }
 
   // Attach row definitions (height, hidden, outlineLevel)
+  if (sheetFormat && Object.keys(sheetFormat).length > 0) {
+    sheet.sheetFormat = sheetFormat
+  }
   if (rowDefs.size > 0) {
     sheet.rowDefs = rowDefs
   }
@@ -1709,4 +1765,20 @@ function parseColorAttrs(attrs: Record<string, string>): Color {
     color.indexed = Number(attrs["indexed"])
   }
   return color
+}
+
+function numberAttr(attrs: Record<string, string>, name: string): number | undefined {
+  const value = attrValue(attrs, name)
+  if (value === undefined || value === "") return undefined
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : undefined
+}
+
+function attrValue(attrs: Record<string, string>, name: string): string | undefined {
+  if (attrs[name] !== undefined) return attrs[name]
+  for (const [key, value] of Object.entries(attrs)) {
+    const local = key.includes(":") ? key.slice(key.indexOf(":") + 1) : key
+    if (local === name) return value
+  }
+  return undefined
 }

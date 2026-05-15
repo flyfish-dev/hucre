@@ -167,6 +167,7 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
     hidden: sheet.hidden,
     veryHidden: sheet.veryHidden,
     tables: sheet.tables,
+    sheetFormat: sheet.sheetFormat,
     rowDefs: sheet.rowDefs,
   }))
 

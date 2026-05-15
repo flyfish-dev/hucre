@@ -3,7 +3,7 @@
 // Each addRow() serializes the row to XML immediately.
 // finish() assembles all parts into a valid XLSX ZIP archive.
 
-import type { CellValue, CellStyle, ColumnDef, FreezePane } from "../_types"
+import type { CellValue, CellStyle, ColumnDef, FreezePane, SheetFormat } from "../_types"
 import { ZipWriter } from "../zip/writer"
 import { writeContentTypes } from "./content-types-writer"
 import { writeRootRels, writeWorkbookRels } from "./workbook-writer"
@@ -17,6 +17,7 @@ const encoder = /* @__PURE__ */ new TextEncoder()
 
 const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+const NS_X14AC = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -27,6 +28,8 @@ export interface StreamWriterOptions {
   columns?: ColumnDef[]
   /** Freeze pane */
   freezePane?: FreezePane
+  /** Sheet-wide format defaults */
+  sheetFormat?: SheetFormat
   /** Date system. Default: "1900" */
   dateSystem?: "1900" | "1904"
   /**
@@ -61,6 +64,7 @@ export class XlsxStreamWriter {
   private sheetName: string
   private columns: ColumnDef[] | undefined
   private freezePane: FreezePane | undefined
+  private sheetFormat: SheetFormat | undefined
   private dateSystem: "1900" | "1904"
   private maxRowsPerSheet: number
   private repeatHeaders: boolean
@@ -85,6 +89,7 @@ export class XlsxStreamWriter {
     this.sheetName = options.name
     this.columns = options.columns
     this.freezePane = options.freezePane
+    this.sheetFormat = options.sheetFormat
     this.dateSystem = options.dateSystem ?? "1900"
     this.maxRowsPerSheet = options.maxRowsPerSheet ?? XLSX_MAX_ROWS_PER_SHEET
     this.repeatHeaders = options.repeatHeaders ?? true
@@ -232,17 +237,18 @@ export class XlsxStreamWriter {
       zip.add("xl/sharedStrings.xml", encoder.encode(writeSharedStringsXml(this.sharedStrings)))
     }
 
+    const worksheetAttrs: Record<string, string> = { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }
+    if (this.sheetFormat?.dyDescent !== undefined) {
+      worksheetAttrs["xmlns:x14ac"] = NS_X14AC
+    }
+
     // xl/worksheets/sheet{N}.xml — one entry per fragment array
     for (let s = 0; s < sheetCount; s++) {
       const fragments = this.sheetFragments[s]!
       const worksheetParts: string[] = []
       worksheetParts.push(...sheetPrelude)
       worksheetParts.push(xmlElement("sheetData", undefined, fragments.length > 0 ? fragments : ""))
-      const worksheetXml = xmlDocument(
-        "worksheet",
-        { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R },
-        worksheetParts,
-      )
+      const worksheetXml = xmlDocument("worksheet", worksheetAttrs, worksheetParts)
       zip.add(`xl/worksheets/sheet${s + 1}.xml`, encoder.encode(worksheetXml))
     }
 
@@ -304,18 +310,34 @@ export class XlsxStreamWriter {
     )
 
     // SheetFormatPr
-    parts.push(xmlSelfClose("sheetFormatPr", { defaultRowHeight: 15 }))
+    parts.push(
+      xmlSelfClose("sheetFormatPr", {
+        baseColWidth: this.sheetFormat?.baseColWidth,
+        defaultColWidth: this.sheetFormat?.defaultColWidth,
+        defaultRowHeight: this.sheetFormat?.defaultRowHeight ?? 15,
+        zeroHeight: this.sheetFormat?.zeroHeight ? 1 : undefined,
+        outlineLevelRow: this.sheetFormat?.outlineLevelRow,
+        outlineLevelCol: this.sheetFormat?.outlineLevelCol,
+        "x14ac:dyDescent": this.sheetFormat?.dyDescent,
+      }),
+    )
 
     // Columns
     if (this.columns && this.columns.length > 0) {
       const colElements: string[] = []
       for (let i = 0; i < this.columns.length; i++) {
         const col = this.columns[i]
-        if (col.width !== undefined || col.hidden || col.outlineLevel) {
+        const colStyle =
+          col.style || col.numFmt
+            ? { ...(col.style ?? {}), numFmt: col.numFmt ?? col.style?.numFmt }
+            : undefined
+        const colStyleIndex = colStyle ? this.styles.addStyle(colStyle) : 0
+        if (col.width !== undefined || col.hidden || col.outlineLevel || colStyleIndex !== 0) {
           const colAttrs: Record<string, string | number | boolean> = {
             min: i + 1,
             max: i + 1,
           }
+          if (colStyleIndex !== 0) colAttrs["style"] = colStyleIndex
           if (col.width !== undefined) {
             colAttrs["width"] = col.width
             colAttrs["customWidth"] = true

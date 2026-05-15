@@ -606,6 +606,10 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
     dateSystem,
   }
 
+  if (parsedStyles?.fonts[0]) {
+    workbook.defaultFont = parsedStyles.fonts[0]
+  }
+
   if (namedRanges.length > 0) {
     workbook.namedRanges = namedRanges
   }
@@ -1262,9 +1266,12 @@ function findCNvPrMeta(
 }
 
 /** Parse row/col from an anchor position element (from or to) */
-function parseAnchorPosition(el: {
-  children: Array<unknown>
-}): { row: number; col: number; rowOff?: number; colOff?: number } {
+function parseAnchorPosition(el: { children: Array<unknown> }): {
+  row: number
+  col: number
+  rowOff?: number
+  colOff?: number
+} {
   let row = 0
   let col = 0
   let rowOff: number | undefined
@@ -1289,7 +1296,12 @@ function parseAnchorPosition(el: {
     }
   }
 
-  return { row, col, ...(rowOff !== undefined ? { rowOff } : {}), ...(colOff !== undefined ? { colOff } : {}) }
+  return {
+    row,
+    col,
+    ...(rowOff !== undefined ? { rowOff } : {}),
+    ...(colOff !== undefined ? { colOff } : {}),
+  }
 }
 
 /** Find the r:embed attribute on the blip element inside a pic element */
