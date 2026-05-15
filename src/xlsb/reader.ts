@@ -775,7 +775,10 @@ function filterSheets(
   if (filter === undefined) return sheets
   if (typeof filter === "function") {
     return sheets.filter((s) =>
-      filter({ name: s.name, index: s.index, hidden: s.state === "hidden", veryHidden: s.state === "veryHidden" } as SheetFilterInfo),
+      filter(
+        { name: s.name, index: s.index, hidden: s.state === "hidden", veryHidden: s.state === "veryHidden" } as SheetFilterInfo,
+        s.index,
+      ),
     )
   }
   const filters = Array.isArray(filter) ? filter : [filter]

@@ -2,16 +2,39 @@
 // Parses the Workbook/Book stream inside legacy XLS CFB containers.
 // Implements the BIFF records needed for complete worksheet value reads:
 // sheet metadata, shared strings, numbers, RK values, booleans/errors,
-// formulas with cached results, labels, merges, row/column metadata, and
-// date style inference.
+// formulas with cached results, labels, merges, row/column metadata, styles,
+// and date style inference.
 
-import type { Cell, CellType, CellValue, MergeRange, NamedRange, ReadOptions, Sheet, Workbook } from "../_types"
+import type {
+  BorderSide,
+  Cell,
+  CellStyle,
+  CellType,
+  CellValue,
+  Color,
+  FontStyle,
+  MergeRange,
+  NamedRange,
+  PatternFill,
+  ReadOptions,
+  Sheet,
+  Workbook,
+} from "../_types"
 import { isDateFormat, serialToDate } from "../_date"
 import { ParseError } from "../errors"
 import { decodeBiffFormula } from "./formula"
 import { createBiffFilePassDecryptor } from "./filepass"
 import type { BiffRecordDecryptor } from "./filepass"
 import type { FormulaExternSheetRef, FormulaNameRef } from "./formula"
+import { ZipReader } from "../zip/reader"
+import { parseThemeColors, resolveThemeColor } from "../xlsx/theme"
+import {
+  biffBorderLineStyle,
+  biffFillPattern,
+  getBuiltinNumberFormat,
+  indexedColor,
+  rgbHex,
+} from "../style-utils"
 
 const BIFF_BOF = 0x0809
 const BIFF_EOF = 0x000a
@@ -19,8 +42,12 @@ const BIFF_CONTINUE = 0x003c
 const BIFF_BOUNDSHEET8 = 0x0085
 const BIFF_CODEPAGE = 0x0042
 const BIFF_DATEMODE = 0x0022
+const BIFF_FONT = 0x0031
 const BIFF_FORMAT = 0x041e
 const BIFF_XF = 0x00e0
+const BIFF_XFEXT = 0x087d
+const BIFF_THEME = 0x0896
+const BIFF_PALETTE = 0x0092
 const BIFF_SST = 0x00fc
 const BIFF_FILEPASS = 0x002f
 const BIFF_DIMENSIONS = 0x0200
@@ -66,12 +93,28 @@ interface ParsedGlobals {
   sharedStrings: string[]
   dateSystem: "1900" | "1904"
   formats: Map<number, string>
-  xfs: number[]
+  fonts: Map<number, FontStyle>
+  xfs: BiffXf[]
+  palette: Map<number, Color>
   codePage: number
   biffVersion: number
   names: FormulaNameRef[]
   namedRanges: NamedRange[]
   externSheets: FormulaExternSheetRef[]
+  themeColors?: string[]
+}
+
+interface BiffXf {
+  fontId: number
+  numFmtId: number
+  style?: CellStyle
+}
+
+interface BiffXfExt {
+  xfIndex: number
+  fillFgColor?: Color
+  fillBgColor?: Color
+  fontColor?: Color
 }
 
 interface PendingFormulaString {
@@ -97,6 +140,10 @@ function makeView(bytes: Uint8Array): DataView {
 
 function u16(bytes: Uint8Array, offset: number): number {
   return makeView(bytes).getUint16(offset, true)
+}
+
+function i16(bytes: Uint8Array, offset: number): number {
+  return makeView(bytes).getInt16(offset, true)
 }
 
 function u32(bytes: Uint8Array, offset: number): number {
@@ -393,6 +440,275 @@ function parseFormat(record: Uint8Array, codePage: number): { id: number; value:
   return { id, value }
 }
 
+function parseFont(record: Uint8Array, codePage: number): FontStyle | null {
+  if (record.length < 16) return null
+  const flags = u16(record, 2)
+  const colorIndex = u16(record, 4)
+  const weight = u16(record, 6)
+  const underline = record[10] ?? 0
+  const family = record[11]
+  const charset = record[12]
+  const { value: name } = readShortBiff8UnicodeString(record, 14, codePage)
+  const font: FontStyle = {}
+  const heightTwips = u16(record, 0)
+  if (heightTwips > 0) font.size = heightTwips / 20
+  if (name) font.name = name
+  if (weight >= 700) font.bold = true
+  if ((flags & 0x0002) !== 0) font.italic = true
+  if ((flags & 0x0008) !== 0) font.strikethrough = true
+  if (underline === 1) font.underline = true
+  else if (underline === 2) font.underline = "double"
+  else if (underline === 0x21) font.underline = "singleAccounting"
+  else if (underline === 0x22) font.underline = "doubleAccounting"
+  const color = indexedColor(colorIndex)
+  if (color) font.color = color
+  if (family !== undefined && family !== 0) font.family = family
+  if (charset !== undefined && charset !== 0) font.charset = charset
+  return Object.keys(font).length ? font : null
+}
+
+function parsePalette(record: Uint8Array): Map<number, Color> {
+  const palette = new Map<number, Color>()
+  if (record.length < 2) return palette
+  const count = u16(record, 0)
+  let pos = 2
+  for (let index = 0; index < count && pos + 4 <= record.length; index += 1) {
+    const red = record[pos] ?? 0
+    const green = record[pos + 1] ?? 0
+    const blue = record[pos + 2] ?? 0
+    palette.set(index + 8, { rgb: rgbHex(red, green, blue) })
+    pos += 4
+  }
+  return palette
+}
+
+function parseXf(record: Uint8Array, globals: Pick<ParsedGlobals, "formats" | "fonts" | "palette">): BiffXf | null {
+  if (record.length < 4) return null
+  const fontId = u16(record, 0)
+  const numFmtId = u16(record, 2)
+  const style: CellStyle = {}
+  const numFmt = numFmtFromId(numFmtId, globals.formats)
+  if (numFmt) style.numFmt = numFmt
+  const font = globals.fonts.get(fontId)
+  if (font) style.font = font
+
+  if (record.length >= 10) {
+    const align = record[6] ?? 0
+    const rotation = record[7] ?? 0
+    const indent = record[8] ?? 0
+    const alignment = parseXfAlignment(align, rotation, indent)
+    if (Object.keys(alignment).length) style.alignment = alignment
+  }
+
+  if (record.length >= 14) {
+    const border = parseXfBorder(record, globals.palette)
+    if (Object.keys(border).length) style.border = border
+  }
+
+  if (record.length >= 20) {
+    const fill = parseXfFill(record, globals.palette)
+    if (fill) style.fill = fill
+  }
+
+  return { fontId, numFmtId, ...(Object.keys(style).length ? { style } : {}) }
+}
+
+function parseXfAlignment(align: number, rotation: number, indentByte: number): NonNullable<CellStyle["alignment"]> {
+  const horizontalMap: Record<number, NonNullable<CellStyle["alignment"]>["horizontal"]> = {
+    0: "general",
+    1: "left",
+    2: "center",
+    3: "right",
+    4: "fill",
+    5: "justify",
+    6: "centerContinuous",
+    7: "distributed",
+  }
+  const verticalMap: Record<number, NonNullable<CellStyle["alignment"]>["vertical"]> = {
+    0: "top",
+    1: "center",
+    2: "bottom",
+    3: "justify",
+    4: "distributed",
+  }
+  const alignment: NonNullable<CellStyle["alignment"]> = {}
+  const horizontal = horizontalMap[align & 0x07]
+  const vertical = verticalMap[(align >> 4) & 0x07]
+  if (horizontal && horizontal !== "general") alignment.horizontal = horizontal
+  if (vertical) alignment.vertical = vertical
+  if ((align & 0x08) !== 0) alignment.wrapText = true
+  if (rotation) alignment.textRotation = rotation === 255 ? 255 : rotation > 90 ? 90 - rotation : rotation
+  const indent = indentByte & 0x0f
+  if (indent) alignment.indent = indent
+  if ((indentByte & 0x10) !== 0) alignment.shrinkToFit = true
+  return alignment
+}
+
+function parseXfBorder(record: Uint8Array, palette: Map<number, Color>): NonNullable<CellStyle["border"]> {
+  const lines = u16(record, 10)
+  const sideColors = u16(record, 12)
+  const topBottomColors = u32(record, 14)
+  const border: NonNullable<CellStyle["border"]> = {}
+  const left = borderSide(lines & 0x0f, sideColors & 0x7f, palette)
+  const right = borderSide((lines >> 4) & 0x0f, (sideColors >> 7) & 0x7f, palette)
+  const top = borderSide((lines >> 8) & 0x0f, topBottomColors & 0x7f, palette)
+  const bottom = borderSide((lines >> 12) & 0x0f, (topBottomColors >> 7) & 0x7f, palette)
+  if (left) border.left = left
+  if (right) border.right = right
+  if (top) border.top = top
+  if (bottom) border.bottom = bottom
+  return border
+}
+
+function parseXfFill(record: Uint8Array, palette: Map<number, Color>): CellStyle["fill"] | undefined {
+  const borderAndPattern = u32(record, 14)
+  const fillColors = u16(record, 18)
+  const patternCode = (borderAndPattern >> 26) & 0x3f
+  const fgIndex = fillColors & 0x7f
+  const bgIndex = (fillColors >> 7) & 0x7f
+  const pattern = biffFillPattern(patternCode)
+  if (pattern === "none") return undefined
+  return {
+    type: "pattern",
+    pattern,
+    fgColor: indexedColor(fgIndex, palette),
+    bgColor: indexedColor(bgIndex, palette),
+  }
+}
+
+function parseXfExt(record: Uint8Array, palette: Map<number, Color>): BiffXfExt | null {
+  if (record.length < 20) return null
+  const xfIndex = u16(record, 14)
+  const propCount = u16(record, 18)
+  const ext: BiffXfExt = { xfIndex }
+  let pos = 20
+
+  for (let i = 0; i < propCount && pos + 4 <= record.length; i++) {
+    const extType = u16(record, pos)
+    const cb = u16(record, pos + 2)
+    if (cb < 4 || pos + cb > record.length) break
+    const data = record.subarray(pos + 4, pos + cb)
+
+    if (extType === 0x0004) {
+      ext.fillFgColor = parseFullColorExt(data, palette)
+    } else if (extType === 0x0005) {
+      ext.fillBgColor = parseFullColorExt(data, palette)
+    } else if (extType === 0x000d) {
+      ext.fontColor = parseFullColorExt(data, palette)
+    }
+
+    pos += cb
+  }
+
+  return ext.fillFgColor || ext.fillBgColor || ext.fontColor ? ext : null
+}
+
+function parseFullColorExt(data: Uint8Array, palette: Map<number, Color>): Color | undefined {
+  if (data.length < 8) return undefined
+  const xclrType = u16(data, 0)
+  const tint = colorTintToFloat(i16(data, 2))
+  const value = u32(data, 4)
+  let color: Color | undefined
+
+  if (xclrType === 0x01) {
+    color = indexedColor(value & 0xff, palette)
+  } else if (xclrType === 0x02) {
+    color = { rgb: rgbHex(data[4] ?? 0, data[5] ?? 0, data[6] ?? 0) }
+  } else if (xclrType === 0x03) {
+    color = { theme: value }
+  }
+
+  if (color && tint !== undefined) color.tint = tint
+  return color
+}
+
+function colorTintToFloat(raw: number): number | undefined {
+  if (raw === 0 || raw === -32768) return undefined
+  return Math.max(-1, Math.min(1, raw / 32767))
+}
+
+function applyXfExt(xfs: BiffXf[], ext: BiffXfExt): void {
+  const xf = xfs[ext.xfIndex]
+  if (!xf) return
+  const style = xf.style ?? {}
+
+  if (ext.fillFgColor || ext.fillBgColor) {
+    const fill: PatternFill = style.fill?.type === "pattern" ? { ...style.fill } : { type: "pattern", pattern: "solid" }
+    if (ext.fillFgColor) fill.fgColor = ext.fillFgColor
+    if (ext.fillBgColor) fill.bgColor = ext.fillBgColor
+    style.fill = fill
+  }
+
+  if (ext.fontColor) {
+    style.font = { ...(style.font ?? {}), color: ext.fontColor }
+  }
+
+  xf.style = style
+}
+
+function parseThemeRecord(record: Uint8Array): string[] | undefined {
+  if (record.length < 16) return undefined
+  const themeVersion = u32(record, 12)
+  if (themeVersion !== 0) return undefined
+  const packageData = record.subarray(16)
+  if (packageData.length < 4 || u32(packageData, 0) !== 0x04034b50) return undefined
+
+  try {
+    const zip = new ZipReader(packageData)
+    const themePath = zip.entries().find((path) => /(^|\/)theme1\.xml$/i.test(path))
+    if (!themePath) return undefined
+    return parseThemeColors(new TextDecoder("utf-8").decode(zip.extractSync(themePath)))
+  } catch {
+    return undefined
+  }
+}
+
+function resolveThemeColorsInXfs(xfs: BiffXf[], themeColors: string[]): void {
+  for (const xf of xfs) {
+    if (xf.style) xf.style = resolveThemeColorsInStyle(xf.style, themeColors)
+  }
+}
+
+function resolveThemeColorsInStyle(style: CellStyle, themeColors: string[]): CellStyle {
+  const next: CellStyle = { ...style }
+  if (next.font?.color) next.font = { ...next.font, color: resolveBiffThemeColor(next.font.color, themeColors) }
+  if (next.fill?.type === "pattern") {
+    next.fill = {
+      ...next.fill,
+      fgColor: resolveBiffThemeColor(next.fill.fgColor, themeColors),
+      bgColor: resolveBiffThemeColor(next.fill.bgColor, themeColors),
+    }
+  } else if (next.fill?.type === "gradient") {
+    next.fill = {
+      ...next.fill,
+      stops: next.fill.stops.map((stop) => ({
+        ...stop,
+        color: resolveBiffThemeColor(stop.color, themeColors) ?? stop.color,
+      })),
+    }
+  }
+  if (next.border) {
+    next.border = { ...next.border }
+    for (const side of ["left", "right", "top", "bottom", "diagonal"] as const) {
+      const borderSideValue = next.border[side]
+      if (borderSideValue?.color) {
+        next.border[side] = { ...borderSideValue, color: resolveBiffThemeColor(borderSideValue.color, themeColors) }
+      }
+    }
+  }
+  return next
+}
+
+function resolveBiffThemeColor(color: Color | undefined, themeColors: string[]): Color | undefined {
+  if (!color || color.rgb || typeof color.theme !== "number") return color
+  return { rgb: resolveThemeColor(themeColors, color.theme, color.tint) }
+}
+
+function borderSide(styleCode: number, colorIndex: number, palette: Map<number, Color>): BorderSide | undefined {
+  const style = biffBorderLineStyle(styleCode)
+  if (!style) return undefined
+  return { style, color: indexedColor(colorIndex, palette) }
+}
 
 function readBiff5ByteString(data: Uint8Array, offset: number, codePage: number): { value: string; offset: number } {
   if (offset >= data.length) return { value: "", offset: data.length }
@@ -549,12 +865,16 @@ function parseGlobals(records: BiffRecord[]): ParsedGlobals {
   let dateSystem: "1900" | "1904" = "1900"
   const sheets: BiffSheetInfo[] = []
   const formats = new Map<number, string>()
-  const xfs: number[] = []
+  const fonts = new Map<number, FontStyle>()
+  const xfs: BiffXf[] = []
+  const palette = new Map<number, Color>()
   let sharedStrings: string[] = []
   let biffVersion = 0x0600
   const names: FormulaNameRef[] = []
   const namedRanges: NamedRange[] = []
   let externSheets: FormulaExternSheetRef[] = []
+  let nextFontId = 0
+  let themeColors: string[] | undefined
 
   for (let i = 0; i < records.length; i++) {
     const record = records[i]!
@@ -576,8 +896,30 @@ function parseGlobals(records: BiffRecord[]): ParsedGlobals {
         if (fmt) formats.set(fmt.id, fmt.value)
         break
       }
+      case BIFF_FONT: {
+        const font = parseFont(record.data, codePage)
+        if (nextFontId === 4) nextFontId += 1
+        if (font) fonts.set(nextFontId, font)
+        nextFontId += 1
+        break
+      }
+      case BIFF_PALETTE: {
+        for (const [index, color] of parsePalette(record.data)) palette.set(index, color)
+        break
+      }
       case BIFF_XF:
-        if (record.data.length >= 4) xfs.push(u16(record.data, 2))
+        {
+          const xf = parseXf(record.data, { formats, fonts, palette })
+          if (xf) xfs.push(xf)
+        }
+        break
+      case BIFF_XFEXT: {
+        const xfExt = parseXfExt(record.data, palette)
+        if (xfExt) applyXfExt(xfs, xfExt)
+        break
+      }
+      case BIFF_THEME:
+        themeColors = parseThemeRecord(record.data) ?? themeColors
         break
       case BIFF_BOUNDSHEET8: {
         const sheet = parseBoundSheet(record.data, sheets.length, codePage, biffVersion >= 0x0600)
@@ -604,11 +946,28 @@ function parseGlobals(records: BiffRecord[]): ParsedGlobals {
         break
       }
       case BIFF_EOF:
-        return { sheets, sharedStrings, dateSystem, formats, xfs, codePage, biffVersion, names, namedRanges, externSheets }
+        i = records.length
+        break
     }
   }
 
-  return { sheets, sharedStrings, dateSystem, formats, xfs, codePage, biffVersion, names, namedRanges, externSheets }
+  if (themeColors) resolveThemeColorsInXfs(xfs, themeColors)
+
+  return {
+    sheets,
+    sharedStrings,
+    dateSystem,
+    formats,
+    fonts,
+    xfs,
+    palette,
+    codePage,
+    biffVersion,
+    names,
+    namedRanges,
+    externSheets,
+    ...(themeColors ? { themeColors } : {}),
+  }
 }
 
 function decodeRk(rk: number): number {
@@ -648,9 +1007,19 @@ function inRange(row: number, col: number, range?: MergeRange): boolean {
 
 function numFmtForXf(xfIndex: number, globals: ParsedGlobals): string | undefined {
   if (xfIndex < 0) return undefined
-  const fmtId = globals.xfs[xfIndex]
-  if (fmtId === undefined) return undefined
-  return globals.formats.get(fmtId) ?? String(fmtId)
+  const xf = globals.xfs[xfIndex]
+  if (!xf) return undefined
+  return numFmtFromId(xf.numFmtId, globals.formats)
+}
+
+function numFmtFromId(fmtId: number, formats: Map<number, string>): string | undefined {
+  return formats.get(fmtId) ?? getBuiltinNumberFormat(fmtId)
+}
+
+function styleForXf(xfIndex: number, globals: ParsedGlobals): CellStyle | undefined {
+  if (xfIndex < 0) return undefined
+  const style = globals.xfs[xfIndex]?.style
+  return style && Object.keys(style).length ? style : undefined
 }
 
 function convertNumber(value: number, xfIndex: number, globals: ParsedGlobals): { value: CellValue; type: CellType } {
@@ -678,8 +1047,8 @@ function setCell(
 
   const cell: Cell = { value, type }
   if (readStyles) {
-    const numFmt = numFmtForXf(xfIndex, globals)
-    if (numFmt) cell.style = { numFmt }
+    const style = styleForXf(xfIndex, globals)
+    if (style) cell.style = style
   }
 
   if (!sheet.cells) sheet.cells = new Map()
@@ -703,8 +1072,8 @@ function setFormulaCell(
 
   const cell: Cell = { value, type: "formula", formula: formula ?? "", formulaResult: value }
   if (readStyles) {
-    const numFmt = numFmtForXf(xfIndex, globals)
-    if (numFmt) cell.style = { numFmt }
+    const style = styleForXf(xfIndex, globals)
+    if (style) cell.style = style
   }
 
   if (!sheet.cells) sheet.cells = new Map()
@@ -740,7 +1109,7 @@ function shouldReadSheet(sheet: BiffSheetInfo, filter: ReadOptions["sheets"] | u
     hidden: sheet.state === "hidden",
     veryHidden: sheet.state === "veryHidden",
   }
-  if (typeof filter === "function") return filter(info)
+  if (typeof filter === "function") return filter(info, sheet.index)
   const items = Array.isArray(filter) ? filter : [filter]
   return items.some((item) => (typeof item === "number" ? item === sheet.index : item === sheet.name))
 }
@@ -990,6 +1359,7 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
         const first = u16(record.data, 0)
         const last = u16(record.data, 2)
         const width = u16(record.data, 4) / 256
+        const xf = u16(record.data, 6)
         const flags = u16(record.data, 8)
         const hidden = (flags & 0x0001) !== 0
         const outlineLevel = (flags >> 8) & 0x07
@@ -999,6 +1369,10 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
           while (sheet.columns.length <= col) sheet.columns.push({})
           const def = sheet.columns[col] ?? {}
           if (width) def.width = width
+          if (readStyles) {
+            const style = styleForXf(xf, globals)
+            if (style) def.style = style
+          }
           if (hidden) def.hidden = true
           if (outlineLevel) def.outlineLevel = outlineLevel
           if (collapsed) def.collapsed = true
@@ -1048,6 +1422,7 @@ export function parseBiffWorkbook(workbookStream: Uint8Array, options?: ReadOpti
     sheets,
     dateSystem: globals.dateSystem,
   }
+  if (globals.themeColors) workbook.themeColors = globals.themeColors
   if (globals.namedRanges.length > 0) workbook.namedRanges = globals.namedRanges
   return workbook
 }

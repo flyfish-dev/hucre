@@ -25,6 +25,12 @@ interface CentralDirEntry {
   hasDataDescriptor: boolean
 }
 
+interface LocalEntryData {
+  compressedData: Uint8Array
+  uncompressedSize: number
+  expectedCrc: number
+}
+
 // ── Decompression ───────────────────────────────────────────────────
 
 let hasDecompressionStream: boolean | undefined
@@ -114,6 +120,15 @@ export class ZipReader {
       throw new ZipError(`Entry not found: ${path}`)
     }
     return this.extractEntry(entry)
+  }
+
+  /** Extract a single file synchronously using the pure TypeScript inflater. */
+  extractSync(path: string): Uint8Array {
+    const entry = this.entryMap.get(path)
+    if (!entry) {
+      throw new ZipError(`Entry not found: ${path}`)
+    }
+    return this.extractEntrySync(entry)
   }
 
   /** Extract a single file as a ReadableStream of decompressed bytes */
@@ -210,7 +225,7 @@ export class ZipReader {
     }
   }
 
-  private async extractEntry(entry: CentralDirEntry): Promise<Uint8Array> {
+  private readLocalEntryData(entry: CentralDirEntry): LocalEntryData {
     const pos = entry.localHeaderOffset
 
     if (pos + 30 > this.data.length) {
@@ -262,6 +277,12 @@ export class ZipReader {
 
     const compressedData = this.data.subarray(dataStart, dataStart + compressedSize)
 
+    return { compressedData, uncompressedSize, expectedCrc }
+  }
+
+  private async extractEntry(entry: CentralDirEntry): Promise<Uint8Array> {
+    const { compressedData, uncompressedSize, expectedCrc } = this.readLocalEntryData(entry)
+
     let result: Uint8Array
 
     if (entry.compressionMethod === 0) {
@@ -269,7 +290,7 @@ export class ZipReader {
       result = compressedData
     } else if (entry.compressionMethod === 8) {
       // DEFLATE
-      if (compressedSize === 0 && uncompressedSize === 0) {
+      if (compressedData.length === 0 && uncompressedSize === 0) {
         result = new Uint8Array(0)
       } else {
         result = await decompressDeflateRaw(compressedData)
@@ -280,17 +301,47 @@ export class ZipReader {
       )
     }
 
+    this.verifyEntry(entry.fileName, result, expectedCrc, uncompressedSize)
+
+    return result
+  }
+
+  private extractEntrySync(entry: CentralDirEntry): Uint8Array {
+    const { compressedData, uncompressedSize, expectedCrc } = this.readLocalEntryData(entry)
+
+    let result: Uint8Array
+
+    if (entry.compressionMethod === 0) {
+      result = compressedData
+    } else if (entry.compressionMethod === 8) {
+      result = compressedData.length === 0 && uncompressedSize === 0 ? new Uint8Array(0) : inflate(compressedData)
+    } else {
+      throw new ZipError(
+        `Unsupported compression method ${entry.compressionMethod} for entry: ${entry.fileName}`,
+      )
+    }
+
+    this.verifyEntry(entry.fileName, result, expectedCrc, uncompressedSize)
+
+    return result
+  }
+
+  private verifyEntry(fileName: string, result: Uint8Array, expectedCrc: number, uncompressedSize: number): void {
+    if (uncompressedSize !== 0 && result.length !== uncompressedSize) {
+      throw new ZipError(
+        `Uncompressed size mismatch for ${fileName}: expected ${uncompressedSize}, got ${result.length}`,
+      )
+    }
+
     // Verify CRC-32 (skip if CRC is 0 — some generators omit it)
     if (expectedCrc !== 0 && result.length > 0) {
       const actualCrc = crc32(result)
       if (actualCrc !== expectedCrc) {
         throw new ZipError(
-          `CRC-32 mismatch for ${entry.fileName}: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`,
+          `CRC-32 mismatch for ${fileName}: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`,
         )
       }
     }
-
-    return result
   }
 
   private extractEntryStream(entry: CentralDirEntry): ReadableStream<Uint8Array> {

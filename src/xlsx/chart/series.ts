@@ -238,13 +238,19 @@ export function parseSeries(ser: XmlElement, kind: ChartKind, index: number): Ch
 
   // Numeric values land in <c:val> for most chart types; scatter and
   // bubble use <c:yVal> instead.
-  const valuesRef = formulaText(findChild(ser, "val")) ?? formulaText(findChild(ser, "yVal"))
+  const valuesNode = findChild(ser, "val") ?? findChild(ser, "yVal")
+  const valuesRef = formulaText(valuesNode)
   if (valuesRef !== undefined) out.valuesRef = valuesRef
+  const cachedValues = parseCachedChartValues(valuesNode)
+  if (cachedValues !== undefined) out.cachedValues = cachedValues
 
   // Categories live in <c:cat> for category-axis charts and in
   // <c:xVal> for scatter/bubble.
-  const catRef = formulaText(findChild(ser, "cat")) ?? formulaText(findChild(ser, "xVal"))
+  const categoriesNode = findChild(ser, "cat") ?? findChild(ser, "xVal")
+  const catRef = formulaText(categoriesNode)
   if (catRef !== undefined) out.categoriesRef = catRef
+  const cachedCategories = parseCachedChartValues(categoriesNode)
+  if (cachedCategories !== undefined) out.cachedCategories = cachedCategories
 
   const color = parseSeriesColor(ser)
   if (color !== undefined) out.color = color
@@ -342,6 +348,52 @@ export function parseSeries(ser: XmlElement, kind: ChartKind, index: number): Ch
   }
 
   return out
+}
+
+function parseCachedChartValues(wrapper: XmlElement | undefined): Array<number | string | null> | undefined {
+  if (!wrapper) return undefined
+  const strCache = findChild(wrapper, "strLit") ?? findChild(findChild(wrapper, "strRef") ?? wrapper, "strCache")
+  if (strCache) return parseChartPointCache(strCache, false)
+
+  const numCache = findChild(wrapper, "numLit") ?? findChild(findChild(wrapper, "numRef") ?? wrapper, "numCache")
+  if (numCache) return parseChartPointCache(numCache, true)
+
+  return undefined
+}
+
+function parseChartPointCache(cache: XmlElement, numeric: boolean): Array<number | string | null> | undefined {
+  const values: Array<number | string | null> = []
+  let sawPoint = false
+
+  for (const pt of childElements(cache)) {
+    if (pt.local !== "pt") continue
+    const valueNode = findChild(pt, "v")
+    if (!valueNode) continue
+
+    const value = parseChartPointValue(elementText(valueNode), numeric)
+    const rawIndex = pt.attrs.idx
+    const index = typeof rawIndex === "string" ? Number.parseInt(rawIndex, 10) : Number.NaN
+    if (Number.isInteger(index) && index >= 0) {
+      values[index] = value
+    } else {
+      values.push(value)
+    }
+    sawPoint = true
+  }
+
+  if (!sawPoint) return undefined
+  for (let i = 0; i < values.length; i += 1) {
+    if (values[i] === undefined) values[i] = null
+  }
+  return values
+}
+
+function parseChartPointValue(value: string, numeric: boolean): number | string | null {
+  const text = value.trim()
+  if (text.length === 0) return null
+  if (!numeric) return text
+  const n = Number.parseFloat(text)
+  return Number.isFinite(n) ? n : text
 }
 
 /**

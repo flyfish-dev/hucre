@@ -5605,6 +5605,18 @@ export interface ChartSeriesInfo {
   valuesRef?: string
   /** Raw `<c:f>` for `<c:cat>` / `<c:xVal>`. */
   categoriesRef?: string
+  /**
+   * Cached numeric values embedded in `<c:numLit>` or `<c:numRef><c:numCache>`.
+   * Present when the chart XML carries point values directly, or as a fallback
+   * when an external range reference cannot be resolved by the host renderer.
+   */
+  cachedValues?: Array<number | string | null>
+  /**
+   * Cached category labels embedded in `<c:strLit>` / `<c:strRef><c:strCache>`
+   * or numeric category caches. Present when the chart XML carries literal
+   * category values, or as a fallback for unresolved range references.
+   */
+  cachedCategories?: Array<number | string | null>
   /** 6-digit RGB hex from `<c:spPr><a:solidFill><a:srgbClr val>`. */
   color?: string
   /**

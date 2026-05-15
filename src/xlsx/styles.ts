@@ -16,6 +16,7 @@ import type {
 } from "../_types"
 import { parseXml } from "../xml/parser"
 import { isDateFormat } from "../_date"
+import { BUILTIN_NUM_FMTS, DATE_FMT_IDS } from "../style-utils"
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -47,51 +48,6 @@ export interface CellXf {
    */
   hasCheckboxFeature?: boolean
 }
-
-// ── Built-in Number Formats ──────────────────────────────────────────
-
-const BUILTIN_NUM_FMTS: Record<number, string> = {
-  0: "General",
-  1: "0",
-  2: "0.00",
-  3: "#,##0",
-  4: "#,##0.00",
-  5: "$#,##0_);\\($#,##0\\)",
-  6: "$#,##0_);[Red]\\($#,##0\\)",
-  7: "$#,##0.00_);\\($#,##0.00\\)",
-  8: "$#,##0.00_);[Red]\\($#,##0.00\\)",
-  9: "0%",
-  10: "0.00%",
-  11: "0.00E+00",
-  12: "# ?/?",
-  13: "# ??/??",
-  14: "m/d/yyyy",
-  15: "d-mmm-yy",
-  16: "d-mmm",
-  17: "mmm-yy",
-  18: "h:mm AM/PM",
-  19: "h:mm:ss AM/PM",
-  20: "h:mm",
-  21: "h:mm:ss",
-  22: "m/d/yyyy h:mm",
-  37: "#,##0 ;(#,##0)",
-  38: "#,##0 ;[Red](#,##0)",
-  39: "#,##0.00;(#,##0.00)",
-  40: "#,##0.00;[Red](#,##0.00)",
-  45: "mm:ss",
-  46: "[h]:mm:ss",
-  47: "mmss.0",
-  48: "##0.0E+0",
-  49: "@",
-}
-
-// ── Date Format Detection ────────────────────────────────────────────
-
-/** Built-in format IDs that represent date/time formats */
-const DATE_FMT_IDS = new Set([
-  14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 45, 46, 47, 50, 51,
-  52, 53, 54, 55, 56, 57, 58,
-])
 
 // ── Parser ───────────────────────────────────────────────────────────
 
