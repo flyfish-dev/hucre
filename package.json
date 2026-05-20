@@ -16,8 +16,8 @@
     "typescript",
     "write",
     "xls",
-    "xlsx",
     "xlsb",
+    "xlsx",
     "zero-dependency"
   ],
   "homepage": "https://github.com/productdevbook/hucre",

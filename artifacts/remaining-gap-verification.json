@@ -40,9 +40,7 @@
     {
       "item": "XLSB rich shared-string formatting runs",
       "status": "implemented",
-      "details": [
-        "BrtSSTItem run boundaries are surfaced as Cell.richText spans"
-      ]
+      "details": ["BrtSSTItem run boundaries are surfaced as Cell.richText spans"]
     },
     {
       "item": "charts, drawings, comments, tables, pivots, defined names, hyperlinks, document properties for XLS/XLSB parity",

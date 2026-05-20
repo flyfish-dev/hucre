@@ -64,7 +64,8 @@ function decodeUtf16Le(bytes: Uint8Array): string {
     return new TextDecoder("utf-16le").decode(bytes)
   } catch {
     let out = ""
-    for (let i = 0; i + 1 < bytes.length; i += 2) out += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
+    for (let i = 0; i + 1 < bytes.length; i += 2)
+      out += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
     return out
   }
 }
@@ -123,7 +124,12 @@ function oleDateToDate(value: number): Date | undefined {
   return new Date(ms)
 }
 
-function readStringValue(data: Uint8Array, offset: number, codePage: number, wide: boolean): string | undefined {
+function readStringValue(
+  data: Uint8Array,
+  offset: number,
+  codePage: number,
+  wide: boolean,
+): string | undefined {
   if (offset + 4 > data.length) return undefined
   const length = u32(data, offset)
   const start = offset + 4
@@ -157,7 +163,9 @@ function readTypedValue(data: Uint8Array, offset: number, codePage: number): unk
     case VT_DATE:
       return valueOffset + 8 <= data.length ? oleDateToDate(f64(data, valueOffset)) : undefined
     case VT_BOOL:
-      return valueOffset + 2 <= data.length ? view(data).getInt16(valueOffset, true) !== 0 : undefined
+      return valueOffset + 2 <= data.length
+        ? view(data).getInt16(valueOffset, true) !== 0
+        : undefined
     case VT_BSTR:
     case VT_LPSTR:
       return readStringValue(data, valueOffset, codePage, false)

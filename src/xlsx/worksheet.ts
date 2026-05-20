@@ -915,6 +915,7 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               dbColor,
               isCfvos,
               isAttrs,
+              ctx.styles,
             )
             if (cfRule) {
               conditionalRules.push(cfRule)
@@ -1356,6 +1357,7 @@ function buildConditionalRule(
   dbColor: string,
   isCfvos: Array<{ type: string; value?: string }>,
   isAttrsObj: Record<string, string>,
+  styles: ParsedStyles | null,
 ): ConditionalRule | null {
   const typeStr = attrs["type"]
   if (!typeStr || !VALID_CF_TYPES.has(typeStr)) return null
@@ -1373,8 +1375,10 @@ function buildConditionalRule(
     rule.operator = operatorStr as ValidationOperator
   }
 
-  // dxfId — we store it but don't resolve to a style (dxf styles are not parsed in the reader yet)
-  // The round-trip test will check the type/priority/formulas; style is write-only for now.
+  const dxfId = attrs["dxfId"] !== undefined ? Number(attrs["dxfId"]) : Number.NaN
+  if (Number.isInteger(dxfId) && styles?.dxfs[dxfId]) {
+    rule.style = styles.dxfs[dxfId]
+  }
 
   // stopIfTrue
   if (attrs["stopIfTrue"] === "1" || attrs["stopIfTrue"] === "true") {

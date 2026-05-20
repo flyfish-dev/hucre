@@ -65,7 +65,7 @@ export async function decryptOfficeEncryptedPackage(
   if (!password) {
     throw new EncryptedFileError(
       format,
-      "File is password-protected. Pass `{ password: \"...\" }` in read options to decrypt it.",
+      'File is password-protected. Pass `{ password: "..." }` in read options to decrypt it.',
     )
   }
 
@@ -73,7 +73,9 @@ export async function decryptOfficeEncryptedPackage(
   const encryptionInfo = cfb.getStream(ENCRYPTION_INFO_STREAM)
   const encryptedPackage = cfb.getStream(ENCRYPTED_PACKAGE_STREAM)
   if (!encryptionInfo || !encryptedPackage) {
-    throw new ParseError("Invalid encrypted Office package: missing EncryptionInfo or EncryptedPackage stream")
+    throw new ParseError(
+      "Invalid encrypted Office package: missing EncryptionInfo or EncryptedPackage stream",
+    )
   }
 
   return decryptEncryptionInfoPackage(encryptionInfo, encryptedPackage, password, format)
@@ -148,7 +150,10 @@ async function decryptAgilePackage(
     return await decryptAgilePackageUnchecked(xmlBytes, encryptedPackage, password, format)
   } catch (err) {
     if (err instanceof EncryptedFileError || err instanceof ParseError) throw err
-    throw new EncryptedFileError(format, "Incorrect password or corrupted encrypted Office workbook.")
+    throw new EncryptedFileError(
+      format,
+      "Incorrect password or corrupted encrypted Office workbook.",
+    )
   }
 }
 
@@ -160,25 +165,73 @@ async function decryptAgilePackageUnchecked(
 ): Promise<Uint8Array> {
   const xml = decodeUtf8(stripTrailingZeros(xmlBytes))
   const info = parseAgileInfo(xml)
-  const passwordHash = await hashPasswordAgile(password, info.encryptedKey.saltValue, info.encryptedKey.spinCount, info.encryptedKey.hashAlgorithm)
+  const passwordHash = await hashPasswordAgile(
+    password,
+    info.encryptedKey.saltValue,
+    info.encryptedKey.spinCount,
+    info.encryptedKey.hashAlgorithm,
+  )
 
-  const verifierKey = await deriveAgileKey(passwordHash, BLOCKKEY_VERIFIER_INPUT, info.encryptedKey.hashAlgorithm, info.encryptedKey.keyBits / 8)
-  const verifierIv = await deriveAgileIv(info.encryptedKey.saltValue, BLOCKKEY_VERIFIER_INPUT, info.encryptedKey.hashAlgorithm, info.encryptedKey.blockSize)
-  const verifierInput = await aesCbcDecrypt(verifierKey, verifierIv, info.encryptedKey.encryptedVerifierHashInput)
+  const verifierKey = await deriveAgileKey(
+    passwordHash,
+    BLOCKKEY_VERIFIER_INPUT,
+    info.encryptedKey.hashAlgorithm,
+    info.encryptedKey.keyBits / 8,
+  )
+  const verifierIv = await deriveAgileIv(
+    info.encryptedKey.saltValue,
+    BLOCKKEY_VERIFIER_INPUT,
+    info.encryptedKey.hashAlgorithm,
+    info.encryptedKey.blockSize,
+  )
+  const verifierInput = await aesCbcDecrypt(
+    verifierKey,
+    verifierIv,
+    info.encryptedKey.encryptedVerifierHashInput,
+  )
 
-  const verifierValueKey = await deriveAgileKey(passwordHash, BLOCKKEY_VERIFIER_VALUE, info.encryptedKey.hashAlgorithm, info.encryptedKey.keyBits / 8)
-  const verifierValueIv = await deriveAgileIv(info.encryptedKey.saltValue, BLOCKKEY_VERIFIER_VALUE, info.encryptedKey.hashAlgorithm, info.encryptedKey.blockSize)
-  const verifierHashValue = await aesCbcDecrypt(verifierValueKey, verifierValueIv, info.encryptedKey.encryptedVerifierHashValue)
+  const verifierValueKey = await deriveAgileKey(
+    passwordHash,
+    BLOCKKEY_VERIFIER_VALUE,
+    info.encryptedKey.hashAlgorithm,
+    info.encryptedKey.keyBits / 8,
+  )
+  const verifierValueIv = await deriveAgileIv(
+    info.encryptedKey.saltValue,
+    BLOCKKEY_VERIFIER_VALUE,
+    info.encryptedKey.hashAlgorithm,
+    info.encryptedKey.blockSize,
+  )
+  const verifierHashValue = await aesCbcDecrypt(
+    verifierValueKey,
+    verifierValueIv,
+    info.encryptedKey.encryptedVerifierHashValue,
+  )
   const verifierHash = await digest(info.encryptedKey.hashAlgorithm, verifierInput)
-  if (!constantTimeStartsWith(verifierHashValue, verifierHash.subarray(0, info.encryptedKey.hashSize))) {
+  if (
+    !constantTimeStartsWith(verifierHashValue, verifierHash.subarray(0, info.encryptedKey.hashSize))
+  ) {
     throw new EncryptedFileError(format, "Incorrect password for encrypted Office workbook.")
   }
 
-  const secretKeyKey = await deriveAgileKey(passwordHash, BLOCKKEY_ENCRYPTED_KEY, info.encryptedKey.hashAlgorithm, info.encryptedKey.keyBits / 8)
-  const secretKeyIv = await deriveAgileIv(info.encryptedKey.saltValue, BLOCKKEY_ENCRYPTED_KEY, info.encryptedKey.hashAlgorithm, info.encryptedKey.blockSize)
-  const secretKey = (await aesCbcDecrypt(secretKeyKey, secretKeyIv, info.encryptedKey.encryptedKeyValue)).subarray(0, info.keyData.keyBits / 8)
+  const secretKeyKey = await deriveAgileKey(
+    passwordHash,
+    BLOCKKEY_ENCRYPTED_KEY,
+    info.encryptedKey.hashAlgorithm,
+    info.encryptedKey.keyBits / 8,
+  )
+  const secretKeyIv = await deriveAgileIv(
+    info.encryptedKey.saltValue,
+    BLOCKKEY_ENCRYPTED_KEY,
+    info.encryptedKey.hashAlgorithm,
+    info.encryptedKey.blockSize,
+  )
+  const secretKey = (
+    await aesCbcDecrypt(secretKeyKey, secretKeyIv, info.encryptedKey.encryptedKeyValue)
+  ).subarray(0, info.keyData.keyBits / 8)
 
-  if (encryptedPackage.length < 8) throw new ParseError("Invalid EncryptedPackage stream: too short")
+  if (encryptedPackage.length < 8)
+    throw new ParseError("Invalid EncryptedPackage stream: too short")
   const packageView = dv(encryptedPackage)
   const originalSize = Number(packageView.getBigUint64(0, true))
   const out = new Uint8Array(originalSize)
@@ -189,11 +242,19 @@ async function decryptAgilePackageUnchecked(
   while (plainOffset < originalSize) {
     const plainLen = Math.min(PACKAGE_SEGMENT_SIZE, originalSize - plainOffset)
     const encryptedLen = align(plainLen, info.keyData.blockSize)
-    const encryptedChunk = encryptedPackage.subarray(encryptedOffset, encryptedOffset + encryptedLen)
+    const encryptedChunk = encryptedPackage.subarray(
+      encryptedOffset,
+      encryptedOffset + encryptedLen,
+    )
     if (encryptedChunk.length !== encryptedLen) {
       throw new ParseError("Invalid EncryptedPackage stream: encrypted payload is truncated")
     }
-    const iv = await deriveAgileIv(info.keyData.saltValue, int32le(block), info.keyData.hashAlgorithm, info.keyData.blockSize)
+    const iv = await deriveAgileIv(
+      info.keyData.saltValue,
+      int32le(block),
+      info.keyData.hashAlgorithm,
+      info.keyData.blockSize,
+    )
     const plainChunk = await aesCbcDecrypt(secretKey, iv, encryptedChunk)
     out.set(plainChunk.subarray(0, plainLen), plainOffset)
     encryptedOffset += encryptedLen
@@ -217,24 +278,74 @@ export async function encryptOfficeAgilePackageParts(
   const encryptedKeySalt = randomBytes(16)
   const packageKey = randomBytes(keyBits / 8)
   const verifierInputPlain = randomBytes(16)
-  const passwordHash = await hashPasswordAgile(options.password, encryptedKeySalt, spinCount, hashAlgorithm)
+  const passwordHash = await hashPasswordAgile(
+    options.password,
+    encryptedKeySalt,
+    spinCount,
+    hashAlgorithm,
+  )
 
   const verifierHash = await digest(hashAlgorithm, verifierInputPlain)
-  const verifierInputKey = await deriveAgileKey(passwordHash, BLOCKKEY_VERIFIER_INPUT, hashAlgorithm, keyBits / 8)
-  const verifierInputIv = await deriveAgileIv(encryptedKeySalt, BLOCKKEY_VERIFIER_INPUT, hashAlgorithm, blockSize)
-  const encryptedVerifierHashInput = await aesCbcEncrypt(verifierInputKey, verifierInputIv, verifierInputPlain)
+  const verifierInputKey = await deriveAgileKey(
+    passwordHash,
+    BLOCKKEY_VERIFIER_INPUT,
+    hashAlgorithm,
+    keyBits / 8,
+  )
+  const verifierInputIv = await deriveAgileIv(
+    encryptedKeySalt,
+    BLOCKKEY_VERIFIER_INPUT,
+    hashAlgorithm,
+    blockSize,
+  )
+  const encryptedVerifierHashInput = await aesCbcEncrypt(
+    verifierInputKey,
+    verifierInputIv,
+    verifierInputPlain,
+  )
 
-  const verifierValueKey = await deriveAgileKey(passwordHash, BLOCKKEY_VERIFIER_VALUE, hashAlgorithm, keyBits / 8)
-  const verifierValueIv = await deriveAgileIv(encryptedKeySalt, BLOCKKEY_VERIFIER_VALUE, hashAlgorithm, blockSize)
-  const encryptedVerifierHashValue = await aesCbcEncrypt(verifierValueKey, verifierValueIv, verifierHash)
+  const verifierValueKey = await deriveAgileKey(
+    passwordHash,
+    BLOCKKEY_VERIFIER_VALUE,
+    hashAlgorithm,
+    keyBits / 8,
+  )
+  const verifierValueIv = await deriveAgileIv(
+    encryptedKeySalt,
+    BLOCKKEY_VERIFIER_VALUE,
+    hashAlgorithm,
+    blockSize,
+  )
+  const encryptedVerifierHashValue = await aesCbcEncrypt(
+    verifierValueKey,
+    verifierValueIv,
+    verifierHash,
+  )
 
-  const secretKeyKey = await deriveAgileKey(passwordHash, BLOCKKEY_ENCRYPTED_KEY, hashAlgorithm, keyBits / 8)
-  const secretKeyIv = await deriveAgileIv(encryptedKeySalt, BLOCKKEY_ENCRYPTED_KEY, hashAlgorithm, blockSize)
+  const secretKeyKey = await deriveAgileKey(
+    passwordHash,
+    BLOCKKEY_ENCRYPTED_KEY,
+    hashAlgorithm,
+    keyBits / 8,
+  )
+  const secretKeyIv = await deriveAgileIv(
+    encryptedKeySalt,
+    BLOCKKEY_ENCRYPTED_KEY,
+    hashAlgorithm,
+    blockSize,
+  )
   const encryptedKeyValue = await aesCbcEncrypt(secretKeyKey, secretKeyIv, packageKey)
 
   const encryptedPayloadParts: Uint8Array[] = []
-  for (let offset = 0, block = 0; offset < packageData.length; offset += PACKAGE_SEGMENT_SIZE, block++) {
-    const plainChunk = packageData.subarray(offset, Math.min(offset + PACKAGE_SEGMENT_SIZE, packageData.length))
+  for (
+    let offset = 0, block = 0;
+    offset < packageData.length;
+    offset += PACKAGE_SEGMENT_SIZE, block++
+  ) {
+    const plainChunk = packageData.subarray(
+      offset,
+      Math.min(offset + PACKAGE_SEGMENT_SIZE, packageData.length),
+    )
     const iv = await deriveAgileIv(keyDataSalt, int32le(block), hashAlgorithm, blockSize)
     encryptedPayloadParts.push(await aesCbcEncrypt(packageKey, iv, plainChunk))
   }
@@ -272,7 +383,9 @@ function parseAgileInfo(xml: string): AgileInfo {
   const keyDataTag = tagAttrs(xml, "keyData")
   const encryptedKeyTag = tagAttrs(xml, "encryptedKey")
   if (!keyDataTag || !encryptedKeyTag) {
-    throw new ParseError("Invalid Agile EncryptionInfo XML: missing keyData or encryptedKey element")
+    throw new ParseError(
+      "Invalid Agile EncryptionInfo XML: missing keyData or encryptedKey element",
+    )
   }
 
   return {
@@ -280,7 +393,11 @@ function parseAgileInfo(xml: string): AgileInfo {
       saltValue: b64(required(keyDataTag, "saltValue", "keyData")),
       blockSize: intAttr(keyDataTag, "blockSize", 16),
       keyBits: intAttr(keyDataTag, "keyBits", 256),
-      hashSize: intAttr(keyDataTag, "hashSize", hashByteLength(normalizeHash(required(keyDataTag, "hashAlgorithm", "keyData")))),
+      hashSize: intAttr(
+        keyDataTag,
+        "hashSize",
+        hashByteLength(normalizeHash(required(keyDataTag, "hashAlgorithm", "keyData"))),
+      ),
       cipherAlgorithm: required(keyDataTag, "cipherAlgorithm", "keyData"),
       cipherChaining: required(keyDataTag, "cipherChaining", "keyData"),
       hashAlgorithm: normalizeHash(required(keyDataTag, "hashAlgorithm", "keyData")),
@@ -290,12 +407,20 @@ function parseAgileInfo(xml: string): AgileInfo {
       spinCount: intAttr(encryptedKeyTag, "spinCount", 100000),
       blockSize: intAttr(encryptedKeyTag, "blockSize", 16),
       keyBits: intAttr(encryptedKeyTag, "keyBits", 256),
-      hashSize: intAttr(encryptedKeyTag, "hashSize", hashByteLength(normalizeHash(required(encryptedKeyTag, "hashAlgorithm", "encryptedKey")))),
+      hashSize: intAttr(
+        encryptedKeyTag,
+        "hashSize",
+        hashByteLength(normalizeHash(required(encryptedKeyTag, "hashAlgorithm", "encryptedKey"))),
+      ),
       cipherAlgorithm: required(encryptedKeyTag, "cipherAlgorithm", "encryptedKey"),
       cipherChaining: required(encryptedKeyTag, "cipherChaining", "encryptedKey"),
       hashAlgorithm: normalizeHash(required(encryptedKeyTag, "hashAlgorithm", "encryptedKey")),
-      encryptedVerifierHashInput: b64(required(encryptedKeyTag, "encryptedVerifierHashInput", "encryptedKey")),
-      encryptedVerifierHashValue: b64(required(encryptedKeyTag, "encryptedVerifierHashValue", "encryptedKey")),
+      encryptedVerifierHashInput: b64(
+        required(encryptedKeyTag, "encryptedVerifierHashInput", "encryptedKey"),
+      ),
+      encryptedVerifierHashValue: b64(
+        required(encryptedKeyTag, "encryptedVerifierHashValue", "encryptedKey"),
+      ),
       encryptedKeyValue: b64(required(encryptedKeyTag, "encryptedKeyValue", "encryptedKey")),
     },
   }
@@ -316,7 +441,8 @@ function tagAttrs(xml: string, localName: string): Record<string, string> | null
 
 function required(attrs: Record<string, string>, name: string, tag: string): string {
   const value = attrs[name]
-  if (value === undefined) throw new ParseError(`Invalid Agile EncryptionInfo XML: ${tag}/@${name} is missing`)
+  if (value === undefined)
+    throw new ParseError(`Invalid Agile EncryptionInfo XML: ${tag}/@${name} is missing`)
   return value
 }
 
@@ -410,45 +536,91 @@ async function digest(algorithm: HashAlgorithmIdentifier, data: Uint8Array): Pro
   return new Uint8Array(out)
 }
 
-async function aesCbcDecrypt(keyBytes: Uint8Array, iv: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+async function aesCbcDecrypt(
+  keyBytes: Uint8Array,
+  iv: Uint8Array,
+  data: Uint8Array,
+): Promise<Uint8Array> {
   const node = await nodeCrypto()
   if (node) {
     const buffer = nodeBuffer()
-    const decipher = node.createDecipheriv(`aes-${keyBytes.length * 8}-cbc`, buffer.from(keyBytes), buffer.from(iv))
+    const decipher = node.createDecipheriv(
+      `aes-${keyBytes.length * 8}-cbc`,
+      buffer.from(keyBytes),
+      buffer.from(iv),
+    )
     decipher.setAutoPadding(false)
     return new Uint8Array(buffer.concat([decipher.update(buffer.from(data)), decipher.final()]))
   }
 
   const subtle = cryptoSubtle()
-  const key = await subtle.importKey("raw", keyBytes as unknown as BufferSource, { name: "AES-CBC" }, false, ["decrypt"])
-  const out = await subtle.decrypt({ name: "AES-CBC", iv: iv as unknown as BufferSource }, key, data as unknown as BufferSource)
+  const key = await subtle.importKey(
+    "raw",
+    keyBytes as unknown as BufferSource,
+    { name: "AES-CBC" },
+    false,
+    ["decrypt"],
+  )
+  const out = await subtle.decrypt(
+    { name: "AES-CBC", iv: iv as unknown as BufferSource },
+    key,
+    data as unknown as BufferSource,
+  )
   return new Uint8Array(out)
 }
 
-async function aesCbcEncrypt(keyBytes: Uint8Array, iv: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+async function aesCbcEncrypt(
+  keyBytes: Uint8Array,
+  iv: Uint8Array,
+  data: Uint8Array,
+): Promise<Uint8Array> {
   const node = await nodeCrypto()
   if (node) {
     const buffer = nodeBuffer()
-    const cipher = node.createCipheriv(`aes-${keyBytes.length * 8}-cbc`, buffer.from(keyBytes), buffer.from(iv))
+    const cipher = node.createCipheriv(
+      `aes-${keyBytes.length * 8}-cbc`,
+      buffer.from(keyBytes),
+      buffer.from(iv),
+    )
     cipher.setAutoPadding(false)
     const padded = data.length % 16 === 0 ? data : padOrTruncate(data, align(data.length, 16))
     return new Uint8Array(buffer.concat([cipher.update(buffer.from(padded)), cipher.final()]))
   }
 
   const subtle = cryptoSubtle()
-  const key = await subtle.importKey("raw", keyBytes as unknown as BufferSource, { name: "AES-CBC" }, false, ["encrypt"])
-  const out = await subtle.encrypt({ name: "AES-CBC", iv: iv as unknown as BufferSource }, key, data as unknown as BufferSource)
+  const key = await subtle.importKey(
+    "raw",
+    keyBytes as unknown as BufferSource,
+    { name: "AES-CBC" },
+    false,
+    ["encrypt"],
+  )
+  const out = await subtle.encrypt(
+    { name: "AES-CBC", iv: iv as unknown as BufferSource },
+    key,
+    data as unknown as BufferSource,
+  )
   return new Uint8Array(out)
 }
 
 async function nodeCrypto(): Promise<null | {
-  createCipheriv(algorithm: string, key: unknown, iv: unknown): { setAutoPadding(value: boolean): void; update(data: unknown): unknown; final(): unknown }
-  createDecipheriv(algorithm: string, key: unknown, iv: unknown): { setAutoPadding(value: boolean): void; update(data: unknown): unknown; final(): unknown }
+  createCipheriv(
+    algorithm: string,
+    key: unknown,
+    iv: unknown,
+  ): { setAutoPadding(value: boolean): void; update(data: unknown): unknown; final(): unknown }
+  createDecipheriv(
+    algorithm: string,
+    key: unknown,
+    iv: unknown,
+  ): { setAutoPadding(value: boolean): void; update(data: unknown): unknown; final(): unknown }
 }> {
   const g = globalThis as unknown as { process?: { versions?: { node?: string } } }
   if (!g.process?.versions?.node) return null
   try {
-    const importer = Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>
+    const importer = Function("specifier", "return import(specifier)") as (
+      specifier: string,
+    ) => Promise<unknown>
     return (await importer("node:crypto")) as Awaited<ReturnType<typeof nodeCrypto>>
   } catch {
     return null
@@ -456,7 +628,11 @@ async function nodeCrypto(): Promise<null | {
 }
 
 function nodeBuffer(): { from(data: Uint8Array): unknown; concat(parts: unknown[]): Uint8Array } {
-  const ctor = (globalThis as unknown as { Buffer?: { from(data: Uint8Array): unknown; concat(parts: unknown[]): Uint8Array } }).Buffer
+  const ctor = (
+    globalThis as unknown as {
+      Buffer?: { from(data: Uint8Array): unknown; concat(parts: unknown[]): Uint8Array }
+    }
+  ).Buffer
   if (!ctor) throw new ParseError("Node Buffer is not available for AES-CBC no-padding.")
   return ctor
 }
@@ -464,13 +640,16 @@ function nodeBuffer(): { from(data: Uint8Array): unknown; concat(parts: unknown[
 function cryptoSubtle(): SubtleCrypto {
   const subtle = globalThis.crypto?.subtle
   if (!subtle) {
-    throw new ParseError("Office decryption requires Web Crypto SubtleCrypto (available in browsers and Node 20+).")
+    throw new ParseError(
+      "Office decryption requires Web Crypto SubtleCrypto (available in browsers and Node 20+).",
+    )
   }
   return subtle
 }
 
 function randomBytes(len: number): Uint8Array {
-  if (!globalThis.crypto?.getRandomValues) throw new ParseError("Office encryption requires crypto.getRandomValues().")
+  if (!globalThis.crypto?.getRandomValues)
+    throw new ParseError("Office encryption requires crypto.getRandomValues().")
   const out = new Uint8Array(len)
   globalThis.crypto.getRandomValues(out)
   return out
@@ -529,7 +708,9 @@ function b64(s: string): Uint8Array {
     for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i)
     return out
   }
-  const bufferCtor = (globalThis as unknown as { Buffer?: { from(data: string, encoding: string): Uint8Array } }).Buffer
+  const bufferCtor = (
+    globalThis as unknown as { Buffer?: { from(data: string, encoding: string): Uint8Array } }
+  ).Buffer
   if (bufferCtor) return new Uint8Array(bufferCtor.from(s, "base64"))
   throw new ParseError("Base64 decoding is not available in this runtime.")
 }
@@ -541,7 +722,11 @@ function toB64(data: Uint8Array): string {
     for (const b of data) s += String.fromCharCode(b)
     return btoaFn(s)
   }
-  const bufferCtor = (globalThis as unknown as { Buffer?: { from(data: Uint8Array): { toString(enc: string): string } } }).Buffer
+  const bufferCtor = (
+    globalThis as unknown as {
+      Buffer?: { from(data: Uint8Array): { toString(enc: string): string } }
+    }
+  ).Buffer
   if (bufferCtor) return bufferCtor.from(data).toString("base64")
   throw new ParseError("Base64 encoding is not available in this runtime.")
 }
@@ -587,13 +772,15 @@ function buildAgileXml(args: {
   encryptedKeyValue: Uint8Array
 }): string {
   const hash = String(args.hashAlgorithm).replace("-", "")
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  return (
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<encryption xmlns="http://schemas.microsoft.com/office/2006/encryption" xmlns:p="http://schemas.microsoft.com/office/2006/keyEncryptor/password">` +
     `<keyData saltSize="${args.keyDataSalt.length}" blockSize="${args.blockSize}" keyBits="${args.keyBits}" hashSize="${args.hashSize}" cipherAlgorithm="AES" cipherChaining="ChainingModeCBC" hashAlgorithm="${hash}" saltValue="${toB64(args.keyDataSalt)}"/>` +
     `<dataIntegrity encryptedHmacKey="" encryptedHmacValue=""/>` +
     `<keyEncryptors><keyEncryptor uri="http://schemas.microsoft.com/office/2006/keyEncryptor/password">` +
     `<p:encryptedKey spinCount="${args.spinCount}" saltSize="${args.encryptedKeySalt.length}" blockSize="${args.blockSize}" keyBits="${args.keyBits}" hashSize="${args.hashSize}" cipherAlgorithm="AES" cipherChaining="ChainingModeCBC" hashAlgorithm="${hash}" saltValue="${toB64(args.encryptedKeySalt)}" encryptedVerifierHashInput="${toB64(args.encryptedVerifierHashInput)}" encryptedVerifierHashValue="${toB64(args.encryptedVerifierHashValue)}" encryptedKeyValue="${toB64(args.encryptedKeyValue)}"/>` +
     `</keyEncryptor></keyEncryptors></encryption>`
+  )
 }
 
 interface CfbWriteStream {
@@ -655,7 +842,18 @@ function writeSimpleCfb(streams: CfbWriteStream[]): Uint8Array {
     view.setUint32(0x4c + i * 4, firstFatSector + i, true)
   }
 
-  writeDirectoryEntry(out, directoryStart, 0, "Root Entry", 5, END_OF_CHAIN, 0, streams.length > 0 ? 1 : 0, FREE_SECT, FREE_SECT)
+  writeDirectoryEntry(
+    out,
+    directoryStart,
+    0,
+    "Root Entry",
+    5,
+    END_OF_CHAIN,
+    0,
+    streams.length > 0 ? 1 : 0,
+    FREE_SECT,
+    FREE_SECT,
+  )
   for (let i = 0; i < streams.length; i++) {
     writeDirectoryEntry(
       out,

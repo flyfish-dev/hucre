@@ -3,7 +3,17 @@
 // container layout as XLSX, but workbook and worksheet bodies are BIFF12
 // binary parts instead of XML parts.
 
-import type { Cell, CellType, CellValue, MergeRange, ReadInput, ReadOptions, RichTextRun, Sheet, Workbook } from "../_types"
+import type {
+  Cell,
+  CellType,
+  CellValue,
+  MergeRange,
+  ReadInput,
+  ReadOptions,
+  RichTextRun,
+  Sheet,
+  Workbook,
+} from "../_types"
 import { ParseError, ZipError } from "../errors"
 import { isDateFormat, serialToDate } from "../_date"
 import { decodeBiffFormula } from "../xls/formula"
@@ -12,7 +22,11 @@ import { decryptOfficeEncryptedPackage } from "../crypto/office-crypto"
 import { ZipReader } from "../zip/reader"
 import { parseContentTypes } from "../xlsx/content-types"
 import { parseRelationships } from "../xlsx/relationships"
-import { parseCoreProperties, parseAppProperties, parseCustomProperties } from "../xlsx/doc-props-reader"
+import {
+  parseCoreProperties,
+  parseAppProperties,
+  parseCustomProperties,
+} from "../xlsx/doc-props-reader"
 import type { Relationship } from "../xlsx/relationships"
 import {
   BRT_BUNDLE_SH,
@@ -58,7 +72,11 @@ const NS_TRANSITIONAL = "http://schemas.openxmlformats.org/officeDocument/2006/r
 const NS_STRICT = "http://purl.oclc.org/ooxml/officeDocument/relationships"
 
 function matchesRelType(rel: string, type: string): boolean {
-  return rel === `${NS_TRANSITIONAL}/${type}` || rel === `${NS_STRICT}/${type}` || rel.endsWith("/" + type)
+  return (
+    rel === `${NS_TRANSITIONAL}/${type}` ||
+    rel === `${NS_STRICT}/${type}` ||
+    rel.endsWith("/" + type)
+  )
 }
 
 function decodeUtf8(data: Uint8Array): string {
@@ -112,7 +130,16 @@ interface XlsbSharedString {
 
 interface BinaryWorkbookPart {
   path: string
-  kind: "vba" | "drawing" | "chart" | "comment" | "pivot" | "table" | "metadata" | "externalLink" | "unknown"
+  kind:
+    | "vba"
+    | "drawing"
+    | "chart"
+    | "comment"
+    | "pivot"
+    | "table"
+    | "metadata"
+    | "externalLink"
+    | "unknown"
   data: Uint8Array
 }
 
@@ -132,7 +159,9 @@ export async function readXlsb(
     zip = new ZipReader(data)
   } catch (err) {
     if (err instanceof ZipError) throw err
-    throw new ParseError("Failed to open XLSB file: not a valid ZIP archive", undefined, { cause: err })
+    throw new ParseError("Failed to open XLSB file: not a valid ZIP archive", undefined, {
+      cause: err,
+    })
   }
 
   if (!zip.has("[Content_Types].xml")) {
@@ -150,8 +179,11 @@ export async function readXlsb(
     throw new ParseError("Invalid XLSB: cannot find workbook relationship in _rels/.rels")
   }
 
-  const workbookPath = workbookRel.target.startsWith("/") ? workbookRel.target.slice(1) : workbookRel.target
-  if (!zip.has(workbookPath)) throw new ParseError(`Invalid XLSB: missing workbook at ${workbookPath}`)
+  const workbookPath = workbookRel.target.startsWith("/")
+    ? workbookRel.target.slice(1)
+    : workbookRel.target
+  if (!zip.has(workbookPath))
+    throw new ParseError(`Invalid XLSB: missing workbook at ${workbookPath}`)
 
   const workbookDir = dirname(workbookPath)
   const workbookRelsPath = workbookDir
@@ -166,7 +198,8 @@ export async function readXlsb(
   const workbookInfo = parseWorkbookBin(await zip.extract(workbookPath))
   const sheetRelMap = new Map<string, string>()
   for (const rel of workbookRels) {
-    if (matchesRelType(rel.type, "worksheet")) sheetRelMap.set(rel.id, resolvePath(workbookDir, rel.target))
+    if (matchesRelType(rel.type, "worksheet"))
+      sheetRelMap.set(rel.id, resolvePath(workbookDir, rel.target))
   }
 
   let sharedStrings: XlsbSharedString[] = []
@@ -190,7 +223,14 @@ export async function readXlsb(
     if (!wsPath || !zip.has(wsPath)) {
       throw new ParseError(`Invalid XLSB: missing worksheet file for sheet "${info.name}"`)
     }
-    const sheet = parseWorksheetBin(await zip.extract(wsPath), info.name, sharedStrings, workbookInfo, styles, options)
+    const sheet = parseWorksheetBin(
+      await zip.extract(wsPath),
+      info.name,
+      sharedStrings,
+      workbookInfo,
+      styles,
+      options,
+    )
     if (info.state === "hidden") sheet.hidden = true
     if (info.state === "veryHidden") sheet.veryHidden = true
     sheets.push(sheet)
@@ -262,7 +302,10 @@ function parseWorkbookBin(data: Uint8Array): XlsbWorkbookInfo {
   return { sheets, dateSystem }
 }
 
-function readOptionalWideString(data: Uint8Array, offset: number): { value: string; offset: number } | null {
+function readOptionalWideString(
+  data: Uint8Array,
+  offset: number,
+): { value: string; offset: number } | null {
   if (offset + 4 > data.length) return null
   const cch = u32(data, offset)
   if (cch > 32767 || offset + 4 + cch * 2 > data.length) return null
@@ -334,7 +377,11 @@ function parseSharedStringItem(data: Uint8Array): XlsbSharedString {
   return richText ? { text, richText } : { text }
 }
 
-function parseRichTextRuns(text: string, data: Uint8Array, offset: number): RichTextRun[] | undefined {
+function parseRichTextRuns(
+  text: string,
+  data: Uint8Array,
+  offset: number,
+): RichTextRun[] | undefined {
   if (offset + 4 > data.length || text.length === 0) return undefined
   const runCount32 = u32(data, offset)
   const runCount16 = u16(data, offset)
@@ -394,39 +441,116 @@ function parseWorksheetBin(
       case BRT_CELL_RK: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length < h.offset + 4) break
-        setCell(rows, cells, currentRow, h.col, decodeRk(u32(record.data, h.offset)), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          decodeRk(u32(record.data, h.offset)),
+          "number",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_CELL_REAL: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length < h.offset + 8) break
-        setCell(rows, cells, currentRow, h.col, f64(record.data, h.offset), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          f64(record.data, h.offset),
+          "number",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_CELL_BOOL: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length <= h.offset) break
-        setCell(rows, cells, currentRow, h.col, record.data[h.offset] === 1, "boolean", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          record.data[h.offset] === 1,
+          "boolean",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_CELL_ERROR: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length <= h.offset) break
-        setCell(rows, cells, currentRow, h.col, decodeError(record.data[h.offset] ?? 0), "error", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          decodeError(record.data[h.offset] ?? 0),
+          "error",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_CELL_ISST: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length < h.offset + 4) break
         const idx = u32(record.data, h.offset)
-        setSharedStringCell(rows, cells, currentRow, h.col, sharedStrings[idx], h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setSharedStringCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          sharedStrings[idx],
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_CELL_ST: {
         const h = readCellHeader(record.data)
         if (!h) break
         const text = readXlsbWideString(record.data, h.offset).value
-        setCell(rows, cells, currentRow, h.col, text, "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          text,
+          "string",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_SHORT_BLANK: {
@@ -438,67 +562,210 @@ function parseWorksheetBin(
       case BRT_SHORT_RK: {
         const h = readShortCellHeader(record.data)
         if (!h || record.data.length < h.offset + 4) break
-        setCell(rows, cells, currentRow, h.col, decodeRk(u32(record.data, h.offset)), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          decodeRk(u32(record.data, h.offset)),
+          "number",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_SHORT_REAL: {
         const h = readShortCellHeader(record.data)
         if (!h || record.data.length < h.offset + 8) break
-        setCell(rows, cells, currentRow, h.col, f64(record.data, h.offset), "number", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          f64(record.data, h.offset),
+          "number",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_SHORT_BOOL: {
         const h = readShortCellHeader(record.data)
         if (!h || record.data.length <= h.offset) break
-        setCell(rows, cells, currentRow, h.col, record.data[h.offset] === 1, "boolean", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          record.data[h.offset] === 1,
+          "boolean",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_SHORT_ERROR: {
         const h = readShortCellHeader(record.data)
         if (!h || record.data.length <= h.offset) break
-        setCell(rows, cells, currentRow, h.col, decodeError(record.data[h.offset] ?? 0), "error", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          decodeError(record.data[h.offset] ?? 0),
+          "error",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_SHORT_ISST: {
         const h = readShortCellHeader(record.data)
         if (!h || record.data.length < h.offset + 4) break
         const idx = u32(record.data, h.offset)
-        setSharedStringCell(rows, cells, currentRow, h.col, sharedStrings[idx], h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setSharedStringCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          sharedStrings[idx],
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_SHORT_ST: {
         const h = readShortCellHeader(record.data)
         if (!h) break
         const text = readXlsbWideString(record.data, h.offset).value
-        setCell(rows, cells, currentRow, h.col, text, "string", h.style, workbookInfo, styles, readStyles, maxRows, range)
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          text,
+          "string",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+        )
         break
       }
       case BRT_FMLA_NUM: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length < h.offset + 8) break
         const value = f64(record.data, h.offset)
-        setCell(rows, cells, currentRow, h.col, value, "formula", h.style, workbookInfo, styles, readStyles, maxRows, range, value, decodeFormulaTail(record.data, h.offset + 8, currentRow, h.col, workbookInfo))
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          value,
+          "formula",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+          value,
+          decodeFormulaTail(record.data, h.offset + 8, currentRow, h.col, workbookInfo),
+        )
         break
       }
       case BRT_FMLA_STRING: {
         const h = readCellHeader(record.data)
         if (!h) break
         const text = readXlsbWideString(record.data, h.offset).value
-        setCell(rows, cells, currentRow, h.col, text, "formula", h.style, workbookInfo, styles, readStyles, maxRows, range, text, decodeFormulaTail(record.data, h.offset + 4 + text.length * 2, currentRow, h.col, workbookInfo))
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          text,
+          "formula",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+          text,
+          decodeFormulaTail(
+            record.data,
+            h.offset + 4 + text.length * 2,
+            currentRow,
+            h.col,
+            workbookInfo,
+          ),
+        )
         break
       }
       case BRT_FMLA_BOOL: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length <= h.offset) break
         const value = record.data[h.offset] === 1
-        setCell(rows, cells, currentRow, h.col, value, "formula", h.style, workbookInfo, styles, readStyles, maxRows, range, value, decodeFormulaTail(record.data, h.offset + 1, currentRow, h.col, workbookInfo))
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          value,
+          "formula",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+          value,
+          decodeFormulaTail(record.data, h.offset + 1, currentRow, h.col, workbookInfo),
+        )
         break
       }
       case BRT_FMLA_ERROR: {
         const h = readCellHeader(record.data)
         if (!h || record.data.length <= h.offset) break
         const value = decodeError(record.data[h.offset] ?? 0)
-        setCell(rows, cells, currentRow, h.col, value, "formula", h.style, workbookInfo, styles, readStyles, maxRows, range, value, decodeFormulaTail(record.data, h.offset + 1, currentRow, h.col, workbookInfo))
+        setCell(
+          rows,
+          cells,
+          currentRow,
+          h.col,
+          value,
+          "formula",
+          h.style,
+          workbookInfo,
+          styles,
+          readStyles,
+          maxRows,
+          range,
+          value,
+          decodeFormulaTail(record.data, h.offset + 1, currentRow, h.col, workbookInfo),
+        )
         break
       }
       case BRT_HLINK: {
@@ -526,7 +793,10 @@ function parseWorksheetBin(
     if (!inRange(row, col, range)) continue
     ensureCell(rows, row, col)
     const key = `${row},${col}`
-    const existing = cells.get(key) ?? { value: rows[row]?.[col] ?? null, type: "empty" as CellType }
+    const existing = cells.get(key) ?? {
+      value: rows[row]?.[col] ?? null,
+      type: "empty" as CellType,
+    }
     existing.hyperlink = {
       target: link.target,
       ...(link.location ? { location: link.location } : {}),
@@ -541,8 +811,10 @@ function parseWorksheetBin(
   return sheet
 }
 
-
-function numFmtForStyle(styleIndex: number, styles: ParsedXlsbStyles | undefined): string | undefined {
+function numFmtForStyle(
+  styleIndex: number,
+  styles: ParsedXlsbStyles | undefined,
+): string | undefined {
   if (styleIndex < 0) return undefined
   const fmtId = styles?.cellXfs[styleIndex]
   if (fmtId !== undefined) return styles?.formats.get(fmtId) ?? String(fmtId)
@@ -635,7 +907,20 @@ function setSharedStringCell(
   range?: MergeRange,
 ): void {
   const text = shared?.text ?? ""
-  setCell(rows, cells, row, col, text, shared?.richText ? "richText" : "string", styleIndex, workbookInfo, styles, readStyles, maxRows, range)
+  setCell(
+    rows,
+    cells,
+    row,
+    col,
+    text,
+    shared?.richText ? "richText" : "string",
+    styleIndex,
+    workbookInfo,
+    styles,
+    readStyles,
+    maxRows,
+    range,
+  )
   if (shared?.richText && inRange(row, col, range) && !(maxRows > 0 && row >= maxRows)) {
     const cell = cells.get(`${row},${col}`)
     if (cell) cell.richText = shared.richText
@@ -658,7 +943,11 @@ function setBlank(
   ensureCell(rows, row, col)
   if (readStyles) {
     const numFmt = numFmtForStyle(styleIndex, styles)
-    cells.set(`${row},${col}`, { value: null, type: "empty", ...(numFmt ? { style: { numFmt } } : {}) })
+    cells.set(`${row},${col}`, {
+      value: null,
+      type: "empty",
+      ...(numFmt ? { style: { numFmt } } : {}),
+    })
   }
 }
 
@@ -732,13 +1021,21 @@ function parseCellRef(ref: string): { row: number; col: number } {
 
 function inRange(row: number, col: number, range?: MergeRange): boolean {
   if (!range) return true
-  return row >= range.startRow && row <= range.endRow && col >= range.startCol && col <= range.endCol
+  return (
+    row >= range.startRow && row <= range.endRow && col >= range.startCol && col <= range.endCol
+  )
 }
 
 async function collectPackageParts(zip: ZipReader): Promise<BinaryWorkbookPart[]> {
   const out: BinaryWorkbookPart[] = []
   for (const path of zip.entries()) {
-    if (path.endsWith("/") || path === "[Content_Types].xml" || path.startsWith("_rels/") || path.startsWith("docProps/")) continue
+    if (
+      path.endsWith("/") ||
+      path === "[Content_Types].xml" ||
+      path.startsWith("_rels/") ||
+      path.startsWith("docProps/")
+    )
+      continue
     if (/^xl\/(workbook|sharedStrings|styles)\.bin$/i.test(path)) continue
     if (/^xl\/worksheets\//i.test(path)) continue
     const kind = classifyPackagePart(path)
@@ -776,11 +1073,18 @@ function filterSheets(
   if (typeof filter === "function") {
     return sheets.filter((s) =>
       filter(
-        { name: s.name, index: s.index, hidden: s.state === "hidden", veryHidden: s.state === "veryHidden" } as SheetFilterInfo,
+        {
+          name: s.name,
+          index: s.index,
+          hidden: s.state === "hidden",
+          veryHidden: s.state === "veryHidden",
+        } as SheetFilterInfo,
         s.index,
       ),
     )
   }
   const filters = Array.isArray(filter) ? filter : [filter]
-  return sheets.filter((s) => filters.some((f) => (typeof f === "number" ? f === s.index : f === s.name)))
+  return sheets.filter((s) =>
+    filters.some((f) => (typeof f === "number" ? f === s.index : f === s.name)),
+  )
 }

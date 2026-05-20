@@ -124,7 +124,9 @@ export class CfbReader {
     }
 
     this.miniFat = this.readMiniFat(firstMiniFatSector, numMiniFatSectors)
-    this.miniStream = this.rootEntry ? this.readRegularChain(this.rootEntry.startSector, this.rootEntry.size) : new Uint8Array(0)
+    this.miniStream = this.rootEntry
+      ? this.readRegularChain(this.rootEntry.startSector, this.rootEntry.size)
+      : new Uint8Array(0)
   }
 
   /** Return all root-level streams discovered in the CFB directory. */
@@ -143,13 +145,21 @@ export class CfbReader {
     if (!entry) return undefined
     if (entry.size === 0) return new Uint8Array(0)
 
-    if (entry.size < this.miniStreamCutoff && this.miniFat.length > 0 && entry.startSector !== END_OF_CHAIN) {
+    if (
+      entry.size < this.miniStreamCutoff &&
+      this.miniFat.length > 0 &&
+      entry.startSector !== END_OF_CHAIN
+    ) {
       return this.readMiniChain(entry.startSector, entry.size)
     }
     return this.readRegularChain(entry.startSector, entry.size)
   }
 
-  private readDifat(firstDifatSector: number, numDifatSectors: number, numFatSectors: number): number[] {
+  private readDifat(
+    firstDifatSector: number,
+    numDifatSectors: number,
+    numFatSectors: number,
+  ): number[] {
     const difat: number[] = []
 
     for (let i = 0; i < 109; i++) {
@@ -190,7 +200,11 @@ export class CfbReader {
   }
 
   private readMiniFat(firstMiniFatSector: number, numMiniFatSectors: number): number[] {
-    if (firstMiniFatSector === END_OF_CHAIN || firstMiniFatSector === FREE_SECT || numMiniFatSectors === 0) {
+    if (
+      firstMiniFatSector === END_OF_CHAIN ||
+      firstMiniFatSector === FREE_SECT ||
+      numMiniFatSectors === 0
+    ) {
       return []
     }
     const bytes = this.readRegularChain(firstMiniFatSector, numMiniFatSectors * this.sectorSize)

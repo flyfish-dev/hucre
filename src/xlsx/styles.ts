@@ -26,6 +26,7 @@ export interface ParsedStyles {
   fills: FillStyle[]
   borders: BorderStyle[]
   cellXfs: CellXf[]
+  dxfs: CellStyle[]
 }
 
 export interface CellXf {
@@ -63,6 +64,7 @@ export function parseStyles(xml: string): ParsedStyles {
   const fills: FillStyle[] = []
   const borders: BorderStyle[] = []
   const cellXfs: CellXf[] = []
+  const dxfs: CellStyle[] = []
 
   for (const child of doc.children) {
     if (typeof child === "string") continue
@@ -84,10 +86,13 @@ export function parseStyles(xml: string): ParsedStyles {
       case "cellXfs":
         parseCellXfs(child, cellXfs)
         break
+      case "dxfs":
+        parseDxfs(child, dxfs)
+        break
     }
   }
 
-  return { numFmts, fonts, fills, borders, cellXfs }
+  return { numFmts, fonts, fills, borders, cellXfs, dxfs }
 }
 
 // ── Number Formats ───────────────────────────────────────────────────
@@ -380,6 +385,50 @@ function parseCellXf(el: XmlElement): CellXf {
   }
 
   return xf
+}
+
+// ── Differential Formats ─────────────────────────────────────────────
+
+function parseDxfs(el: XmlElement, dxfs: CellStyle[]): void {
+  for (const child of el.children) {
+    if (typeof child === "string") continue
+    const local = child.local || child.tag
+    if (local === "dxf") {
+      dxfs.push(parseDxf(child))
+    }
+  }
+}
+
+function parseDxf(el: XmlElement): CellStyle {
+  const style: CellStyle = {}
+
+  for (const child of el.children) {
+    if (typeof child === "string") continue
+    const local = child.local || child.tag
+
+    switch (local) {
+      case "font":
+        style.font = parseFont(child)
+        break
+      case "fill":
+        style.fill = parseFill(child)
+        break
+      case "border":
+        style.border = parseBorder(child)
+        break
+      case "numFmt":
+        if (child.attrs["formatCode"]) style.numFmt = child.attrs["formatCode"]
+        break
+      case "alignment":
+        style.alignment = parseAlignment(child)
+        break
+      case "protection":
+        style.protection = parseProtection(child)
+        break
+    }
+  }
+
+  return style
 }
 
 const FPB_XF_EXT_URI = "{C7286773-470A-42A8-94C5-96B5CB345126}"

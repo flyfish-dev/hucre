@@ -63,7 +63,9 @@ export async function readXls(
     const decrypted = await decryptOfficeEncryptedPackage(data, options?.password, "xls")
     if (isRawBiff(decrypted)) return parseBiffWorkbook(decrypted, options)
     if (isCfb(decrypted)) return readXls(decrypted, options)
-    throw new ParseError("Encrypted package decrypted successfully, but it does not contain a legacy XLS BIFF workbook")
+    throw new ParseError(
+      "Encrypted package decrypted successfully, but it does not contain a legacy XLS BIFF workbook",
+    )
   }
 
   const cfb = new CfbReader(data)
@@ -95,7 +97,8 @@ function collectBinaryParts(cfb: CfbReader): BinaryWorkbookPart[] {
   const parts: BinaryWorkbookPart[] = []
   for (const entry of cfb.listStreams()) {
     const normalized = entry.name.replace(/^\u0005/, "")
-    if (/^(Workbook|Book|SummaryInformation|DocumentSummaryInformation)$/i.test(normalized)) continue
+    if (/^(Workbook|Book|SummaryInformation|DocumentSummaryInformation)$/i.test(normalized))
+      continue
     const data = cfb.getStream(entry.name)
     if (!data || data.length === 0) continue
     parts.push({ path: entry.name, kind: classifyCfbPart(entry.name), data })

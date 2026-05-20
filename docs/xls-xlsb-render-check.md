@@ -4,11 +4,11 @@ This artifact set was produced from the uploaded workbook `be2cfc00-79c3-469e-88
 
 ## Parsed workbook summary
 
-| Sheet | Rows | Columns | Merge ranges |
-| --- | ---: | ---: | ---: |
-| 单选题 | 11 | 6 | 0 |
-| 多选题 | 14 | 15 | 1 |
-| 判断题 | 14 | 10 | 1 |
+| Sheet  | Rows | Columns | Merge ranges |
+| ------ | ---: | ------: | -----------: |
+| 单选题 |   11 |       6 |            0 |
+| 多选题 |   14 |      15 |            1 |
+| 判断题 |   14 |      10 |            1 |
 
 The generated HTML is stored at:
 

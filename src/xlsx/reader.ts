@@ -1299,8 +1299,8 @@ function parseAnchorPosition(el: { children: Array<unknown> }): {
   return {
     row,
     col,
-    ...(rowOff !== undefined ? { rowOff } : {}),
-    ...(colOff !== undefined ? { colOff } : {}),
+    ...(rowOff ? { rowOff } : {}),
+    ...(colOff ? { colOff } : {}),
   }
 }
 

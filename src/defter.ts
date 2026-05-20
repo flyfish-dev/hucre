@@ -19,10 +19,12 @@ import { readXlsb } from "./xlsb/reader"
 import { writeXlsx } from "./xlsx/writer"
 import { readOds } from "./ods/reader"
 import { writeOds } from "./ods/writer"
-import { UnsupportedFormatError } from "./errors"
+import { EncryptedFileError, ParseError, UnsupportedFormatError } from "./errors"
 import { isOle2Container, readInputToUint8Array } from "./_input"
 import { decryptOfficeEncryptedPackage, isOfficeEncryptedPackage } from "./crypto/office-crypto"
 import { ZipReader } from "./zip/reader"
+import { parseXml } from "./xml/parser"
+import type { XmlElement } from "./xml/parser"
 
 // ── Format Detection ────────────────────────────────────────────────
 
@@ -72,10 +74,43 @@ async function detectZipFormat(data: Uint8Array): Promise<"xlsx" | "xlsb" | "ods
   const zip = new ZipReader(data)
   if (zip.has("[Content_Types].xml")) {
     const contentTypes = decoder.decode(await zip.extract("[Content_Types].xml"))
-    if (/application\/vnd\.ms-excel\.sheet\.binary/i.test(contentTypes)) return "xlsb"
+    const workbookFormat = detectWorkbookFormatFromContentTypes(contentTypes)
+    if (workbookFormat) return workbookFormat
   }
 
+  if (zip.has("xl/workbook.xml")) return "xlsx"
+  if (zip.has("xl/workbook.bin")) return "xlsb"
+  if (zip.entries().some((entry) => /(^|\/)workbook\.bin$/i.test(entry))) return "xlsb"
+
   return "xlsx"
+}
+
+function detectWorkbookFormatFromContentTypes(xml: string): "xlsx" | "xlsb" | undefined {
+  let root: XmlElement
+  try {
+    root = parseXml(xml)
+  } catch {
+    return undefined
+  }
+
+  const stack: XmlElement[] = [root]
+  while (stack.length) {
+    const el = stack.pop()!
+    if (el.local === "Override") {
+      const partName = normalizePackagePartName(el.attrs["PartName"])
+      if (/(^|\/)workbook\.xml$/i.test(partName)) return "xlsx"
+      if (/(^|\/)workbook\.bin$/i.test(partName)) return "xlsb"
+    }
+    for (const child of el.children) {
+      if (typeof child !== "string") stack.push(child)
+    }
+  }
+
+  return undefined
+}
+
+function normalizePackagePartName(partName = ""): string {
+  return partName.replace(/^\/+/, "")
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -94,7 +129,14 @@ export async function read(
     if (isOfficeEncryptedPackage(data)) {
       data = await decryptOfficeEncryptedPackage(data, options?.password)
     } else {
-      return readXls(data, options)
+      try {
+        return await readXls(data, options)
+      } catch (err) {
+        if (err instanceof ParseError) {
+          throw new EncryptedFileError()
+        }
+        throw err
+      }
     }
   }
 
@@ -109,7 +151,9 @@ export async function read(
 }
 
 /** Write a workbook to the specified format. */
-export async function write(options: WriteOptions & { format?: "xlsx" | "ods" }): Promise<WriteOutput> {
+export async function write(
+  options: WriteOptions & { format?: "xlsx" | "ods" },
+): Promise<WriteOutput> {
   const format = options.format ?? "xlsx"
   if (format === "ods") return writeOds(options)
   return writeXlsx(options)
@@ -152,7 +196,10 @@ export interface WriteObjectsTableOption {
   showTotalRow?: boolean
   showAutoFilter?: boolean
   showRowStripes?: boolean
-  totals?: Record<string, "sum" | "average" | "count" | "min" | "max" | "countNums" | "stdDev" | "var">
+  totals?: Record<
+    string,
+    "sum" | "average" | "count" | "min" | "max" | "countNums" | "stdDev" | "var"
+  >
 }
 
 /** Write an array of objects to a spreadsheet format. */

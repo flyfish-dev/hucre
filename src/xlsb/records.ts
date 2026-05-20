@@ -109,7 +109,8 @@ export function decodeUtf16Le(bytes: Uint8Array): string {
     return new TextDecoder("utf-16le").decode(bytes)
   } catch {
     let s = ""
-    for (let i = 0; i + 1 < bytes.length; i += 2) s += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
+    for (let i = 0; i + 1 < bytes.length; i += 2)
+      s += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
     return s
   }
 }
@@ -117,7 +118,10 @@ export function decodeUtf16Le(bytes: Uint8Array): string {
 /**
  * XLSB XLWideString: 4-byte character count followed by UTF-16LE chars.
  */
-export function readXlsbWideString(data: Uint8Array, offset: number): { value: string; offset: number } {
+export function readXlsbWideString(
+  data: Uint8Array,
+  offset: number,
+): { value: string; offset: number } {
   if (offset + 4 > data.length) return { value: "", offset: data.length }
   const cch = u32(data, offset)
   const start = offset + 4
@@ -129,7 +133,9 @@ export function readXlsbWideString(data: Uint8Array, offset: number): { value: s
 /**
  * Common XLSB cell header: column (4), style index (3), flags (1).
  */
-export function readCellHeader(data: Uint8Array): { col: number; style: number; offset: number } | null {
+export function readCellHeader(
+  data: Uint8Array,
+): { col: number; style: number; offset: number } | null {
   if (data.length < 8) return null
   const col = u32(data, 0)
   const style = (data[4] ?? 0) | ((data[5] ?? 0) << 8) | ((data[6] ?? 0) << 16)
@@ -143,7 +149,9 @@ export function readCellHeader(data: Uint8Array): { col: number; style: number; 
  * MS-XLSB and is harmless for regular BrtCell* records, which continue to
  * use {@link readCellHeader}.
  */
-export function readShortCellHeader(data: Uint8Array): { col: number; style: number; offset: number } | null {
+export function readShortCellHeader(
+  data: Uint8Array,
+): { col: number; style: number; offset: number } | null {
   if (data.length < 4) return null
   return { col: u32(data, 0), style: 0, offset: 4 }
 }

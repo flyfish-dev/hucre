@@ -163,11 +163,11 @@ function decodeUtf16Le(bytes: Uint8Array): string {
     return new TextDecoder("utf-16le").decode(bytes)
   } catch {
     let s = ""
-    for (let i = 0; i + 1 < bytes.length; i += 2) s += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
+    for (let i = 0; i + 1 < bytes.length; i += 2)
+      s += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
     return s
   }
 }
-
 
 function decodeCodePage(bytes: Uint8Array, codePage: number): string {
   const label = codePageToEncoding(codePage)
@@ -257,7 +257,10 @@ function readRecords(
     records.push({ sid, offset: pos, data })
 
     if (sid === BIFF_FILEPASS) {
-      decryptor = createBiffFilePassDecryptor(stream.subarray(dataStart, dataEnd), options?.password)
+      decryptor = createBiffFilePassDecryptor(
+        stream.subarray(dataStart, dataEnd),
+        options?.password,
+      )
     }
 
     pos = dataEnd
@@ -272,7 +275,11 @@ function shouldDecryptRecord(sid: number): boolean {
   return sid !== BIFF_BOF && sid !== BIFF_EOF && sid !== BIFF_FILEPASS
 }
 
-function readBiff8UnicodeString(data: Uint8Array, offset: number, codePage: number): { value: string; offset: number } {
+function readBiff8UnicodeString(
+  data: Uint8Array,
+  offset: number,
+  codePage: number,
+): { value: string; offset: number } {
   if (offset + 3 > data.length) return { value: "", offset: data.length }
   const cch = u16(data, offset)
   let pos = offset + 2
@@ -295,7 +302,11 @@ function readBiff8UnicodeString(data: Uint8Array, offset: number, codePage: numb
   return { value, offset: Math.min(pos, data.length) }
 }
 
-function readShortBiff8UnicodeString(data: Uint8Array, offset: number, codePage: number): { value: string; offset: number } {
+function readShortBiff8UnicodeString(
+  data: Uint8Array,
+  offset: number,
+  codePage: number,
+): { value: string; offset: number } {
   if (offset + 2 > data.length) return { value: "", offset: data.length }
   const cch = data[offset] ?? 0
   const flags = data[offset + 1] ?? 0
@@ -388,7 +399,10 @@ class SstCursor {
   }
 
   private ensureChunk(): void {
-    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex]!.length) {
+    while (
+      this.chunkIndex < this.chunks.length &&
+      this.pos >= this.chunks[this.chunkIndex]!.length
+    ) {
       this.nextChunk()
     }
     if (this.chunkIndex >= this.chunks.length) {
@@ -416,7 +430,12 @@ function parseSst(chunks: Uint8Array[], codePage: number): string[] {
   return strings
 }
 
-function parseBoundSheet(record: Uint8Array, index: number, codePage: number, biff8: boolean): BiffSheetInfo | null {
+function parseBoundSheet(
+  record: Uint8Array,
+  index: number,
+  codePage: number,
+  biff8: boolean,
+): BiffSheetInfo | null {
   if (record.length < 8) return null
   const offset = u32(record, 0)
   const hsState = record[4] ?? 0
@@ -482,7 +501,10 @@ function parsePalette(record: Uint8Array): Map<number, Color> {
   return palette
 }
 
-function parseXf(record: Uint8Array, globals: Pick<ParsedGlobals, "formats" | "fonts" | "palette">): BiffXf | null {
+function parseXf(
+  record: Uint8Array,
+  globals: Pick<ParsedGlobals, "formats" | "fonts" | "palette">,
+): BiffXf | null {
   if (record.length < 4) return null
   const fontId = u16(record, 0)
   const numFmtId = u16(record, 2)
@@ -513,7 +535,11 @@ function parseXf(record: Uint8Array, globals: Pick<ParsedGlobals, "formats" | "f
   return { fontId, numFmtId, ...(Object.keys(style).length ? { style } : {}) }
 }
 
-function parseXfAlignment(align: number, rotation: number, indentByte: number): NonNullable<CellStyle["alignment"]> {
+function parseXfAlignment(
+  align: number,
+  rotation: number,
+  indentByte: number,
+): NonNullable<CellStyle["alignment"]> {
   const horizontalMap: Record<number, NonNullable<CellStyle["alignment"]>["horizontal"]> = {
     0: "general",
     1: "left",
@@ -537,14 +563,18 @@ function parseXfAlignment(align: number, rotation: number, indentByte: number): 
   if (horizontal && horizontal !== "general") alignment.horizontal = horizontal
   if (vertical) alignment.vertical = vertical
   if ((align & 0x08) !== 0) alignment.wrapText = true
-  if (rotation) alignment.textRotation = rotation === 255 ? 255 : rotation > 90 ? 90 - rotation : rotation
+  if (rotation)
+    alignment.textRotation = rotation === 255 ? 255 : rotation > 90 ? 90 - rotation : rotation
   const indent = indentByte & 0x0f
   if (indent) alignment.indent = indent
   if ((indentByte & 0x10) !== 0) alignment.shrinkToFit = true
   return alignment
 }
 
-function parseXfBorder(record: Uint8Array, palette: Map<number, Color>): NonNullable<CellStyle["border"]> {
+function parseXfBorder(
+  record: Uint8Array,
+  palette: Map<number, Color>,
+): NonNullable<CellStyle["border"]> {
   const lines = u16(record, 10)
   const sideColors = u16(record, 12)
   const topBottomColors = u32(record, 14)
@@ -560,7 +590,10 @@ function parseXfBorder(record: Uint8Array, palette: Map<number, Color>): NonNull
   return border
 }
 
-function parseXfFill(record: Uint8Array, palette: Map<number, Color>): CellStyle["fill"] | undefined {
+function parseXfFill(
+  record: Uint8Array,
+  palette: Map<number, Color>,
+): CellStyle["fill"] | undefined {
   const borderAndPattern = u32(record, 14)
   const fillColors = u16(record, 18)
   const patternCode = (borderAndPattern >> 26) & 0x3f
@@ -633,7 +666,8 @@ function applyXfExt(xfs: BiffXf[], ext: BiffXfExt): void {
   const style = xf.style ?? {}
 
   if (ext.fillFgColor || ext.fillBgColor) {
-    const fill: PatternFill = style.fill?.type === "pattern" ? { ...style.fill } : { type: "pattern", pattern: "solid" }
+    const fill: PatternFill =
+      style.fill?.type === "pattern" ? { ...style.fill } : { type: "pattern", pattern: "solid" }
     if (ext.fillFgColor) fill.fgColor = ext.fillFgColor
     if (ext.fillBgColor) fill.bgColor = ext.fillBgColor
     style.fill = fill
@@ -671,7 +705,8 @@ function resolveThemeColorsInXfs(xfs: BiffXf[], themeColors: string[]): void {
 
 function resolveThemeColorsInStyle(style: CellStyle, themeColors: string[]): CellStyle {
   const next: CellStyle = { ...style }
-  if (next.font?.color) next.font = { ...next.font, color: resolveBiffThemeColor(next.font.color, themeColors) }
+  if (next.font?.color)
+    next.font = { ...next.font, color: resolveBiffThemeColor(next.font.color, themeColors) }
   if (next.fill?.type === "pattern") {
     next.fill = {
       ...next.fill,
@@ -692,7 +727,10 @@ function resolveThemeColorsInStyle(style: CellStyle, themeColors: string[]): Cel
     for (const side of ["left", "right", "top", "bottom", "diagonal"] as const) {
       const borderSideValue = next.border[side]
       if (borderSideValue?.color) {
-        next.border[side] = { ...borderSideValue, color: resolveBiffThemeColor(borderSideValue.color, themeColors) }
+        next.border[side] = {
+          ...borderSideValue,
+          color: resolveBiffThemeColor(borderSideValue.color, themeColors),
+        }
       }
     }
   }
@@ -704,13 +742,21 @@ function resolveBiffThemeColor(color: Color | undefined, themeColors: string[]):
   return { rgb: resolveThemeColor(themeColors, color.theme, color.tint) }
 }
 
-function borderSide(styleCode: number, colorIndex: number, palette: Map<number, Color>): BorderSide | undefined {
+function borderSide(
+  styleCode: number,
+  colorIndex: number,
+  palette: Map<number, Color>,
+): BorderSide | undefined {
   const style = biffBorderLineStyle(styleCode)
   if (!style) return undefined
   return { style, color: indexedColor(colorIndex, palette) }
 }
 
-function readBiff5ByteString(data: Uint8Array, offset: number, codePage: number): { value: string; offset: number } {
+function readBiff5ByteString(
+  data: Uint8Array,
+  offset: number,
+  codePage: number,
+): { value: string; offset: number } {
   if (offset >= data.length) return { value: "", offset: data.length }
   const cch = data[offset] ?? 0
   const start = offset + 1
@@ -718,14 +764,22 @@ function readBiff5ByteString(data: Uint8Array, offset: number, codePage: number)
   return { value: decodeCodePage(data.subarray(start, end), codePage), offset: end }
 }
 
-function readBiff8NameText(data: Uint8Array, offset: number, cch: number, codePage: number): { value: string; offset: number } {
+function readBiff8NameText(
+  data: Uint8Array,
+  offset: number,
+  cch: number,
+  codePage: number,
+): { value: string; offset: number } {
   if (offset >= data.length) return { value: "", offset: data.length }
   const flags = data[offset] ?? 0
   const is16 = (flags & 0x01) !== 0
   const start = offset + 1
   const byteLen = cch * (is16 ? 2 : 1)
   const raw = data.subarray(start, Math.min(start + byteLen, data.length))
-  return { value: is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw), offset: Math.min(start + byteLen, data.length) }
+  return {
+    value: is16 ? decodeUtf16Le(raw) : decodeCompressedUnicode(raw),
+    offset: Math.min(start + byteLen, data.length),
+  }
 }
 
 const BUILTIN_NAMES: Record<number, string> = {
@@ -802,7 +856,12 @@ function parseNameRecord(
   if (!nameText || !formula) return { name }
 
   const hidden = (flags & 0x0001) !== 0
-  if (hidden && nameText !== "Print_Area" && nameText !== "Print_Titles" && nameText !== "_FilterDatabase") {
+  if (
+    hidden &&
+    nameText !== "Print_Area" &&
+    nameText !== "Print_Titles" &&
+    nameText !== "_FilterDatabase"
+  ) {
     return { name }
   }
 
@@ -1002,7 +1061,9 @@ function parseA1(ref: string): { row: number; col: number } {
 
 function inRange(row: number, col: number, range?: MergeRange): boolean {
   if (!range) return true
-  return row >= range.startRow && row <= range.endRow && col >= range.startCol && col <= range.endCol
+  return (
+    row >= range.startRow && row <= range.endRow && col >= range.startCol && col <= range.endCol
+  )
 }
 
 function numFmtForXf(xfIndex: number, globals: ParsedGlobals): string | undefined {
@@ -1022,7 +1083,11 @@ function styleForXf(xfIndex: number, globals: ParsedGlobals): CellStyle | undefi
   return style && Object.keys(style).length ? style : undefined
 }
 
-function convertNumber(value: number, xfIndex: number, globals: ParsedGlobals): { value: CellValue; type: CellType } {
+function convertNumber(
+  value: number,
+  xfIndex: number,
+  globals: ParsedGlobals,
+): { value: CellValue; type: CellType } {
   const numFmt = numFmtForXf(xfIndex, globals)
   if (numFmt && isDateFormat(numFmt)) {
     return { value: serialToDate(value, globals.dateSystem === "1904"), type: "date" }
@@ -1080,7 +1145,14 @@ function setFormulaCell(
   sheet.cells.set(`${row},${col}`, cell)
 }
 
-function setBlank(sheet: Sheet, row: number, col: number, xfIndex: number, globals: ParsedGlobals, readStyles: boolean): void {
+function setBlank(
+  sheet: Sheet,
+  row: number,
+  col: number,
+  xfIndex: number,
+  globals: ParsedGlobals,
+  readStyles: boolean,
+): void {
   if (!readStyles) return
   setCell(sheet, row, col, null, "empty", xfIndex, globals, true)
 }
@@ -1111,7 +1183,9 @@ function shouldReadSheet(sheet: BiffSheetInfo, filter: ReadOptions["sheets"] | u
   }
   if (typeof filter === "function") return filter(info, sheet.index)
   const items = Array.isArray(filter) ? filter : [filter]
-  return items.some((item) => (typeof item === "number" ? item === sheet.index : item === sheet.name))
+  return items.some((item) =>
+    typeof item === "number" ? item === sheet.index : item === sheet.name,
+  )
 }
 
 function recordsForSheet(records: BiffRecord[], offset: number): BiffRecord[] {
@@ -1126,7 +1200,12 @@ function recordsForSheet(records: BiffRecord[], offset: number): BiffRecord[] {
   return out
 }
 
-function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals: ParsedGlobals, options?: ReadOptions): Sheet {
+function parseWorksheet(
+  records: BiffRecord[],
+  sheetInfo: BiffSheetInfo,
+  globals: ParsedGlobals,
+  options?: ReadOptions,
+): Sheet {
   const sheet: Sheet = { name: sheetInfo.name, rows: [] }
   if (sheetInfo.state === "hidden") sheet.hidden = true
   if (sheetInfo.state === "veryHidden") sheet.veryHidden = true
@@ -1181,7 +1260,16 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
         if (!inRange(row, col, range)) break
         const xf = u16(record.data, 4)
         const idx = u32(record.data, 6)
-        setCell(sheet, row, col, globals.sharedStrings[idx] ?? "", "string", xf, globals, readStyles)
+        setCell(
+          sheet,
+          row,
+          col,
+          globals.sharedStrings[idx] ?? "",
+          "string",
+          xf,
+          globals,
+          readStyles,
+        )
         break
       }
       case BIFF_LABEL:
@@ -1194,9 +1282,10 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
         if (!inRange(row, col, range)) break
         const xf = record.data.length >= 8 ? u16(record.data, 4) : -1
         const textOffset = record.data.length >= 8 ? 6 : 4
-        const { value } = globals.biffVersion >= 0x0600 && record.sid !== BIFF2_LABEL
-          ? readBiff8UnicodeString(record.data, textOffset, globals.codePage)
-          : readBiff5ByteString(record.data, textOffset, globals.codePage)
+        const { value } =
+          globals.biffVersion >= 0x0600 && record.sid !== BIFF2_LABEL
+            ? readBiff8UnicodeString(record.data, textOffset, globals.codePage)
+            : readBiff5ByteString(record.data, textOffset, globals.codePage)
         setCell(sheet, row, col, value, "string", xf, globals, readStyles)
         break
       }
@@ -1258,15 +1347,19 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
         if (maxRows > 0 && row >= maxRows) break
         if (!inRange(row, col, range)) break
         const xf = u16(record.data, 4)
-        const formula = record.data.length >= 22
-          ? decodeBiffFormula(record.data.subarray(22, Math.min(22 + u16(record.data, 20), record.data.length)), {
-              currentRow: row,
-              currentCol: col,
-              sheetNames: globals.sheets.map((s) => s.name),
-              externSheets: globals.externSheets,
-              names: globals.names,
-            })
-          : ""
+        const formula =
+          record.data.length >= 22
+            ? decodeBiffFormula(
+                record.data.subarray(22, Math.min(22 + u16(record.data, 20), record.data.length)),
+                {
+                  currentRow: row,
+                  currentCol: col,
+                  sheetNames: globals.sheets.map((s) => s.name),
+                  externSheets: globals.externSheets,
+                  names: globals.names,
+                },
+              )
+            : ""
         const marker6 = record.data[12]
         const marker7 = record.data[13]
         if (marker6 === 0xff && marker7 === 0xff) {
@@ -1274,10 +1367,28 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
           if (kind === 0) {
             pendingFormulaString = { row, col, xfIndex: xf, formula }
           } else if (kind === 1) {
-            setFormulaCell(sheet, row, col, (record.data[8] ?? 0) !== 0, xf, globals, readStyles, formula)
+            setFormulaCell(
+              sheet,
+              row,
+              col,
+              (record.data[8] ?? 0) !== 0,
+              xf,
+              globals,
+              readStyles,
+              formula,
+            )
           } else if (kind === 2) {
             const raw = record.data[8] ?? 0
-            setFormulaCell(sheet, row, col, ERROR_TEXT[raw] ?? `#ERR${raw}`, xf, globals, readStyles, formula)
+            setFormulaCell(
+              sheet,
+              row,
+              col,
+              ERROR_TEXT[raw] ?? `#ERR${raw}`,
+              xf,
+              globals,
+              readStyles,
+              formula,
+            )
           } else {
             setFormulaCell(sheet, row, col, null, xf, globals, readStyles, formula)
           }
@@ -1320,7 +1431,8 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
         const lastCol = u16(record.data, record.data.length - 2)
         let pos = 4
         for (let col = firstCol; col <= lastCol && pos + 2 <= record.data.length - 2; col++) {
-          if (inRange(row, col, range)) setBlank(sheet, row, col, u16(record.data, pos), globals, readStyles)
+          if (inRange(row, col, range))
+            setBlank(sheet, row, col, u16(record.data, pos), globals, readStyles)
           pos += 2
         }
         break
@@ -1393,7 +1505,10 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
     while (arr.length <= col) arr.push(null)
     if (!sheet.cells) sheet.cells = new Map()
     const key = `${row},${col}`
-    const existing = sheet.cells.get(key) ?? { value: arr[col] ?? null, type: typeof arr[col] === "string" ? "string" : "empty" as CellType }
+    const existing = sheet.cells.get(key) ?? {
+      value: arr[col] ?? null,
+      type: typeof arr[col] === "string" ? "string" : ("empty" as CellType),
+    }
     existing.hyperlink = {
       target: link.target,
       ...(link.location ? { location: link.location } : {}),
@@ -1406,13 +1521,17 @@ function parseWorksheet(records: BiffRecord[], sheetInfo: BiffSheetInfo, globals
 }
 
 /** Parse a BIFF Workbook stream into the hucre Workbook model. */
-export function parseBiffWorkbook(workbookStream: Uint8Array, options?: ReadOptions & { password?: string }): Workbook {
+export function parseBiffWorkbook(
+  workbookStream: Uint8Array,
+  options?: ReadOptions & { password?: string },
+): Workbook {
   const records = readRecords(workbookStream, 0, options)
   const globals = parseGlobals(records)
 
-  const sheetInfos = globals.sheets.length > 0
-    ? globals.sheets
-    : [{ name: "Sheet1", index: 0, offset: 0, state: "visible" as const, type: 0 }]
+  const sheetInfos =
+    globals.sheets.length > 0
+      ? globals.sheets
+      : [{ name: "Sheet1", index: 0, offset: 0, state: "visible" as const, type: 0 }]
 
   const sheets = sheetInfos
     .filter((s) => s.type === 0 && shouldReadSheet(s, options?.sheets))

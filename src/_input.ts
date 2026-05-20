@@ -23,7 +23,9 @@ export function assertNotEncrypted(data: Uint8Array, format: WorkbookFormat): vo
 }
 
 /** Drain a ReadableStream of byte chunks into one Uint8Array. */
-export async function bufferReadableStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+export async function bufferReadableStream(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Uint8Array> {
   const reader = stream.getReader()
   const chunks: Uint8Array[] = []
   let totalLen = 0

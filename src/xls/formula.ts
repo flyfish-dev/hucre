@@ -354,7 +354,6 @@ function decodeUtf16Le(bytes: Uint8Array): string {
   }
 }
 
-
 function decodeCompressedUnicode(bytes: Uint8Array): string {
   let s = ""
   for (const b of bytes) s += String.fromCharCode(b)
@@ -398,7 +397,11 @@ function readRef(data: Uint8Array, pos: number): { text: string; offset: number 
   return { text: formatCell(row, colFlags & 0xff, colFlags), offset: pos + 4 }
 }
 
-function readRefN(data: Uint8Array, pos: number, ctx: FormulaDecodeContext): { text: string; offset: number } {
+function readRefN(
+  data: Uint8Array,
+  pos: number,
+  ctx: FormulaDecodeContext,
+): { text: string; offset: number } {
   if (pos + 4 > data.length) return { text: "#REF!", offset: data.length }
   const rowRaw = u16(data, pos)
   const colFlags = u16(data, pos + 2)
@@ -419,7 +422,11 @@ function readArea(data: Uint8Array, pos: number): { text: string; offset: number
   return { text: `${start}:${end}`, offset: pos + 8 }
 }
 
-function readAreaN(data: Uint8Array, pos: number, ctx: FormulaDecodeContext): { text: string; offset: number } {
+function readAreaN(
+  data: Uint8Array,
+  pos: number,
+  ctx: FormulaDecodeContext,
+): { text: string; offset: number } {
   if (pos + 8 > data.length) return { text: "#REF!", offset: data.length }
   const row1Raw = u16(data, pos)
   const row2Raw = u16(data, pos + 2)

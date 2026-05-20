@@ -314,7 +314,10 @@ export class ZipReader {
     if (entry.compressionMethod === 0) {
       result = compressedData
     } else if (entry.compressionMethod === 8) {
-      result = compressedData.length === 0 && uncompressedSize === 0 ? new Uint8Array(0) : inflate(compressedData)
+      result =
+        compressedData.length === 0 && uncompressedSize === 0
+          ? new Uint8Array(0)
+          : inflate(compressedData)
     } else {
       throw new ZipError(
         `Unsupported compression method ${entry.compressionMethod} for entry: ${entry.fileName}`,
@@ -326,7 +329,12 @@ export class ZipReader {
     return result
   }
 
-  private verifyEntry(fileName: string, result: Uint8Array, expectedCrc: number, uncompressedSize: number): void {
+  private verifyEntry(
+    fileName: string,
+    result: Uint8Array,
+    expectedCrc: number,
+    uncompressedSize: number,
+  ): void {
     if (uncompressedSize !== 0 && result.length !== uncompressedSize) {
       throw new ZipError(
         `Uncompressed size mismatch for ${fileName}: expected ${uncompressedSize}, got ${result.length}`,

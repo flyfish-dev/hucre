@@ -91,7 +91,7 @@ export function createBiffFilePassDecryptor(
   if (!password) {
     throw new EncryptedFileError(
       "xls",
-      "XLS workbook is encrypted with a BIFF FilePass record. Pass `{ password: \"...\" }` in read options to decrypt it.",
+      'XLS workbook is encrypted with a BIFF FilePass record. Pass `{ password: "..." }` in read options to decrypt it.',
     )
   }
   if (filePass.length < 2) throw new ParseError("Invalid XLS FilePass record: too short")
@@ -100,7 +100,10 @@ export function createBiffFilePassDecryptor(
   if (encryptionType === FILEPASS_XOR) return createXorDecryptor(filePass.subarray(2), password)
   if (encryptionType === FILEPASS_RC4) return createRc4Decryptor(filePass.subarray(2), password)
 
-  throw new EncryptedFileError("xls", `Unsupported XLS FilePass encryption type 0x${encryptionType.toString(16)}`)
+  throw new EncryptedFileError(
+    "xls",
+    `Unsupported XLS FilePass encryption type 0x${encryptionType.toString(16)}`,
+  )
 }
 
 function createXorDecryptor(data: Uint8Array, password: string): BiffRecordDecryptor {
@@ -171,9 +174,10 @@ function rotateRight8(value: number, bits: number): number {
 function createRc4Decryptor(data: Uint8Array, password: string): BiffRecordDecryptor {
   const info = parseRc4FilePass(data)
   const normalized = clampPassword(password)
-  const baseHash = info.method === "cryptoapi"
-    ? digest(info.hash, concat([info.salt, utf16le(normalized)]))
-    : md5(concat([utf16le(normalized), info.salt]))
+  const baseHash =
+    info.method === "cryptoapi"
+      ? digest(info.hash, concat([info.salt, utf16le(normalized)]))
+      : md5(concat([utf16le(normalized), info.salt]))
 
   const verifierKey = deriveRc4BlockKey(baseHash, 0, info)
   const verifier = rc4(verifierKey, info.encryptedVerifier)
@@ -231,7 +235,8 @@ function parseRc4FilePass(data: Uint8Array): Rc4FilePassInfo {
   // flags dword and size dword; the verifier immediately follows the variable
   // header. We read the common fields used by Excel-generated XLS files and
   // tolerate overlong provider names by trusting EncryptionHeaderSize.
-  if (data.length < 8) throw new ParseError("Invalid RC4 FilePass record: missing encryption header")
+  if (data.length < 8)
+    throw new ParseError("Invalid RC4 FilePass record: missing encryption header")
   const flags = u32(data, 0)
   const headerSize = u32(data, 4)
   const headerStart = 8
@@ -246,7 +251,10 @@ function parseRc4FilePass(data: Uint8Array): Rc4FilePassInfo {
   const keyBits = header.length >= 20 ? u32(header, 16) : 40
 
   if (algId !== 0x6801) {
-    throw new EncryptedFileError("xls", `Unsupported XLS CryptoAPI cipher algId 0x${algId.toString(16)}; RC4 is supported.`)
+    throw new EncryptedFileError(
+      "xls",
+      `Unsupported XLS CryptoAPI cipher algId 0x${algId.toString(16)}; RC4 is supported.`,
+    )
   }
 
   const hash = algHash === 0x8003 ? "md5" : "sha1"
@@ -255,7 +263,10 @@ function parseRc4FilePass(data: Uint8Array): Rc4FilePassInfo {
     throw new ParseError("Invalid RC4 CryptoAPI FilePass verifier salt")
   }
   const salt = data.subarray(verifierStart + 4, verifierStart + 4 + saltSize)
-  const encryptedVerifier = data.subarray(verifierStart + 4 + saltSize, verifierStart + 4 + saltSize + 16)
+  const encryptedVerifier = data.subarray(
+    verifierStart + 4 + saltSize,
+    verifierStart + 4 + saltSize + 16,
+  )
   const hashSizeOffset = verifierStart + 4 + saltSize + 16
   const encryptedVerifierHashSize = u32(data, hashSizeOffset)
   const encryptedVerifierHash = data.subarray(hashSizeOffset + 4)
@@ -265,7 +276,8 @@ function parseRc4FilePass(data: Uint8Array): Rc4FilePassInfo {
     salt,
     encryptedVerifier,
     encryptedVerifierHash,
-    encryptedVerifierHashSize: encryptedVerifierHashSize > 0 ? encryptedVerifierHashSize : hashByteLength(hash),
+    encryptedVerifierHashSize:
+      encryptedVerifierHashSize > 0 ? encryptedVerifierHashSize : hashByteLength(hash),
     keySize: keyBits || 40,
     hash,
   }
@@ -340,14 +352,21 @@ function md5(input: Uint8Array): Uint8Array {
   let b = 0xefcdab89
   let c = 0x98badcfe
   let d = 0x10325476
-  const s = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+  const s = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
+    14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ]
   const k = new Uint32Array(64)
   for (let i = 0; i < 64; i++) k[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0
 
   for (let off = 0; off < data.length; off += 64) {
     const m = new Uint32Array(16)
     for (let i = 0; i < 16; i++) m[i] = u32(data, off + i * 4)
-    let aa = a, bb = b, cc = c, dd = d
+    let aa = a,
+      bb = b,
+      cc = c,
+      dd = d
     for (let i = 0; i < 64; i++) {
       let f: number
       let g: number
@@ -391,10 +410,19 @@ function sha1(input: Uint8Array): Uint8Array {
 
   for (let off = 0; off < data.length; off += 64) {
     for (let i = 0; i < 16; i++) {
-      w[i] = ((data[off + i * 4]! << 24) | (data[off + i * 4 + 1]! << 16) | (data[off + i * 4 + 2]! << 8) | data[off + i * 4 + 3]!) >>> 0
+      w[i] =
+        ((data[off + i * 4]! << 24) |
+          (data[off + i * 4 + 1]! << 16) |
+          (data[off + i * 4 + 2]! << 8) |
+          data[off + i * 4 + 3]!) >>>
+        0
     }
     for (let i = 16; i < 80; i++) w[i] = rotl32(w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!, 1)
-    let a = h0, b = h1, c = h2, d = h3, e = h4
+    let a = h0,
+      b = h1,
+      c = h2,
+      d = h3,
+      e = h4
     for (let i = 0; i < 80; i++) {
       let f: number
       let k: number
@@ -429,7 +457,7 @@ function sha1(input: Uint8Array): Uint8Array {
 
 function padHash(input: Uint8Array, littleEndianLength: boolean): Uint8Array {
   const bitLen = input.length * 8
-  const total = (((input.length + 9 + 63) >> 6) << 6)
+  const total = ((input.length + 9 + 63) >> 6) << 6
   const out = new Uint8Array(total)
   out.set(input)
   out[input.length] = 0x80

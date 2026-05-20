@@ -28,20 +28,20 @@ The uploaded file `be2cfc00-79c3-469e-88b4-d979bd73805d.xls` was parsed using th
 
 Observed workbook structure:
 
-| Sheet | Rows | Columns | Status |
-| --- | ---: | ---: | --- |
-| 单选题 | 11 | 6 | Parsed and rendered |
-| 多选题 | 14 | 15 | Parsed and rendered |
-| 判断题 | 14 | 10 | Parsed and rendered |
+| Sheet  | Rows | Columns | Status              |
+| ------ | ---: | ------: | ------------------- |
+| 单选题 |   11 |       6 | Parsed and rendered |
+| 多选题 |   14 |      15 | Parsed and rendered |
+| 判断题 |   14 |      10 | Parsed and rendered |
 
 Parsed CFB document properties from the same workbook:
 
-| Property | Value |
-| --- | --- |
-| creator | DingTalk |
-| lastModifiedBy | DingTalk |
-| created | 2006-09-16T00:00:00.000Z |
-| modified | 2025-10-21T15:23:14.000Z |
+| Property       | Value                    |
+| -------------- | ------------------------ |
+| creator        | DingTalk                 |
+| lastModifiedBy | DingTalk                 |
+| created        | 2006-09-16T00:00:00.000Z |
+| modified       | 2025-10-21T15:23:14.000Z |
 
 The HTML render preserves Chinese text, line breaks, blank cells, correct-answer columns, and sheet separation. This gives a concrete smoke test for the CFB -> BIFF -> Workbook -> HTML path.
 

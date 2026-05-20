@@ -4,6 +4,8 @@ import { readXlsx } from "../src/xlsx/reader"
 import { writeXlsx } from "../src/xlsx/writer"
 import { readOds } from "../src/ods/reader"
 import { writeOds } from "../src/ods/writer"
+import { ZipReader } from "../src/zip/reader"
+import { ZipWriter } from "../src/zip/writer"
 import type { CellValue } from "../src/_types"
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -20,6 +22,23 @@ async function makeOds(rows: CellValue[][], sheetName = "Sheet1"): Promise<Uint8
   return writeOds({
     sheets: [{ name: sheetName, rows }],
   })
+}
+
+async function replaceZipEntry(
+  original: Uint8Array,
+  pathToReplace: string,
+  replacement: Uint8Array,
+): Promise<Uint8Array> {
+  const zip = new ZipReader(original)
+  const writer = new ZipWriter()
+
+  for (const path of zip.entries()) {
+    writer.add(path, path === pathToReplace ? replacement : await zip.extract(path), {
+      compress: false,
+    })
+  }
+
+  return writer.build()
 }
 
 // ── read() ──────────────────────────────────────────────────────────
@@ -66,6 +85,27 @@ describe("read()", () => {
 
     expect(wbXlsx.sheets[0]!.rows[0]![0]).toBe("xlsx")
     expect(wbOds.sheets[0]!.rows[0]![0]).toBe("ods")
+  })
+
+  it("auto-detects XML workbooks as XLSX even when a binary default content type is present", async () => {
+    const xlsx = await makeXlsx([["xlsx"]])
+    const zip = new ZipReader(xlsx)
+    const decoder = new TextDecoder("utf-8")
+    const encoder = new TextEncoder()
+    const contentTypes = decoder.decode(await zip.extract("[Content_Types].xml"))
+    const patchedContentTypes = contentTypes.replace(
+      /(<Types\b[^>]*>)/,
+      `$1<Default Extension="bin" ContentType="application/vnd.ms-excel.sheet.binary.macroEnabled.main"/>`,
+    )
+    const patched = await replaceZipEntry(
+      xlsx,
+      "[Content_Types].xml",
+      encoder.encode(patchedContentTypes),
+    )
+
+    const workbook = await read(patched)
+
+    expect(workbook.sheets[0]!.rows[0]![0]).toBe("xlsx")
   })
 
   it("reads from ArrayBuffer input", async () => {

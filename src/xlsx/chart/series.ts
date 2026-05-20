@@ -350,18 +350,25 @@ export function parseSeries(ser: XmlElement, kind: ChartKind, index: number): Ch
   return out
 }
 
-function parseCachedChartValues(wrapper: XmlElement | undefined): Array<number | string | null> | undefined {
+function parseCachedChartValues(
+  wrapper: XmlElement | undefined,
+): Array<number | string | null> | undefined {
   if (!wrapper) return undefined
-  const strCache = findChild(wrapper, "strLit") ?? findChild(findChild(wrapper, "strRef") ?? wrapper, "strCache")
+  const strCache =
+    findChild(wrapper, "strLit") ?? findChild(findChild(wrapper, "strRef") ?? wrapper, "strCache")
   if (strCache) return parseChartPointCache(strCache, false)
 
-  const numCache = findChild(wrapper, "numLit") ?? findChild(findChild(wrapper, "numRef") ?? wrapper, "numCache")
+  const numCache =
+    findChild(wrapper, "numLit") ?? findChild(findChild(wrapper, "numRef") ?? wrapper, "numCache")
   if (numCache) return parseChartPointCache(numCache, true)
 
   return undefined
 }
 
-function parseChartPointCache(cache: XmlElement, numeric: boolean): Array<number | string | null> | undefined {
+function parseChartPointCache(
+  cache: XmlElement,
+  numeric: boolean,
+): Array<number | string | null> | undefined {
   const values: Array<number | string | null> = []
   let sawPoint = false
 

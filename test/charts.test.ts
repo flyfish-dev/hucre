@@ -234,7 +234,7 @@ describe("parseChart — series introspection", () => {
     expect(parseChart(xml)?.series?.[0].name).toBe("Sheet1!$B$1")
   })
 
-  it("omits valuesRef and categoriesRef for literal numLit series", () => {
+  it("omits range refs but keeps cached values for literal numLit series", () => {
     const xml = `<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
   <c:chart>
     <c:plotArea>
@@ -255,7 +255,7 @@ describe("parseChart — series introspection", () => {
   </c:chart>
 </c:chartSpace>`
     const series = parseChart(xml)?.series
-    expect(series).toEqual([{ kind: "bar", index: 0 }])
+    expect(series).toEqual([{ kind: "bar", index: 0, cachedValues: [1, 2] }])
   })
 
   it("ignores malformed srgbClr values", () => {

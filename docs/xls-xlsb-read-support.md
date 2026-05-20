@@ -23,7 +23,7 @@ This branch adds zero-dependency readers for legacy BIFF `.xls` workbooks and BI
 
 - OPC package and relationship traversal.
 - Binary workbook sheet metadata and 1904 date-system flag.
-- Binary shared strings, full cell records, and compact BrtShort* worksheet cell records.
+- Binary shared strings, full cell records, and compact BrtShort\* worksheet cell records.
 - Binary formula cached values with formula-token decompilation from the formula payload tail.
 - Binary styles parsing for custom number formats and CellXfs, including date conversion.
 - Merged cells and basic binary hyperlink extraction.
