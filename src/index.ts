@@ -3,6 +3,7 @@ export { read, write, readObjects, writeObjects } from "./defter"
 export type { WriteObjectsTableOption } from "./defter"
 export type * from "./_types"
 export {
+  DecryptionError,
   DefterError,
   EncryptedFileError,
   ParseError,
@@ -15,6 +16,7 @@ export {
 // ── XLSX ────────────────────────────────────────────────────────────
 export { readXlsx } from "./xlsx/reader"
 export { writeXlsx } from "./xlsx/writer"
+export { link } from "./xlsx/hyperlink"
 export { openXlsx, saveXlsx } from "./xlsx/roundtrip"
 export type { RoundtripWorkbook } from "./xlsx/roundtrip"
 export { hashSheetPassword } from "./xlsx/password"
@@ -53,6 +55,7 @@ export type {
 // ── ODS ────────────────────────────────────────────────────────────
 export { readOds } from "./ods/reader"
 export { writeOds } from "./ods/writer"
+export { streamOdsRows } from "./ods/stream"
 export { readOdsObjects, writeOdsObjects } from "./ods/objects"
 export type { OdsObjectsReadOptions, OdsObjectsResult, OdsObjectsWriteOptions } from "./ods/objects"
 
@@ -104,7 +107,7 @@ export {
   timeToSerial,
 } from "./_date"
 export { formatValue } from "./_format"
-export type { FormatOptions } from "./_format"
+export type { FormatOptions, LocaleFormat } from "./_format"
 
 // ── Sheet and cell utilities ───────────────────────────────────────
 export {
@@ -141,6 +144,7 @@ export {
 // ── Export helpers ─────────────────────────────────────────────────
 export { fromHtml, toHtml, toJson, toMarkdown } from "./export/index"
 export type { HtmlExportOptions, JsonExportOptions, MarkdownExportOptions } from "./export/index"
+export { writeTsv, writeTsvObjects } from "./export/tsv"
 
 // ── Worker and image helpers ───────────────────────────────────────
 export { deserializeWorkbook, serializeWorkbook, WORKER_SAFE_FUNCTIONS } from "./worker"

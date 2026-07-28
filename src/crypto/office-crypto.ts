@@ -4,8 +4,9 @@
 // EncryptionInfo + EncryptedPackage streams). The implementation uses only
 // Web Crypto primitives available in modern browsers and Node 20+.
 
-import { EncryptedFileError, ParseError } from "../errors"
+import { DecryptionError, EncryptedFileError, ParseError } from "../errors"
 import type { WorkbookFormat } from "../errors"
+import { MAX_SPIN_COUNT } from "../limits"
 import { CfbReader } from "../xls/cfb"
 
 export interface OfficeCryptoOptions {
@@ -149,7 +150,12 @@ async function decryptAgilePackage(
   try {
     return await decryptAgilePackageUnchecked(xmlBytes, encryptedPackage, password, format)
   } catch (err) {
-    if (err instanceof EncryptedFileError || err instanceof ParseError) throw err
+    if (
+      err instanceof DecryptionError ||
+      err instanceof EncryptedFileError ||
+      err instanceof ParseError
+    )
+      throw err
     throw new EncryptedFileError(
       format,
       "Incorrect password or corrupted encrypted Office workbook.",
@@ -388,6 +394,16 @@ function parseAgileInfo(xml: string): AgileInfo {
     )
   }
 
+  const spinCount = intAttr(encryptedKeyTag, "spinCount", 100000)
+  if (!Number.isSafeInteger(spinCount) || spinCount < 0) {
+    throw new DecryptionError("EncryptionInfo has an invalid spinCount.")
+  }
+  if (spinCount > MAX_SPIN_COUNT) {
+    throw new DecryptionError(
+      `EncryptionInfo spinCount ${spinCount} exceeds the maximum of ${MAX_SPIN_COUNT}.`,
+    )
+  }
+
   return {
     keyData: {
       saltValue: b64(required(keyDataTag, "saltValue", "keyData")),
@@ -404,7 +420,7 @@ function parseAgileInfo(xml: string): AgileInfo {
     },
     encryptedKey: {
       saltValue: b64(required(encryptedKeyTag, "saltValue", "encryptedKey")),
-      spinCount: intAttr(encryptedKeyTag, "spinCount", 100000),
+      spinCount,
       blockSize: intAttr(encryptedKeyTag, "blockSize", 16),
       keyBits: intAttr(encryptedKeyTag, "keyBits", 256),
       hashSize: intAttr(

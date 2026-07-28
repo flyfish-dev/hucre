@@ -164,6 +164,25 @@ export interface Hyperlink {
   location?: string
 }
 
+/**
+ * A rich hyperlink value that can be placed inline in a {@link WriteSheet.data}
+ * row object, keyed by a column's `key`. The display text and link target live
+ * together, so a "Link" column needs no parallel `cells` coordinate map.
+ *
+ * @example
+ * ```ts
+ * data: [{ id: "abc", link: { text: "Open", hyperlink: "https://example.com/abc" } }]
+ * ```
+ */
+export interface HyperlinkValue {
+  /** Display text shown in the cell. */
+  text: string
+  /** Link destination — an external URL, or an internal ref prefixed with `#` (e.g. `"#Sheet2!A1"`). */
+  hyperlink: string
+  /** Optional hover tooltip. */
+  tooltip?: string
+}
+
 // ── Comment ────────────────────────────────────────────────────────
 
 export interface CellComment {
@@ -547,6 +566,7 @@ import type { SheetChart } from "./xlsx/chart/types"
 
 export type {
   ChartBorderDash,
+  ChartColor,
   ChartDataLabelPosition,
   ChartDataLabels,
   ChartDataPoint,
@@ -568,6 +588,8 @@ export type {
   ChartScatterStyle,
   ChartSeries,
   ChartShape3D,
+  ChartThemeColor,
+  ChartThemeColorName,
   ChartTrendline,
   ChartTrendlineType,
   ChartView3D,
@@ -1345,6 +1367,17 @@ export interface WriteOptions {
   stringMode?: "shared" | "inline"
   /** VBA project binary (vbaProject.bin) to embed. Output becomes macro-enabled (.xlsm). */
   vbaProject?: Uint8Array
+  /**
+   * Encrypt the output as a password-protected workbook (ECMA-376 Agile,
+   * the Excel 2010+ scheme). The result is an OLE2/CFB container that Excel
+   * opens after prompting for the password.
+   *
+   * `spinCount` is the password key-derivation iteration count (default
+   * 100000, matching Excel). Lower it only when the speed/security trade-off
+   * genuinely calls for it — the value is stored in the file, so any reader
+   * (including Excel) honors it.
+   */
+  encryption?: { password: string; spinCount?: number }
 }
 
 export interface WriteSheet {
@@ -1352,8 +1385,11 @@ export interface WriteSheet {
   columns?: ColumnDef[]
   /** Raw row data (array of arrays) */
   rows?: CellValue[][]
-  /** Object data (array of objects — uses column keys) */
-  data?: Array<Record<string, CellValue>>
+  /**
+   * Object data (array of objects — uses column keys). A value may be a scalar
+   * {@link CellValue} or a rich {@link HyperlinkValue} for inline clickable links.
+   */
+  data?: Array<Record<string, CellValue | HyperlinkValue>>
   /** Detailed cell overrides (keyed by "row,col") */
   cells?: Map<string, Partial<Cell>>
   merges?: MergeRange[]

@@ -16,6 +16,7 @@ import type {
   ChartAxisCrossBetween,
   ChartAxisInfo,
   ChartBarGrouping,
+  ChartColor,
   ChartKind,
   ChartLineAreaGrouping,
   ChartManualLayout,
@@ -26,8 +27,11 @@ import type { XmlElement } from "../../xml/parser"
 import { xmlElement, xmlSelfClose } from "../../xml/writer"
 import {
   EMU_PER_PT,
+  buildColorElement,
   clampStrokeWidthPt,
   normalizeBorderDash,
+  normalizeLineCap,
+  normalizeLineCompound,
   parseBorderWidthFromSpPr,
   parseSpPrBorderColor,
   parseSpPrFill,
@@ -288,7 +292,7 @@ export function parsePlotAreaLayout(plotArea: XmlElement): ChartManualLayout | u
  * so a stray `<c:spPr>` elsewhere (e.g. on a series, on an axis, on the
  * `<c:dTable>` block) cannot leak in.
  */
-export function parsePlotAreaFillColor(plotArea: XmlElement): string | undefined {
+export function parsePlotAreaFillColor(plotArea: XmlElement): ChartColor | undefined {
   return parseSpPrFill(plotArea)
 }
 
@@ -324,7 +328,7 @@ export function parsePlotAreaFillColor(plotArea: XmlElement): string | undefined
  * (`<a:ln><a:solidFill>`) child rather than the fill
  * (`<a:solidFill>`) child.
  */
-export function parsePlotAreaBorderColor(plotArea: XmlElement): string | undefined {
+export function parsePlotAreaBorderColor(plotArea: XmlElement): ChartColor | undefined {
   return parseSpPrBorderColor(plotArea)
 }
 
@@ -863,6 +867,10 @@ export function buildPlotArea(chart: SheetChart, sheetName: string): string {
     // Excel's reference shape byte-for-byte.
     xAxisTitleBorderDash: normalizeBorderDash(chart.axes?.x?.axisTitleBorderDash),
     yAxisTitleBorderDash: normalizeBorderDash(chart.axes?.y?.axisTitleBorderDash),
+    xAxisTitleBorderCap: normalizeLineCap(chart.axes?.x?.axisTitleBorderCap),
+    yAxisTitleBorderCap: normalizeLineCap(chart.axes?.y?.axisTitleBorderCap),
+    xAxisTitleBorderCompound: normalizeLineCompound(chart.axes?.x?.axisTitleBorderCompound),
+    yAxisTitleBorderCompound: normalizeLineCompound(chart.axes?.y?.axisTitleBorderCompound),
     xGridlines: normalizeAxisGridlines(chart.axes?.x?.gridlines),
     yGridlines: normalizeAxisGridlines(chart.axes?.y?.gridlines),
     xScale: normalizeAxisScale(chart.axes?.x?.scale),
@@ -1111,33 +1119,41 @@ export function buildPlotAreaSpPr(chart: SheetChart): string | undefined {
   const borderHex = normalizePlotAreaBorderColor(chart.plotAreaBorderColor)
   const borderWidthPt = clampStrokeWidthPt(chart.plotAreaBorderWidth)
   const borderDash = normalizeBorderDash(chart.plotAreaBorderDash)
+  const borderCap = normalizeLineCap(chart.plotAreaBorderCap)
+  const borderCompound = normalizeLineCompound(chart.plotAreaBorderCompound)
   if (
     fillHex === undefined &&
     borderHex === undefined &&
     borderWidthPt === undefined &&
-    borderDash === undefined
+    borderDash === undefined &&
+    borderCap === undefined &&
+    borderCompound === undefined
   ) {
     return undefined
   }
 
   const children: string[] = []
   if (fillHex !== undefined) {
-    children.push(
-      xmlElement("a:solidFill", undefined, [xmlSelfClose("a:srgbClr", { val: fillHex })]),
-    )
+    children.push(xmlElement("a:solidFill", undefined, [buildColorElement(fillHex)]))
   }
-  if (borderHex !== undefined || borderWidthPt !== undefined || borderDash !== undefined) {
+  if (
+    borderHex !== undefined ||
+    borderWidthPt !== undefined ||
+    borderDash !== undefined ||
+    borderCap !== undefined ||
+    borderCompound !== undefined
+  ) {
     const lnAttrs: Record<string, string | number> = {}
     if (borderWidthPt !== undefined) {
       // OOXML stores stroke width in EMU (1 pt = 12 700 EMU). Round to
       // the nearest integer because the schema types `w` as `xsd:int`.
       lnAttrs.w = Math.round(borderWidthPt * EMU_PER_PT)
     }
+    if (borderCap !== undefined) lnAttrs.cap = borderCap
+    if (borderCompound !== undefined) lnAttrs.cmpd = borderCompound
     const lnChildren: string[] = []
     if (borderHex !== undefined) {
-      lnChildren.push(
-        xmlElement("a:solidFill", undefined, [xmlSelfClose("a:srgbClr", { val: borderHex })]),
-      )
+      lnChildren.push(xmlElement("a:solidFill", undefined, [buildColorElement(borderHex)]))
     }
     // `<a:prstDash>` follows `<a:solidFill>` per CT_LineProperties
     // (ECMA-376 Part 1, §20.1.2.3.24) — fill before dash before
@@ -1171,7 +1187,7 @@ export function buildPlotAreaSpPr(chart: SheetChart): string | undefined {
  * the chart-level {@link normalizeTitleColor} so the two share the same
  * sRGB grammar.
  */
-export function normalizePlotAreaFillColor(value: string | undefined): string | undefined {
+export function normalizePlotAreaFillColor(value: ChartColor | undefined): ChartColor | undefined {
   return normalizeTitleColor(value)
 }
 
@@ -1193,7 +1209,9 @@ export function normalizePlotAreaFillColor(value: string | undefined): string | 
  * {@link normalizePlotAreaFillColor} — same hex grammar, distinct
  * writer slot (`<a:ln>` rather than `<a:solidFill>`).
  */
-export function normalizePlotAreaBorderColor(value: string | undefined): string | undefined {
+export function normalizePlotAreaBorderColor(
+  value: ChartColor | undefined,
+): ChartColor | undefined {
   return normalizeTitleColor(value)
 }
 
@@ -1763,9 +1781,9 @@ export function resolveClonePlotAreaLayout(
  * a `<c:plotArea>` element to host the fill.
  */
 export function resolveClonePlotAreaFillColor(
-  sourceValue: string | undefined,
-  override: string | null | undefined,
-): string | undefined {
+  sourceValue: ChartColor | undefined,
+  override: ChartColor | null | undefined,
+): ChartColor | undefined {
   if (override === undefined) return normalizePlotAreaFillColor(sourceValue)
   if (override === null) return undefined
   return normalizePlotAreaFillColor(override)
@@ -1793,9 +1811,9 @@ export function resolveClonePlotAreaFillColor(
  * `<c:plotArea>` element to host the stroke.
  */
 export function resolveClonePlotAreaBorderColor(
-  sourceValue: string | undefined,
-  override: string | null | undefined,
-): string | undefined {
+  sourceValue: ChartColor | undefined,
+  override: ChartColor | null | undefined,
+): ChartColor | undefined {
   if (override === undefined) return normalizePlotAreaBorderColor(sourceValue)
   if (override === null) return undefined
   return normalizePlotAreaBorderColor(override)

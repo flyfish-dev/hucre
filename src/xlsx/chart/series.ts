@@ -17,6 +17,7 @@
 
 import type {
   Chart,
+  ChartColor,
   ChartDataLabels,
   ChartDataPoint,
   ChartErrorBars,
@@ -40,8 +41,15 @@ import {
   STROKE_WIDTH_MAX_PT,
   STROKE_WIDTH_MIN_PT,
   VALID_DASH_STYLES,
+  VALID_LINE_CAPS,
+  VALID_LINE_COMPOUNDS,
+  buildColorElement,
   clampStrokeWidthPt,
+  normalizeChartColor,
+  normalizeLineCap,
+  normalizeLineCompound,
   normalizeRgbHex,
+  parseSchemeClr,
 } from "./shape"
 import {
   applyOverride,
@@ -90,31 +98,10 @@ const VALID_MARKER_SYMBOLS: ReadonlySet<ChartMarkerSymbol> = new Set([
 const MARKER_SIZE_MIN = 2
 const MARKER_SIZE_MAX = 72
 
-/** Recognized line cap tokens — mirrors OOXML `ST_LineCap`. */
-const VALID_LINE_CAPS: ReadonlySet<ChartLineCap> = new Set(["rnd", "sq", "flat"])
-
-/** Recognized line compound tokens — mirrors OOXML `ST_CompoundLine`. */
-const VALID_LINE_COMPOUNDS: ReadonlySet<ChartLineCompound> = new Set([
-  "sng",
-  "dbl",
-  "thickThin",
-  "thinThick",
-  "tri",
-])
-
-/** Validate a line cap token. */
-export function normalizeLineCap(value: ChartLineCap | undefined): ChartLineCap | undefined {
-  if (typeof value !== "string") return undefined
-  return VALID_LINE_CAPS.has(value) ? value : undefined
-}
-
-/** Validate a line compound token. */
-export function normalizeLineCompound(
-  value: ChartLineCompound | undefined,
-): ChartLineCompound | undefined {
-  if (typeof value !== "string") return undefined
-  return VALID_LINE_COMPOUNDS.has(value) ? value : undefined
-}
+// `VALID_LINE_CAPS` / `VALID_LINE_COMPOUNDS` and `normalizeLineCap` /
+// `normalizeLineCompound` now live in `chart/shape.ts` so every chart
+// host that emits `<a:ln cap="..."/>` / `<a:ln cmpd="..."/>` shares
+// the same accept-or-drop grammar. Re-imported below where needed.
 
 // ── Series options (writer) ───────────────────────────────────────
 
@@ -563,17 +550,21 @@ export function parseSeriesName(ser: XmlElement): string | undefined {
   return undefined
 }
 
-export function parseSeriesColor(ser: XmlElement): string | undefined {
+export function parseSeriesColor(ser: XmlElement): ChartColor | undefined {
   const spPr = findChild(ser, "spPr")
   if (!spPr) return undefined
   const fill = findChild(spPr, "solidFill")
   if (!fill) return undefined
   const srgb = findChild(fill, "srgbClr")
-  if (!srgb) return undefined
-  const val = srgb.attrs.val
-  if (typeof val !== "string") return undefined
-  const normalized = val.replace(/^#/, "").toUpperCase()
-  return /^[0-9A-F]{6}$/.test(normalized) ? normalized : undefined
+  if (srgb) {
+    const val = srgb.attrs.val
+    if (typeof val !== "string") return undefined
+    const normalized = val.replace(/^#/, "").toUpperCase()
+    return /^[0-9A-F]{6}$/.test(normalized) ? normalized : undefined
+  }
+  const schemeClr = findChild(fill, "schemeClr")
+  if (schemeClr) return parseSchemeClr(schemeClr)
+  return undefined
 }
 
 /**
@@ -869,10 +860,19 @@ export function normalizeDashStyle(
  * color and the dash / width override visibility-only attributes.
  */
 export function buildSeriesSpPr(
-  rgbHex: string | undefined,
+  rgbHex: ChartColor | undefined,
   stroke: ChartLineStroke | undefined,
 ): string | undefined {
-  const fillHex = rgbHex ? rgbHex.replace(/^#/, "").toUpperCase() : undefined
+  // Normalize the color reference. `string` inputs collapse through the
+  // existing srgbClr normalizer; `ChartThemeColor` inputs get validated
+  // and survive to emit a `<a:schemeClr>` element instead.
+  let fillColor: ChartColor | undefined
+  if (typeof rgbHex === "string") {
+    const normalized = rgbHex.replace(/^#/, "").toUpperCase()
+    fillColor = /^[0-9A-F]{6}$/.test(normalized) ? normalized : undefined
+  } else if (rgbHex !== undefined) {
+    fillColor = normalizeChartColor(rgbHex)
+  }
   const dash = normalizeDashStyle(stroke?.dash)
   const widthPt = clampStrokeWidthPt(stroke?.width)
   // The OOXML defaults — `cap="flat"` and `cmpd="sng"` — round-trip as
@@ -884,7 +884,7 @@ export function buildSeriesSpPr(
   const compound = compoundRaw === "sng" ? undefined : compoundRaw
 
   if (
-    !fillHex &&
+    !fillColor &&
     dash === undefined &&
     widthPt === undefined &&
     cap === undefined &&
@@ -894,10 +894,8 @@ export function buildSeriesSpPr(
   }
 
   const spPrChildren: string[] = []
-  if (fillHex) {
-    spPrChildren.push(
-      xmlElement("a:solidFill", undefined, [xmlSelfClose("a:srgbClr", { val: fillHex })]),
-    )
+  if (fillColor !== undefined) {
+    spPrChildren.push(xmlElement("a:solidFill", undefined, [buildColorElement(fillColor)]))
   }
 
   // `<a:ln>` carries stroke metadata. Emit it whenever a fill color is
@@ -905,7 +903,7 @@ export function buildSeriesSpPr(
   // legacy behavior) or whenever stroke width / dash / cap / compound
   // is configured.
   if (
-    fillHex ||
+    fillColor !== undefined ||
     dash !== undefined ||
     widthPt !== undefined ||
     cap !== undefined ||
@@ -920,10 +918,8 @@ export function buildSeriesSpPr(
     if (cap !== undefined) lnAttrs.cap = cap
     if (compound !== undefined) lnAttrs.cmpd = compound
     const lnChildren: string[] = []
-    if (fillHex) {
-      lnChildren.push(
-        xmlElement("a:solidFill", undefined, [xmlSelfClose("a:srgbClr", { val: fillHex })]),
-      )
+    if (fillColor !== undefined) {
+      lnChildren.push(xmlElement("a:solidFill", undefined, [buildColorElement(fillColor)]))
     }
     if (dash !== undefined) {
       lnChildren.push(xmlSelfClose("a:prstDash", { val: dash }))

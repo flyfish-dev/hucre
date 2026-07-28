@@ -65,6 +65,20 @@ export function writeWorkbookXml(
     parts.push(xmlSelfClose("workbookPr", { date1904: 1 }))
   }
 
+  // workbookProtection — lock structure and/or windows. The CT_Workbook
+  // sequence in ECMA-376 §18.2.27 is: workbookPr → workbookProtection →
+  // bookViews → sheets, so workbookProtection must precede bookViews or
+  // strict Excel rejects the workbook as corrupt.
+  if (workbookProtection) {
+    const protAttrs: Record<string, string | number> = {}
+    if (workbookProtection.lockStructure) protAttrs["lockStructure"] = 1
+    if (workbookProtection.lockWindows) protAttrs["lockWindows"] = 1
+    if (workbookProtection.password) {
+      protAttrs["workbookPassword"] = hashSheetPassword(workbookProtection.password)
+    }
+    parts.push(xmlSelfClose("workbookProtection", protAttrs))
+  }
+
   // bookViews — tells Excel which sheet tab is active
   const activeTab = activeSheet ?? 0
   parts.push(
@@ -79,18 +93,21 @@ export function writeWorkbookXml(
     ]),
   )
 
-  // workbookProtection — lock structure and/or windows
-  if (workbookProtection) {
-    const protAttrs: Record<string, string | number> = {}
-    if (workbookProtection.lockStructure) protAttrs["lockStructure"] = 1
-    if (workbookProtection.lockWindows) protAttrs["lockWindows"] = 1
-    if (workbookProtection.password) {
-      protAttrs["workbookPassword"] = hashSheetPassword(workbookProtection.password)
-    }
-    parts.push(xmlSelfClose("workbookProtection", protAttrs))
-  }
-
   parts.push(xmlElement("sheets", undefined, sheetElements))
+
+  // ── externalReferences — must precede definedNames. The CT_Workbook
+  // sequence in ECMA-376 §18.2.27 is: sheets → functionGroups →
+  // externalReferences → definedNames → calcPr. Defined names that
+  // dereference an external book (e.g. "[1]Sheet!$A$1") need that book's
+  // <externalReference> declared first, or Excel rejects the workbook as
+  // corrupt — even though lenient readers (Numbers, QuickLook, openpyxl)
+  // ignore element order and open it fine.
+  if (externalLinkRels && externalLinkRels.length > 0) {
+    const refChildren = externalLinkRels.map((r) =>
+      xmlSelfClose("externalReference", { "r:id": r.rId }),
+    )
+    parts.push(xmlElement("externalReferences", undefined, refChildren))
+  }
 
   // ── Defined Names (named ranges + print area/titles) ──
   if (namedRanges && namedRanges.length > 0) {
@@ -123,16 +140,6 @@ export function writeWorkbookXml(
     }
 
     parts.push(xmlElement("definedNames", undefined, dnElements))
-  }
-
-  // ── externalReferences — ECMA-376 §18.2.2 places the block after
-  // definedNames and before calcPr. Excel tolerates other orders, but
-  // the spec order is what we emit so generated files validate clean.
-  if (externalLinkRels && externalLinkRels.length > 0) {
-    const refChildren = externalLinkRels.map((r) =>
-      xmlSelfClose("externalReference", { "r:id": r.rId }),
-    )
-    parts.push(xmlElement("externalReferences", undefined, refChildren))
   }
 
   // ── calcPr — tells Excel to recalculate all formulas on open ──

@@ -394,6 +394,15 @@ class SstCursor {
     }
   }
 
+  remainingBytes(): number {
+    if (this.chunkIndex >= this.chunks.length) return 0
+    let remaining = this.chunks[this.chunkIndex]!.length - this.pos
+    for (let i = this.chunkIndex + 1; i < this.chunks.length; i++) {
+      remaining += this.chunks[i]!.length
+    }
+    return remaining
+  }
+
   private atChunkEnd(): boolean {
     return this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex]!.length
   }
@@ -419,12 +428,15 @@ class SstCursor {
   }
 }
 
-function parseSst(chunks: Uint8Array[], codePage: number): string[] {
+export function parseSst(chunks: Uint8Array[], codePage = 1252): string[] {
   const cursor = new SstCursor(chunks)
   cursor.readU32() // total string count
   const unique = cursor.readU32()
+  // An SST string needs at least cch (2 bytes) and grbit (1 byte).
+  // Bound hostile count headers by the bytes that actually remain.
+  const maxStrings = Math.min(unique, Math.floor(cursor.remainingBytes() / 3))
   const strings: string[] = []
-  for (let i = 0; i < unique; i++) {
+  for (let i = 0; i < maxStrings; i++) {
     strings.push(cursor.readString(codePage))
   }
   return strings

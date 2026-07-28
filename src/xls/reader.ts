@@ -55,13 +55,13 @@ export async function readXls(
   const data = await readInputToUint8Array(input)
 
   if (!isCfb(data)) {
-    if (isRawBiff(data)) return parseBiffWorkbook(data, options)
+    if (isRawBiff(data)) return parseBiffSafely(data, options)
     throw new ParseError("Invalid XLS: missing OLE2/CFB header or BIFF BOF record")
   }
 
   if (isOfficeEncryptedPackage(data)) {
     const decrypted = await decryptOfficeEncryptedPackage(data, options?.password, "xls")
-    if (isRawBiff(decrypted)) return parseBiffWorkbook(decrypted, options)
+    if (isRawBiff(decrypted)) return parseBiffSafely(decrypted, options)
     if (isCfb(decrypted)) return readXls(decrypted, options)
     throw new ParseError(
       "Encrypted package decrypted successfully, but it does not contain a legacy XLS BIFF workbook",
@@ -75,7 +75,7 @@ export async function readXls(
     throw new ParseError("Invalid XLS: missing Workbook/Book stream")
   }
 
-  const workbook = parseBiffWorkbook(workbookStream, options)
+  const workbook = parseBiffSafely(workbookStream, options)
   const properties = parseXlsProperties(cfb)
   if (properties) workbook.properties = properties
 
@@ -91,6 +91,20 @@ export async function readXls(
   }
 
   return workbook
+}
+
+function parseBiffSafely(
+  workbookStream: Uint8Array,
+  options?: ReadOptions & { password?: string },
+): Workbook {
+  try {
+    return parseBiffWorkbook(workbookStream, options)
+  } catch (err) {
+    if (err instanceof ParseError) throw err
+    throw new ParseError("Failed to parse XLS workbook (malformed or truncated)", undefined, {
+      cause: err,
+    })
+  }
 }
 
 function collectBinaryParts(cfb: CfbReader): BinaryWorkbookPart[] {

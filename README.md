@@ -243,6 +243,31 @@ const buffer = await writeXlsx({
 })
 ```
 
+For tabular reports, put links **inline in `data` rows** instead of a parallel
+`cells` map — keyed by the column's `key`. Use the `link()` helper (or a plain
+`{ text, hyperlink, tooltip? }` object). A `#`-prefixed target is treated as an
+internal reference (`#Sheet2!A1`).
+
+```ts
+import { writeXlsx, link } from "hucre/xlsx"
+
+await writeXlsx({
+  sheets: [
+    {
+      name: "Summary",
+      columns: [
+        { header: "Link", key: "link" },
+        { header: "ID", key: "id" },
+      ],
+      data: [
+        { link: link("Open", "https://example.com/items/abc-123"), id: "abc-123" },
+        { link: { text: "Open", hyperlink: "https://example.com/items/def-456" }, id: "def-456" },
+      ],
+    },
+  ],
+})
+```
+
 ### Streaming
 
 Process large files row-by-row without loading everything into memory:
@@ -252,6 +277,18 @@ import { streamXlsxRows, XlsxStreamWriter } from "hucre/xlsx"
 
 // Stream read — async generator yields rows one at a time
 for await (const row of streamXlsxRows(buffer)) {
+  console.log(row.index, row.values)
+}
+
+// True streaming from a ReadableStream — the ZIP is parsed front-to-back
+// from local file headers, so the whole archive is never buffered. Only
+// the small metadata parts (content types, rels, workbook, shared strings,
+// styles) are read up front; the target worksheet is piped straight into
+// the SAX parser. (Falls back to buffering only for archives whose layout
+// rules out single-pass streaming — e.g. ZIP data descriptors, or shared
+// strings stored after the worksheet.)
+const res = await fetch("https://example.com/huge.xlsx")
+for await (const row of streamXlsxRows(res.body!)) {
   console.log(row.index, row.values)
 }
 
@@ -305,6 +342,75 @@ for (let i = 0; i < 3_000_000; i++) writer.addRow([i + 1, Math.random()])
 // → BigData, BigData_2, BigData_3
 const buf = await writer.finish()
 ```
+
+### Password Protection
+
+Read and write password-protected XLSX workbooks (ECMA-376 **Agile**
+encryption — the Excel 2010+ scheme). Encryption is built on the
+platform's WebCrypto, so it stays zero-dependency and runs in Node, Deno,
+Bun, Cloudflare Workers, and browsers.
+
+```ts
+import { writeXlsx, readXlsx, readObjects, EncryptedFileError, DecryptionError } from "hucre"
+
+// Write an encrypted workbook
+const encrypted = await writeXlsx({
+  sheets: [{ name: "Secret", rows: [["pin", 1234]] }],
+  encryption: { password: "hunter2" },
+})
+
+// Read it back with the password
+const wb = await readXlsx(encrypted, { password: "hunter2" })
+
+// Works through every read entry point: read(), readObjects(), streamXlsxRows()
+const rows = await readObjects(encrypted, { password: "hunter2" })
+
+// Without a password an encrypted file throws EncryptedFileError;
+// with the wrong password it throws DecryptionError.
+try {
+  await readXlsx(encrypted)
+} catch (e) {
+  if (e instanceof EncryptedFileError) console.log("needs a password")
+}
+```
+
+The roundtrip path takes the same option: `await saveXlsx(wb, { encryption: { password } })`.
+The key-derivation iteration count defaults to Excel's 100000; lower it via
+`encryption: { password, spinCount }` when the speed/security trade-off calls for it.
+
+### XLSB (Binary Excel) — read
+
+Read `.xlsb` (Excel Binary Workbook) files — the binary package format
+that's smaller and faster to open than `.xlsx`. `read()` auto-detects it,
+or call `readXlsb` directly:
+
+```ts
+import { read, readXlsb } from "hucre"
+
+const wb = await readXlsb(bytes) // sheet names + typed cell values
+const same = await read(bytes) // auto-detected (XLSX vs XLSB vs ODS)
+```
+
+Decodes shared strings, RK / floating-point numbers, inline strings,
+booleans, error codes, cached formula values, and dates (via the binary
+style table). Read-only; password-protected `.xlsb` also decrypts with
+`{ password }`.
+
+### XLS (Legacy Excel 97-2003) — read
+
+Read legacy `.xls` (BIFF8) files — the OLE2/CFB binary format from Excel
+97-2003. `read()` auto-detects it, or call `readXls`:
+
+```ts
+import { read, readXls } from "hucre"
+
+const wb = await readXls(bytes)
+const same = await read(bytes) // auto-detected
+```
+
+Decodes the shared-string table (with CONTINUE spanning), RK / MULRK /
+number / boolean / error cells, labels, cached formula values, dates, and
+merged cells. Read-only.
 
 ### ODS (OpenDocument)
 
@@ -715,6 +821,31 @@ addChart(dashboard, {
 })
 await writeXlsx({ sheets: [dashboard] })
 ```
+
+Charts also survive the **roundtrip** (`openXlsx` → modify → `saveXlsx`),
+not just the fresh `writeXlsx` path. A chart attached to a newly added
+sheet — or carried across workbooks by `copySheetToWorkbook` — is
+serialized into proper `xl/charts/chartN.xml` parts with their drawing
+relationships on save:
+
+```ts
+import { copySheetToWorkbook, getCharts, openXlsx, saveXlsx } from "hucre"
+
+const template = await openXlsx(templateBytes)
+const report = await openXlsx(reportBytes)
+
+// Copy a chart-bearing sheet from the template into the report workbook…
+copySheetToWorkbook(template.sheets[0], report, "Dashboard")
+
+// …and saveXlsx re-emits the chart parts (not just the cell data).
+const out = await saveXlsx(report)
+console.log(getCharts(await openXlsx(out)).length) // includes the copied chart
+```
+
+The roundtrip path serializes model charts for sheets that don't already
+own a drawing (new or copied sheets); to add a chart to a sheet that
+already carries one, compose it through the fresh `writeXlsx` path
+instead.
 
 ### Unified API
 

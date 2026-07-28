@@ -1,6 +1,6 @@
 {
   "name": "hucre",
-  "version": "0.5.1",
+  "version": "0.6.2",
   "description": "Zero-dependency spreadsheet engine. Read & write XLSX, CSV, ODS. Schema validation, streaming, tree-shakeable. Pure TypeScript, works everywhere.",
   "keywords": [
     "csv",
@@ -87,14 +87,15 @@
   },
   "devDependencies": {
     "@typescript/native-preview": "7.0.0-dev.20260316.1",
-    "@vitest/coverage-v8": "^4.1.1",
-    "bumpp": "^11.0.1",
-    "citty": "^0.2.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "bumpp": "^12.0.0",
+    "citty": "^0.2.2",
     "consola": "^3.4.2",
-    "obuild": "^0.4.32",
-    "oxfmt": "^0.42.0",
-    "oxlint": "^1.57.0",
-    "typescript": "^6.0.2",
-    "vitest": "^4.1.1"
-  }
+    "obuild": "^0.4.38",
+    "oxfmt": "^0.59.0",
+    "oxlint": "^1.74.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "packageManager": "pnpm@11.15.1"
 }

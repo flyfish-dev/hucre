@@ -19,12 +19,13 @@ import { readXlsb } from "./xlsb/reader"
 import { writeXlsx } from "./xlsx/writer"
 import { readOds } from "./ods/reader"
 import { writeOds } from "./ods/writer"
-import { EncryptedFileError, ParseError, UnsupportedFormatError } from "./errors"
+import { EncryptedFileError, UnsupportedFormatError } from "./errors"
 import { isOle2Container, readInputToUint8Array } from "./_input"
 import { decryptOfficeEncryptedPackage, isOfficeEncryptedPackage } from "./crypto/office-crypto"
 import { ZipReader } from "./zip/reader"
 import { parseXml } from "./xml/parser"
 import type { XmlElement } from "./xml/parser"
+import { decryptAgile } from "./xlsx/crypto/agile"
 
 // ── Format Detection ────────────────────────────────────────────────
 
@@ -113,6 +114,25 @@ function normalizePackagePartName(partName = ""): string {
   return partName.replace(/^\/+/, "")
 }
 
+async function decryptDetectedOfficePackage(
+  data: Uint8Array,
+  password?: string,
+): Promise<Uint8Array> {
+  if (!password) {
+    return decryptOfficeEncryptedPackage(data, password)
+  }
+
+  try {
+    return await decryptAgile(data, password)
+  } catch (agileError) {
+    try {
+      return await decryptOfficeEncryptedPackage(data, password)
+    } catch {
+      throw agileError
+    }
+  }
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 
 /**
@@ -127,16 +147,13 @@ export async function read(
 
   if (isOle2Container(data)) {
     if (isOfficeEncryptedPackage(data)) {
-      data = await decryptOfficeEncryptedPackage(data, options?.password)
+      data = await decryptDetectedOfficePackage(data, options?.password)
     } else {
-      try {
-        return await readXls(data, options)
-      } catch (err) {
-        if (err instanceof ParseError) {
-          throw new EncryptedFileError()
-        }
-        throw err
-      }
+      // Preserve the historical byte-sniff behavior for short synthetic
+      // encrypted-container probes, while allowing malformed real XLS files
+      // to surface the parser's typed error instead of being mislabeled.
+      if (data.length < 512) throw new EncryptedFileError()
+      return readXls(data, options)
     }
   }
 

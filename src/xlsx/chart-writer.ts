@@ -6,9 +6,16 @@
 // Chapter 21). Each chart is a self-contained <c:chartSpace> document
 // referenced from a drawing part via a `chart` relationship.
 
-import type { ChartDisplayBlanksAs, SheetChart, WriteChartKind } from "../_types"
+import type { ChartColor, ChartDisplayBlanksAs, SheetChart, WriteChartKind } from "../_types"
 import { xmlDocument, xmlElement, xmlSelfClose } from "../xml/writer"
-import { EMU_PER_PT, clampStrokeWidthPt, normalizeBorderDash } from "./chart/shape"
+import {
+  EMU_PER_PT,
+  buildColorElement,
+  clampStrokeWidthPt,
+  normalizeBorderDash,
+  normalizeLineCap,
+  normalizeLineCompound,
+} from "./chart/shape"
 import {
   buildBackWallThickness,
   buildFloorThickness,
@@ -38,6 +45,8 @@ import {
   normalizeTitleColor,
   resolveTitleBold,
   resolveTitleBorderColor,
+  resolveTitleBorderCap,
+  resolveTitleBorderCompound,
   resolveTitleBorderDash,
   resolveTitleBorderWidth,
   resolveTitleColor,
@@ -106,6 +115,8 @@ export function writeChart(chart: SheetChart, sheetName: string): ChartWriteResu
         resolveTitleBorderColor(chart),
         resolveTitleBorderWidth(chart),
         resolveTitleBorderDash(chart),
+        resolveTitleBorderCap(chart),
+        resolveTitleBorderCompound(chart),
       ),
     )
   }
@@ -218,6 +229,8 @@ export function writeChart(chart: SheetChart, sheetName: string): ChartWriteResu
         resolveLegendBorderColor(chart),
         resolveLegendBorderWidth(chart),
         resolveLegendBorderDash(chart),
+        normalizeLineCap(chart.legendBorderCap),
+        normalizeLineCompound(chart.legendBorderCompound),
       ),
     )
   }
@@ -345,33 +358,41 @@ function buildChartSpaceSpPr(chart: SheetChart): string | undefined {
   const borderHex = normalizeChartSpaceBorderColor(chart.chartSpaceBorderColor)
   const borderWidthPt = clampStrokeWidthPt(chart.chartSpaceBorderWidth)
   const borderDash = normalizeBorderDash(chart.chartSpaceBorderDash)
+  const borderCap = normalizeLineCap(chart.chartSpaceBorderCap)
+  const borderCompound = normalizeLineCompound(chart.chartSpaceBorderCompound)
   if (
     fillHex === undefined &&
     borderHex === undefined &&
     borderWidthPt === undefined &&
-    borderDash === undefined
+    borderDash === undefined &&
+    borderCap === undefined &&
+    borderCompound === undefined
   ) {
     return undefined
   }
 
   const children: string[] = []
   if (fillHex !== undefined) {
-    children.push(
-      xmlElement("a:solidFill", undefined, [xmlSelfClose("a:srgbClr", { val: fillHex })]),
-    )
+    children.push(xmlElement("a:solidFill", undefined, [buildColorElement(fillHex)]))
   }
-  if (borderHex !== undefined || borderWidthPt !== undefined || borderDash !== undefined) {
+  if (
+    borderHex !== undefined ||
+    borderWidthPt !== undefined ||
+    borderDash !== undefined ||
+    borderCap !== undefined ||
+    borderCompound !== undefined
+  ) {
     const lnAttrs: Record<string, string | number> = {}
     if (borderWidthPt !== undefined) {
       // OOXML stores stroke width in EMU (1 pt = 12 700 EMU). Round to
       // the nearest integer because the schema types `w` as `xsd:int`.
       lnAttrs.w = Math.round(borderWidthPt * EMU_PER_PT)
     }
+    if (borderCap !== undefined) lnAttrs.cap = borderCap
+    if (borderCompound !== undefined) lnAttrs.cmpd = borderCompound
     const lnChildren: string[] = []
     if (borderHex !== undefined) {
-      lnChildren.push(
-        xmlElement("a:solidFill", undefined, [xmlSelfClose("a:srgbClr", { val: borderHex })]),
-      )
+      lnChildren.push(xmlElement("a:solidFill", undefined, [buildColorElement(borderHex)]))
     }
     // `<a:prstDash>` follows `<a:solidFill>` per CT_LineProperties
     // schema sequence (ECMA-376 Part 1, §20.1.2.3.24).
@@ -403,7 +424,7 @@ function buildChartSpaceSpPr(chart: SheetChart): string | undefined {
  * to the chart-level {@link normalizeTitleColor} so every `<a:srgbClr>`
  * fill slot shares the same sRGB grammar.
  */
-function normalizeChartSpaceFillColor(value: string | undefined): string | undefined {
+function normalizeChartSpaceFillColor(value: ChartColor | undefined): ChartColor | undefined {
   return normalizeTitleColor(value)
 }
 
@@ -425,7 +446,7 @@ function normalizeChartSpaceFillColor(value: string | undefined): string | undef
  * {@link normalizeChartSpaceFillColor} — same hex grammar, distinct
  * writer slot (`<a:ln>` rather than `<a:solidFill>`).
  */
-function normalizeChartSpaceBorderColor(value: string | undefined): string | undefined {
+function normalizeChartSpaceBorderColor(value: ChartColor | undefined): ChartColor | undefined {
   return normalizeTitleColor(value)
 }
 

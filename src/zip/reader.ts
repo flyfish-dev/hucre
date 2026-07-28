@@ -3,6 +3,7 @@
 // Supports STORE (method 0) and DEFLATE (method 8).
 
 import { ZipError } from "../errors"
+import { MAX_DECOMPRESSED_BYTES } from "../limits"
 import { crc32, inflate } from "./deflate"
 
 // ── ZIP Signatures ──────────────────────────────────────────────────
@@ -11,6 +12,9 @@ const SIG_LOCAL_FILE = 0x04034b50
 const SIG_CENTRAL_DIR = 0x02014b50
 const SIG_END_OF_CENTRAL_DIR = 0x06054b50
 const SIG_DATA_DESCRIPTOR = 0x08074b50
+
+/** 0xFFFFFFFF marker that signals a 32-bit ZIP field overflowed into ZIP64. */
+const ZIP64_SENTINEL = 0xffffffff
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -49,7 +53,10 @@ function checkDecompressionStream(): boolean {
   return hasDecompressionStream
 }
 
-async function decompressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
+async function decompressDeflateRaw(
+  data: Uint8Array,
+  maxBytes = MAX_DECOMPRESSED_BYTES,
+): Promise<Uint8Array> {
   if (checkDecompressionStream()) {
     try {
       const ds = new DecompressionStream("deflate-raw")
@@ -67,8 +74,18 @@ async function decompressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
-        chunks.push(value)
         totalLen += value.length
+        if (totalLen > maxBytes) {
+          try {
+            await reader.cancel()
+          } catch {
+            // ignore
+          }
+          throw new ZipError(
+            `Decompressed size exceeds limit of ${maxBytes} bytes (possible zip bomb)`,
+          )
+        }
+        chunks.push(value)
       }
 
       // Combine chunks
@@ -79,13 +96,16 @@ async function decompressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
         offset += chunk.length
       }
       return result
-    } catch {
-      // Fall through to pure TS implementation
+    } catch (err) {
+      // A size-limit breach is a hard failure — don't retry with the
+      // pure-TS path (which would just OOM the same way).
+      if (err instanceof ZipError) throw err
+      // Otherwise fall through to pure TS implementation
     }
   }
 
   // Pure TypeScript fallback
-  return inflate(data)
+  return inflate(data, maxBytes)
 }
 
 // ── ZipReader ───────────────────────────────────────────────────────
@@ -174,6 +194,20 @@ export class ZipReader {
     const centralDirSize = this.view.getUint32(eocdOffset + 12, true)
     const centralDirOffset = this.view.getUint32(eocdOffset + 16, true)
     const entryCount = this.view.getUint16(eocdOffset + 10, true)
+
+    // ZIP64: when the entry count or central-directory size/offset overflows
+    // the 16-/32-bit EOCD fields they hold a 0xFFFF / 0xFFFFFFFF sentinel and
+    // the real values live in a ZIP64 EOCD record we don't parse. Fail loudly
+    // instead of silently reading a truncated entry list or a garbage offset.
+    if (
+      entryCount === 0xffff ||
+      centralDirSize === ZIP64_SENTINEL ||
+      centralDirOffset === ZIP64_SENTINEL
+    ) {
+      throw new ZipError(
+        "ZIP64 archives are not supported (entry count or size exceeds the classic ZIP limits)",
+      )
+    }
 
     this.readCentralDirectory(centralDirOffset, centralDirSize, entryCount)
   }
@@ -293,7 +327,13 @@ export class ZipReader {
       if (compressedData.length === 0 && uncompressedSize === 0) {
         result = new Uint8Array(0)
       } else {
-        result = await decompressDeflateRaw(compressedData)
+        // Bound output by the central-directory uncompressedSize (when
+        // declared and trustworthy) as well as the absolute hard cap.
+        const declaredCap =
+          uncompressedSize > 0
+            ? Math.min(uncompressedSize, MAX_DECOMPRESSED_BYTES)
+            : MAX_DECOMPRESSED_BYTES
+        result = await decompressDeflateRaw(compressedData, declaredCap)
       }
     } else {
       throw new ZipError(
@@ -422,7 +462,11 @@ export class ZipReader {
       }
 
       // Fallback: inflate synchronously and emit as stream
-      const inflated = inflate(compressedData)
+      const declaredCap =
+        entry.uncompressedSize > 0
+          ? Math.min(entry.uncompressedSize, MAX_DECOMPRESSED_BYTES)
+          : MAX_DECOMPRESSED_BYTES
+      const inflated = inflate(compressedData, declaredCap)
       return new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(inflated)

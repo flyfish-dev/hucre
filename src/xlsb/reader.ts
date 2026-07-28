@@ -21,6 +21,7 @@ import { isOle2Container, readInputToUint8Array } from "../_input"
 import { decryptOfficeEncryptedPackage } from "../crypto/office-crypto"
 import { ZipReader } from "../zip/reader"
 import { parseContentTypes } from "../xlsx/content-types"
+import { decryptAgile } from "../xlsx/crypto/agile"
 import { parseRelationships } from "../xlsx/relationships"
 import {
   parseCoreProperties,
@@ -150,7 +151,20 @@ export async function readXlsb(
 ): Promise<Workbook> {
   const data = await readInputToUint8Array(input)
   if (isOle2Container(data)) {
-    const decrypted = await decryptOfficeEncryptedPackage(data, options?.password, "xlsb")
+    let decrypted: Uint8Array
+    if (!options?.password) {
+      decrypted = await decryptOfficeEncryptedPackage(data, options?.password, "xlsb")
+    } else {
+      try {
+        decrypted = await decryptAgile(data, options.password)
+      } catch (agileError) {
+        try {
+          decrypted = await decryptOfficeEncryptedPackage(data, options.password, "xlsb")
+        } catch {
+          throw agileError
+        }
+      }
+    }
     return readXlsb(decrypted, options)
   }
 
@@ -371,7 +385,7 @@ function parseSharedStringsBin(data: Uint8Array): XlsbSharedString[] {
 }
 
 function parseSharedStringItem(data: Uint8Array): XlsbSharedString {
-  const parsed = readXlsbWideString(data, 0)
+  const parsed = readOptionalWideString(data, 1) ?? readXlsbWideString(data, 0)
   const text = parsed.value
   const richText = parseRichTextRuns(text, data, parsed.offset)
   return richText ? { text, richText } : { text }

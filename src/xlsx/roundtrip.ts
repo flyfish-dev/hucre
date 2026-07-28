@@ -3,7 +3,15 @@
 // images, macros, shapes, or other features that defter doesn't natively
 // understand.
 
-import type { Sheet, Workbook, ReadOptions, WriteSheet, NamedRange } from "../_types"
+import type {
+  Sheet,
+  Workbook,
+  ReadOptions,
+  WriteSheet,
+  NamedRange,
+  Chart,
+  SheetChart,
+} from "../_types"
 import { readXlsx } from "./reader"
 import { ZipReader } from "../zip/reader"
 import { ZipWriter } from "../zip/writer"
@@ -22,6 +30,11 @@ import { createSharedStrings, writeSharedStringsXml, writeWorksheetXml } from ".
 import type { WorksheetResult } from "./worksheet-writer"
 import { writeDrawing } from "./drawing-writer"
 import type { DrawingResult } from "./drawing-writer"
+import { writeChart } from "./chart-writer"
+import { cloneChart } from "./chart-clone"
+import { isOle2Container } from "../_input"
+import { EncryptedFileError } from "../errors"
+import { decryptAgile, encryptAgile } from "./crypto/agile"
 import { writeComments } from "./comments-writer"
 import type { CommentsResult } from "./comments-writer"
 import { writeTable } from "./table-writer"
@@ -108,7 +121,17 @@ export async function openXlsx(
   input: Uint8Array | ArrayBuffer,
   options?: ReadOptions,
 ): Promise<RoundtripWorkbook> {
-  const data = input instanceof Uint8Array ? input : new Uint8Array(input)
+  let data = input instanceof Uint8Array ? input : new Uint8Array(input)
+
+  // Decrypt password-protected workbooks up front so both the parse and
+  // the raw-entry capture below see the plaintext OOXML ZIP.
+  if (isOle2Container(data)) {
+    if (options?.password) {
+      data = await decryptAgile(data, options.password)
+    } else {
+      throw new EncryptedFileError("xlsx")
+    }
+  }
 
   // 1. Parse the workbook normally
   const workbook = await readXlsx(data, options)
@@ -144,8 +167,13 @@ export async function openXlsx(
 
 /**
  * Write a RoundtripWorkbook back to XLSX, preserving unmodified parts.
+ * Pass `{ encryption: { password } }` to emit a password-protected
+ * (ECMA-376 Agile) workbook.
  */
-export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array> {
+export async function saveXlsx(
+  workbook: RoundtripWorkbook,
+  saveOptions?: { encryption?: { password: string; spinCount?: number } },
+): Promise<Uint8Array> {
   const { sheets, properties, namedRanges, dateSystem, defaultFont, activeSheet } = workbook
 
   // Convert Sheet[] to WriteSheet[] for the writer infrastructure
@@ -549,6 +577,86 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
     }
   }
 
+  // ── Model chart serialization (issue #136) ────────────────────────
+  // Charts carried on a sheet's `charts` array as data (not preserved
+  // raw parts) — e.g. a sheet brought in by copySheetToWorkbook, or
+  // charts appended to a workbook after openXlsx — are serialized here
+  // through the same drawing + chart pipeline the fresh writer uses.
+  //
+  // SAFETY: we only emit model charts for a sheet that has NO drawing of
+  // its own already in play — no hucre-regenerated image drawing
+  // (`drawingResults[i]`), no preserved original chart drawing
+  // (`sheetPreservedDrawingTargets[i]`), and no other original drawing
+  // relationship. That keeps this purely additive: it never rewrites or
+  // collides with a drawing the roundtrip is already preserving. Adding
+  // a chart to a sheet that already owns a drawing is out of scope for
+  // the roundtrip path — use the fresh writeXlsx path for that.
+  type ChartFileEntry = { globalIndex: number; xml: string; rels: string }
+  interface ModelChartDrawing {
+    drawing: DrawingResult
+    drawingNumber: number
+    charts: ChartFileEntry[]
+  }
+  const modelChartDrawings: Array<ModelChartDrawing | null> = sheets.map(() => null)
+  const newModelChartIndices: number[] = []
+  {
+    const sheetHasOriginalDrawingRel = (i: number): boolean => {
+      const expected = `xl/worksheets/_rels/sheet${i + 1}.xml.rels`
+      for (const [p, d] of workbook._rawEntries) {
+        if (p.toLowerCase() !== expected) continue
+        return parseRelationships(new TextDecoder("utf-8").decode(d)).some((r) =>
+          r.type.endsWith("/relationships/drawing"),
+        )
+      }
+      return false
+    }
+
+    // Allocate drawing / chart numbers past anything already used so the
+    // new parts never collide with a preserved or regenerated drawing.
+    const usedDrawingNumbers = new Set<number>(preservedDrawingNumbers)
+    for (const path of workbook._rawEntries.keys()) {
+      const m = path.match(/^xl\/drawings\/drawing(\d+)\.xml$/i)
+      if (m) usedDrawingNumbers.add(parseInt(m[1], 10))
+    }
+    for (let i = 0; i < drawingResults.length; i++) {
+      if (drawingResults[i]) usedDrawingNumbers.add(i + 1)
+    }
+    let nextDrawingNumber = (usedDrawingNumbers.size ? Math.max(...usedDrawingNumbers) : 0) + 1
+    let nextChartNumber = (chartIndices.length ? chartIndices[chartIndices.length - 1] : 0) + 1
+
+    for (let i = 0; i < sheets.length; i++) {
+      const srcCharts = sheets[i].charts
+      if (!srcCharts || srcCharts.length === 0) continue
+      // Skip sheets that already own a drawing — see SAFETY note above.
+      if (drawingResults[i]) continue
+      if (sheetPreservedDrawingTargets[i] !== undefined) continue
+      if (sheetHasOriginalDrawingRel(i)) continue
+
+      const writeCharts = toWriteCharts(srcCharts as Array<Chart | SheetChart>)
+      if (writeCharts.length === 0) continue
+
+      const drawingNumber = nextDrawingNumber++
+      const drawing = writeDrawing([], globalImageIndex, undefined, writeCharts, nextChartNumber)
+      const charts: ChartFileEntry[] = []
+      for (let c = 0; c < writeCharts.length; c++) {
+        const written = writeChart(writeCharts[c], sheets[i].name)
+        const g = nextChartNumber + c
+        charts.push({ globalIndex: g, xml: written.chartXml, rels: written.chartRels })
+        newModelChartIndices.push(g)
+      }
+      nextChartNumber += writeCharts.length
+
+      modelChartDrawings[i] = { drawing, drawingNumber, charts }
+      drawingIndices.push(drawingNumber)
+      regeneratedPaths.add(`xl/drawings/drawing${drawingNumber}.xml`)
+      regeneratedPaths.add(`xl/drawings/_rels/drawing${drawingNumber}.xml.rels`)
+      for (const cf of charts) {
+        regeneratedPaths.add(`xl/charts/chart${cf.globalIndex}.xml`)
+        regeneratedPaths.add(`xl/charts/_rels/chart${cf.globalIndex}.xml.rels`)
+      }
+    }
+  }
+
   // Build ZIP archive
   const zip = new ZipWriter()
 
@@ -602,6 +710,7 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
   // need to declare any drawings we force-preserved (chart-only) so
   // Excel doesn't see the preserved bytes as orphan.
   const allDrawingIndices = mergeSortedUnique(drawingIndices, preservedDrawingNumbers)
+  const allChartIndices = mergeSortedUnique(chartIndices, newModelChartIndices)
   const ctOpts: ContentTypesOptions = {
     sheetCount: writeSheets.length,
     hasSharedStrings,
@@ -623,7 +732,7 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
     slicerCacheIndices: slicerCacheIndices.length > 0 ? slicerCacheIndices : undefined,
     timelineIndices: timelineIndices.length > 0 ? timelineIndices : undefined,
     timelineCacheIndices: timelineCacheIndices.length > 0 ? timelineCacheIndices : undefined,
-    chartIndices: chartIndices.length > 0 ? chartIndices : undefined,
+    chartIndices: allChartIndices.length > 0 ? allChartIndices : undefined,
     chartStyleIndices: chartStyleIndices.length > 0 ? chartStyleIndices : undefined,
     chartColorsIndices: chartColorsIndices.length > 0 ? chartColorsIndices : undefined,
     hasCoreProps: true,
@@ -710,6 +819,12 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
     const preservedDrawingTarget = sheetPreservedDrawingTargets[i]
     const hasPreservedDrawing = preservedDrawingTarget !== undefined && !hasDrawing
     let preservedDrawingRId: string | undefined
+    // Model charts serialized for this sheet (issue #136). Like the
+    // preserved-drawing case, the regenerated worksheet body has no
+    // `<drawing>` element, so we emit a drawing relationship and inject
+    // the reference below.
+    const modelDrawing = modelChartDrawings[i]
+    const hasModelChartDrawing = modelDrawing !== null
     let worksheetXml = result.xml
 
     if (
@@ -721,7 +836,8 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
       hasTimelines ||
       hasThreadedComments ||
       hasSheetPivotTables ||
-      hasPreservedDrawing
+      hasPreservedDrawing ||
+      hasModelChartDrawing
     ) {
       const relElements: string[] = []
       // Track the highest existing rId so newly added slicer/timeline
@@ -830,6 +946,20 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
         worksheetXml = injectWorksheetDrawing(worksheetXml, preservedDrawingRId)
       }
 
+      // Wire up the model-chart drawing (issue #136): emit the drawing
+      // relationship and splice `<drawing r:id="..."/>` into the body.
+      if (hasModelChartDrawing && modelDrawing) {
+        const modelDrawingRId = `rId${nextSheetRid++}`
+        relElements.push(
+          xmlSelfClose("Relationship", {
+            Id: modelDrawingRId,
+            Type: REL_DRAWING,
+            Target: `../drawings/drawing${modelDrawing.drawingNumber}.xml`,
+          }),
+        )
+        worksheetXml = injectWorksheetDrawing(worksheetXml, modelDrawingRId)
+      }
+
       // Threaded comments (Excel 365). The rId only needs to be unique
       // within this rels file — `nextSheetRid` already tracks the next
       // free rId past every relationship emitted above (including the
@@ -874,6 +1004,22 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
       }
     }
 
+    // Add model-chart drawing + chart bodies (issue #136)
+    if (modelDrawing) {
+      zip.add(
+        `xl/drawings/drawing${modelDrawing.drawingNumber}.xml`,
+        encoder.encode(modelDrawing.drawing.drawingXml),
+      )
+      zip.add(
+        `xl/drawings/_rels/drawing${modelDrawing.drawingNumber}.xml.rels`,
+        encoder.encode(modelDrawing.drawing.drawingRels),
+      )
+      for (const cf of modelDrawing.charts) {
+        zip.add(`xl/charts/chart${cf.globalIndex}.xml`, encoder.encode(cf.xml))
+        zip.add(`xl/charts/_rels/chart${cf.globalIndex}.xml.rels`, encoder.encode(cf.rels))
+      }
+    }
+
     // Add comments and VML drawing files
     if (comments) {
       zip.add(`xl/comments${i + 1}.xml`, encoder.encode(comments.commentsXml))
@@ -900,7 +1046,9 @@ export async function saveXlsx(workbook: RoundtripWorkbook): Promise<Uint8Array>
     }
   }
 
-  return zip.build()
+  const out = await zip.build()
+  const enc = saveOptions?.encryption
+  return enc?.password ? encryptAgile(out, enc.password, { spinCount: enc.spinCount }) : out
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -1017,6 +1165,43 @@ function mergeSortedUnique(a: number[], b: number[]): number[] {
   const out = new Set<number>(a)
   for (const n of b) out.add(n)
   return Array.from(out).sort((x, y) => x - y)
+}
+
+/**
+ * Normalize a sheet's `charts` entries to writer-ready {@link SheetChart}
+ * objects (issue #136).
+ *
+ * Entries are accepted in either model: a write-model {@link SheetChart}
+ * (it carries a `type` discriminator) passes through, gaining a default
+ * top-left anchor only if it has none; a parsed read-model {@link Chart}
+ * (it carries `kinds`) is bridged via {@link cloneChart}, forwarding its
+ * own `anchor` when present and falling back to the top-left cell for
+ * absolute-anchored charts.
+ *
+ * Charts that cannot be expressed in the write model — non-writable kinds
+ * (radar / surface / stock / …) or series with no formula reference — are
+ * dropped rather than throwing, so a save never fails on a chart the
+ * writer can't represent.
+ */
+function toWriteCharts(charts: Array<Chart | SheetChart>): SheetChart[] {
+  const out: SheetChart[] = []
+  for (const c of charts) {
+    if (!c || typeof c !== "object") continue
+    if ("type" in c && c.type) {
+      // Already a write-model SheetChart.
+      out.push(c.anchor ? c : { ...c, anchor: { from: { row: 0, col: 0 } } })
+      continue
+    }
+    // Parsed read-model Chart → bridge to the write model.
+    try {
+      out.push(
+        cloneChart(c as Chart, { anchor: (c as Chart).anchor ?? { from: { row: 0, col: 0 } } }),
+      )
+    } catch {
+      // Non-writable kind or series without a formula ref — skip it.
+    }
+  }
+  return out
 }
 
 /**

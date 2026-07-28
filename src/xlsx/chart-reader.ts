@@ -15,6 +15,7 @@
 import type {
   Chart,
   ChartBarGrouping,
+  ChartColor,
   ChartDataLabelsInfo,
   ChartDisplayBlanksAs,
   ChartKind,
@@ -26,6 +27,8 @@ import type {
 import { parseXml } from "../xml/parser"
 import type { XmlElement } from "../xml/parser"
 import {
+  parseBorderCapFromSpPr,
+  parseBorderCompoundFromSpPr,
   parseBorderDashFromSpPr,
   parseBorderWidthFromSpPr,
   parseSpPrBorderColor,
@@ -40,7 +43,9 @@ import {
 import {
   parseTitle,
   parseTitleBold,
+  parseTitleBorderCap,
   parseTitleBorderColor,
+  parseTitleBorderCompound,
   parseTitleBorderDash,
   parseTitleBorderWidth,
   parseTitleColor,
@@ -57,7 +62,9 @@ import {
 import {
   parseLegend,
   parseLegendBold,
+  parseLegendBorderCap,
   parseLegendBorderColor,
+  parseLegendBorderCompound,
   parseLegendBorderDash,
   parseLegendBorderWidth,
   parseLegendEntries,
@@ -317,6 +324,14 @@ export function parseChart(xml: string): Chart | undefined {
   const titleBorderDash = parseTitleBorderDash(chartEl)
   if (titleBorderDash !== undefined) out.titleBorderDash = titleBorderDash
 
+  // `<c:title><c:spPr><a:ln cap=".."/>` and `<a:ln cmpd=".."/>` —
+  // Excel's per-line cap and compound styling. Same accept-or-drop
+  // grammar as every other chart-frame `<a:ln>` slot.
+  const titleBorderCap = parseTitleBorderCap(chartEl)
+  if (titleBorderCap !== undefined) out.titleBorderCap = titleBorderCap
+  const titleBorderCompound = parseTitleBorderCompound(chartEl)
+  if (titleBorderCompound !== undefined) out.titleBorderCompound = titleBorderCompound
+
   // `<c:autoTitleDeleted>` records whether the user explicitly deleted
   // the auto-generated title — independent of whether a literal
   // `<c:title>` is present. The element sits on `<c:chart>` directly
@@ -575,6 +590,13 @@ export function parseChart(xml: string): Chart | undefined {
     // chart-frame border-dash slot.
     const plotAreaBorderDash = parseBorderDashFromSpPr(plotArea)
     if (plotAreaBorderDash !== undefined) out.plotAreaBorderDash = plotAreaBorderDash
+
+    // `<c:plotArea><c:spPr><a:ln cap=".."/>` and `<a:ln cmpd=".."/>` —
+    // Excel's per-line cap and compound styling.
+    const plotAreaBorderCap = parseBorderCapFromSpPr(plotArea)
+    if (plotAreaBorderCap !== undefined) out.plotAreaBorderCap = plotAreaBorderCap
+    const plotAreaBorderCompound = parseBorderCompoundFromSpPr(plotArea)
+    if (plotAreaBorderCompound !== undefined) out.plotAreaBorderCompound = plotAreaBorderCompound
   }
 
   const legend = parseLegend(chartEl)
@@ -704,6 +726,13 @@ export function parseChart(xml: string): Chart | undefined {
     // frame border-dash slot.
     const legendBorderDash = parseLegendBorderDash(chartEl)
     if (legendBorderDash !== undefined) out.legendBorderDash = legendBorderDash
+
+    // `<c:legend><c:spPr><a:ln cap=".."/>` and `<a:ln cmpd=".."/>` —
+    // Excel's per-line cap and compound styling.
+    const legendBorderCap = parseLegendBorderCap(chartEl)
+    if (legendBorderCap !== undefined) out.legendBorderCap = legendBorderCap
+    const legendBorderCompound = parseLegendBorderCompound(chartEl)
+    if (legendBorderCompound !== undefined) out.legendBorderCompound = legendBorderCompound
   }
 
   const dispBlanksAs = parseDispBlanksAs(chartEl)
@@ -849,8 +878,29 @@ export function parseChart(xml: string): Chart | undefined {
   const chartSpaceBorderDash = parseBorderDashFromSpPr(chartSpace)
   if (chartSpaceBorderDash !== undefined) out.chartSpaceBorderDash = chartSpaceBorderDash
 
+  // `<c:chartSpace><c:spPr><a:ln cap=".."/>` and `<a:ln cmpd=".."/>` —
+  // Excel's per-line cap and compound styling. Same accept-or-drop
+  // grammar as every other chart-frame `<a:ln>` slot the reader
+  // surfaces — the OOXML defaults `"flat"` / `"sng"` collapse to
+  // `undefined` so absence and the defaults round-trip identically.
+  const chartSpaceBorderCap = parseBorderCapFromSpPr(chartSpace)
+  if (chartSpaceBorderCap !== undefined) out.chartSpaceBorderCap = chartSpaceBorderCap
+  const chartSpaceBorderCompound = parseBorderCompoundFromSpPr(chartSpace)
+  if (chartSpaceBorderCompound !== undefined) {
+    out.chartSpaceBorderCompound = chartSpaceBorderCompound
+  }
+
   return out
 }
+
+// ── Stroke ────────────────────────────────────────────────────────
+//
+// `STROKE_WIDTH_MIN_PT`, `STROKE_WIDTH_MAX_PT`, `EMU_PER_PT`,
+// `VALID_DASH_STYLES`, `VALID_BORDER_DASHES`, `parseBorderWidthFromSpPr`
+// and `parseBorderDashFromSpPr` now live in `./chart/shape.ts`. Imported
+// at the top of this module so every host-specific helper can keep
+// using the same generic primitives without duplicating the OOXML
+// schema knowledge across reader / writer / clone.
 
 // ── Legend ────────────────────────────────────────────────────────
 
@@ -886,7 +936,7 @@ export function parseChart(xml: string): Chart | undefined {
  * {@link parseLegendFillColor} — same `<c:spPr><a:solidFill>
  * <a:srgbClr>` chain on a different host element.
  */
-function parseChartSpaceFillColor(chartSpace: XmlElement): string | undefined {
+function parseChartSpaceFillColor(chartSpace: XmlElement): ChartColor | undefined {
   return parseSpPrFill(chartSpace)
 }
 
@@ -923,9 +973,27 @@ function parseChartSpaceFillColor(chartSpace: XmlElement): string | undefined {
  * same `<c:spPr><a:ln><a:solidFill><a:srgbClr>` chain on a different
  * host element.
  */
-function parseChartSpaceBorderColor(chartSpace: XmlElement): string | undefined {
+function parseChartSpaceBorderColor(chartSpace: XmlElement): ChartColor | undefined {
   return parseSpPrBorderColor(chartSpace)
 }
+
+// `readLayoutCoordinate` and the `<c:layout><c:manualLayout>` walk now
+// live in `./chart/layout.ts`. Imported at the top of this module so
+// every per-host `parseXxxLayout` wrapper shares one accept-or-drop
+// grammar.
+
+// ── Title Italic ─────────────────────────────────────────────────────
+
+// ── Title Color ─────────────────────────────────────────────────────
+
+// `normalizeRgbHex` now lives in `./chart/shape.ts` and is imported at
+// the top of this module so every host-specific helper (title, axis
+// title, legend, plot area, chart space, data labels, data table)
+// shares the same accept-or-drop hex grammar.
+
+// ── Title Strike ────────────────────────────────────────────────────
+
+// ── Title Underline ─────────────────────────────────────────────────
 
 // ── Title Font Family ───────────────────────────────────────────────
 

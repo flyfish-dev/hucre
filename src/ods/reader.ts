@@ -17,6 +17,7 @@ import { ParseError, ZipError } from "../errors"
 import { assertNotEncrypted, readInputToUint8Array } from "../_input"
 import { ZipReader } from "../zip/reader"
 import { parseXml } from "../xml/parser"
+import { MAX_COL_INDEX, MAX_ROW_INDEX } from "../limits"
 import type { XmlElement } from "../xml/parser"
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -243,29 +244,41 @@ function odsStyleToCellStyle(def: OdsStyleDef): CellStyle {
 
 // ── Hyperlink Parsing ───────────────────────────────────────────────
 
-/** Extract text and hyperlink from a cell's children */
-function extractTextAndHyperlink(cell: XmlElement): { text: string; hyperlink?: Hyperlink } {
-  const textP = findChild(cell, "p")
-  if (!textP) return { text: "" }
-
-  // Look for <text:a> elements inside <text:p>
-  for (const child of textP.children) {
+/** Find the first <text:a> hyperlink anywhere under an element. */
+function findHyperlink(el: XmlElement): { href: string; display: string } | undefined {
+  for (const child of el.children) {
     if (typeof child === "string") continue
     const local = child.local || child.tag
     if (local === "a") {
       const href = child.attrs["xlink:href"]
-      const text = child.children.filter((c: unknown) => typeof c === "string").join("")
-      if (href) {
-        return {
-          text,
-          hyperlink: { target: href, display: text },
-        }
-      }
+      if (href) return { href, display: collectText(child) }
+    }
+    const nested = findHyperlink(child)
+    if (nested) return nested
+  }
+  return undefined
+}
+
+/** Extract text and hyperlink from a cell's children */
+function extractTextAndHyperlink(cell: XmlElement): { text: string; hyperlink?: Hyperlink } {
+  // A cell may hold multiple <text:p> paragraphs (ODF joins them with a
+  // newline). Collect the full text of every paragraph — including any text
+  // surrounding a hyperlink — rather than only the first paragraph or only
+  // the anchor text.
+  const paragraphs = findChildren(cell, "p")
+  if (paragraphs.length === 0) return { text: "" }
+
+  const text = paragraphs.map((p) => collectText(p)).join("\n")
+
+  // Surface the first hyperlink found in the cell, if any, without dropping
+  // the surrounding text.
+  for (const p of paragraphs) {
+    const link = findHyperlink(p)
+    if (link) {
+      return { text, hyperlink: { target: link.href, display: link.display } }
     }
   }
 
-  // No hyperlink — collect all text content (including from nested elements)
-  const text = collectText(textP)
   return { text }
 }
 
@@ -498,7 +511,11 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
       let col = 0
 
       for (const entry of cellEntries) {
-        for (let r = 0; r < entry.repeat; r++) {
+        // Clamp column repeats too: a non-trailing cell with a huge
+        // number-columns-repeated would otherwise allocate past Excel's
+        // column limit. (Trailing empty repeats are already trimmed above.)
+        const repeat = Math.min(entry.repeat, MAX_COL_INDEX + 1)
+        for (let r = 0; r < repeat; r++) {
           rowData.push(entry.value)
 
           // Collect merge ranges
@@ -556,8 +573,11 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
       }
 
       // Cap row repeats for empty rows to avoid memory issues
-      // (LibreOffice may emit large row repeats for trailing empty rows)
-      const effectiveRowRepeat = rowData.length > 0 ? rowRepeat : 0
+      // (LibreOffice may emit large row repeats for trailing empty rows).
+      // For non-empty rows, a hostile file can set a huge number-rows-repeated
+      // on a one-cell row to force millions of allocations — clamp to Excel's
+      // row limit.
+      const effectiveRowRepeat = rowData.length > 0 ? Math.min(rowRepeat, MAX_ROW_INDEX + 1) : 0
 
       for (let r = 0; r < effectiveRowRepeat; r++) {
         rows.push(effectiveRowRepeat === 1 && r === 0 ? rowData : [...rowData])
