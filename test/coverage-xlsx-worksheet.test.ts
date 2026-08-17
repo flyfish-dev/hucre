@@ -136,11 +136,11 @@ describe("row definitions", () => {
     })
   })
 
-  it("ignores ht when customHeight is not set", () => {
-    // Excel writes the computed height on every row; only `customHeight`
-    // marks it as user-chosen and worth round-tripping.
+  it("preserves ht when customHeight is not set", () => {
+    // `customHeight` is optional and does not invalidate the effective `ht`.
+    // Excel-generated files commonly omit the flag on copied/formatted rows.
     const s = data(`<row r="1" ht="15"><c r="A1"><v>1</v></c></row>`)
-    expect(s.rowDefs).toBeUndefined()
+    expect(s.rowDefs!.get(0)).toEqual({ height: 15 })
   })
 
   it("ignores outlineLevel 0", () => {

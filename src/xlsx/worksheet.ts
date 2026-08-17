@@ -521,11 +521,12 @@ function worksheetParser(
             // lacking an `r` attribute get sequential columns within this row.
             currentRowNum = Number(attrs["r"]) || currentRowNum + 1
             implicitCol = 0
-            // Parse row-level attributes: ht, customHeight, hidden
-            if (
-              attrs["ht"] &&
-              (attrs["customHeight"] === "1" || attrs["customHeight"] === "true")
-            ) {
+            // `ht` is the effective row height regardless of whether the
+            // producer also emits `customHeight`. Real Excel workbooks often
+            // carry calculated or copied heights without that optional flag;
+            // dropping them collapses multi-line headers back to the sheet
+            // default and clips their text.
+            if (attrs["ht"]) {
               const rowNum = Number(attrs["r"]) - 1 // 0-based
               const height = Number(attrs["ht"])
               if (!Number.isNaN(rowNum) && !Number.isNaN(height)) {
