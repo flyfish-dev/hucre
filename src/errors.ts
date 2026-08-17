@@ -88,6 +88,9 @@ export class UnsupportedFormatError extends HucreError {
   }
 }
 
+/** Spreadsheet format hint carried by encrypted-workbook errors. */
+export type WorkbookFormat = "xls" | "xlsx" | "xlsb" | "ods"
+
 export class EncryptedFileError extends HucreError {
   override name = "EncryptedFileError"
 
@@ -98,9 +101,9 @@ export class EncryptedFileError extends HucreError {
    * that constructed `new EncryptedFileError()` without a hint still
    * see `undefined` here.
    */
-  readonly format?: "xlsx" | "ods"
+  readonly format?: WorkbookFormat
 
-  constructor(format?: "xlsx" | "ods", message?: string) {
+  constructor(format?: WorkbookFormat, message?: string) {
     super(
       message ??
         (format

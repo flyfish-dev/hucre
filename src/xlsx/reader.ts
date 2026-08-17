@@ -24,7 +24,13 @@ import type {
 import { decodePart, isPartTooLargeToDecode, MAX_STRING_LENGTH } from "../_decode"
 import { parsePersons, parseThreadedComments } from "./threaded-comments-reader"
 import { parseExternalLink } from "./external-link-reader"
-import { assembleCellImages, parseCellImages, REL_CELL_IMAGES } from "./cell-images-reader"
+import {
+  assembleCellImages,
+  parseCellImages,
+  parseDispImageId,
+  REL_CELL_IMAGES,
+} from "./cell-images-reader"
+import { parseExcelRichValueImages } from "./rich-value-images-reader"
 import { attachPivotCacheFields, parsePivotCacheDefinition, parsePivotTable } from "./pivot-reader"
 import { parseSlicers, parseSlicerCache, parseTimelines, parseTimelineCache } from "./slicer-reader"
 import { parseChart } from "./chart-reader"
@@ -380,13 +386,71 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   // matter are the dynamic-array (XLDAPR) ones. Resolved once for the
   // whole package because the part is workbook-level.
   let dynamicArrayCm: Set<number> | undefined
+  let metadataXml: string | undefined
   const metadataRel = workbookRels.find((r) => matchesRelType(r.type, "sheetMetadata"))
   if (metadataRel) {
     const metadataPath = resolvePath(workbookDir, metadataRel.target)
     if (zip.has(metadataPath)) {
-      dynamicArrayCm = parseDynamicArrayCellMetadata(
-        decodeUtf8(await zip.extract(metadataPath), metadataPath),
-      )
+      metadataXml = decodeUtf8(await zip.extract(metadataPath), metadataPath)
+      dynamicArrayCm = parseDynamicArrayCellMetadata(metadataXml)
+    }
+  }
+
+  // 7j. Parse Excel 365 "Place in Cell" pictures. Unlike WPS DISPIMG,
+  // Office stores the image identity in value metadata (`c/@vm`) and
+  // routes it through xl/richData before reaching a normal media part.
+  // Keep the two mechanisms additive: a workbook can legally carry both.
+  let richValueImageIdByVm: Map<number, string> | undefined
+  if (metadataXml) {
+    const structuresRel = workbookRels.find((r) => matchesRelType(r.type, "rdRichValueStructure"))
+    const valuesRel = workbookRels.find((r) => matchesRelType(r.type, "rdRichValue"))
+    const richValueRel = workbookRels.find((r) => matchesRelType(r.type, "richValueRel"))
+    if (structuresRel && valuesRel && richValueRel) {
+      const structuresPath = resolvePath(workbookDir, structuresRel.target)
+      const valuesPath = resolvePath(workbookDir, valuesRel.target)
+      const richValueRelPath = resolvePath(workbookDir, richValueRel.target)
+      if (zip.has(structuresPath) && zip.has(valuesPath) && zip.has(richValueRelPath)) {
+        const parsed = parseExcelRichValueImages(
+          metadataXml,
+          decodeUtf8(await zip.extract(structuresPath), structuresPath),
+          decodeUtf8(await zip.extract(valuesPath), valuesPath),
+          decodeUtf8(await zip.extract(richValueRelPath), richValueRelPath),
+        )
+
+        const relsPath = relsPathFor(richValueRelPath)
+        const richDataDir = dirname(richValueRelPath)
+        const mediaByRId = new Map<string, { data: Uint8Array; type: SheetImage["type"] }>()
+        if (zip.has(relsPath)) {
+          const relationships = parseRelationships(
+            decodeUtf8(await zip.extract(relsPath), relsPath),
+          )
+          for (const rel of relationships) {
+            if (!matchesRelType(rel.type, "image")) continue
+            const mediaPath = resolvePath(richDataDir, rel.target)
+            if (!zip.has(mediaPath)) continue
+            const ext = mediaPath.split(".").pop()?.toLowerCase() ?? ""
+            const type = EXT_TO_IMAGE_TYPE[ext]
+            if (!type) continue
+            mediaByRId.set(rel.id, { data: await zip.extract(mediaPath), type })
+          }
+        }
+
+        const loaded: CellImage[] = []
+        const loadedIds = new Set<string>()
+        for (const ref of parsed.refs) {
+          const media = mediaByRId.get(ref.embedRId)
+          if (!media) continue
+          loaded.push({ id: ref.id, data: media.data, type: media.type })
+          loadedIds.add(ref.id)
+        }
+        if (loaded.length > 0) cellImages = [...(cellImages ?? []), ...loaded]
+
+        const resolvedVm = new Map<number, string>()
+        for (const [vm, id] of parsed.imageIdByVm) {
+          if (loadedIds.has(id)) resolvedVm.set(vm, id)
+        }
+        if (resolvedVm.size > 0) richValueImageIdByVm = resolvedVm
+      }
     }
   }
 
@@ -458,11 +522,20 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
       maxTotalCells: options?.maxTotalCells,
       sparse: options?.sparse,
       dynamicArrayCm,
+      richValueImageIdByVm,
       sheetName: info.name,
       onWarning: options?.onWarning,
     }
 
     const sheet = await readWorksheet(zip, wsPath, info.name, worksheetCtx)
+    if (cellImages?.length && sheet.cells) {
+      const knownImageIds = new Set(cellImages.map((image) => image.id))
+      for (const cell of sheet.cells.values()) {
+        if (cell.imageId) continue
+        const imageId = parseDispImageId(cell.formula)
+        if (imageId && knownImageIds.has(imageId)) cell.imageId = imageId
+      }
+    }
     if (info.state === "hidden") sheet.hidden = true
     if (info.state === "veryHidden") sheet.veryHidden = true
 
@@ -1020,10 +1093,8 @@ function parseTwoCellAnchor(
   altText?: string
   title?: string
 } | null {
-  let fromRow = 0
-  let fromCol = 0
-  let toRow = 0
-  let toCol = 0
+  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
+  let to: NonNullable<SheetImage["anchor"]["to"]> = { row: 0, col: 0 }
   let embedId: string | undefined
   let altText: string | undefined
   let title: string | undefined
@@ -1040,19 +1111,26 @@ function parseTwoCellAnchor(
     const local = c.local || c.tag
 
     if (local === "from") {
-      const pos = parseAnchorPosition(c)
-      fromRow = pos.row
-      fromCol = pos.col
+      from = parseAnchorPosition(c)
     } else if (local === "to") {
-      const pos = parseAnchorPosition(c)
-      toRow = pos.row
-      toCol = pos.col
+      to = parseAnchorPosition(c)
     } else if (local === "pic") {
       embedId = findBlipEmbed(c)
       const meta = findCNvPrMeta(c, "nvPicPr")
       altText = meta.altText
       title = meta.title
       size = findShapeExtent(c)
+    }
+  }
+
+  if (!embedId) {
+    const fallbackPic = findDescendantEl(el, "pic")
+    if (fallbackPic) {
+      embedId = findBlipEmbed(fallbackPic)
+      const meta = findCNvPrMeta(fallbackPic, "nvPicPr")
+      altText = meta.altText
+      title = meta.title
+      size = findShapeExtent(fallbackPic)
     }
   }
 
@@ -1077,8 +1155,8 @@ function parseTwoCellAnchor(
     mediaPath,
     type: imageType,
     anchor: {
-      from: { row: fromRow, col: fromCol },
-      to: { row: toRow, col: toCol },
+      from,
+      to,
     },
   }
   if (size) {
@@ -1119,10 +1197,8 @@ function findShapeExtent(shapeEl: {
 
 /** Parse a twoCellAnchor element that contains a textbox shape (sp with txBox="1") */
 function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextBox | null {
-  let fromRow = 0
-  let fromCol = 0
-  let toRow = 0
-  let toCol = 0
+  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
+  let to: NonNullable<SheetTextBox["anchor"]["to"]> = { row: 0, col: 0 }
   let spElement: any = null
 
   for (const child of el.children) {
@@ -1136,13 +1212,9 @@ function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextB
     const local = c.local || c.tag
 
     if (local === "from") {
-      const pos = parseAnchorPosition(c)
-      fromRow = pos.row
-      fromCol = pos.col
+      from = parseAnchorPosition(c)
     } else if (local === "to") {
-      const pos = parseAnchorPosition(c)
-      toRow = pos.row
-      toCol = pos.col
+      to = parseAnchorPosition(c)
     } else if (local === "sp") {
       // Check if this is a textbox shape
       const nvSpPr = findChildEl(c, "nvSpPr")
@@ -1211,8 +1283,8 @@ function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextB
   const tb: SheetTextBox = {
     text,
     anchor: {
-      from: { row: fromRow, col: fromCol },
-      to: { row: toRow, col: toCol },
+      from,
+      to,
     },
   }
 
@@ -1269,6 +1341,26 @@ function findChildEl(
     }
     const local = c.local || c.tag
     if (local === localName) return c
+  }
+  return null
+}
+
+/** Find the first descendant with a local name, including mc:Fallback. */
+function findDescendantEl(
+  el: { children: Array<unknown> },
+  localName: string,
+): { local?: string; tag: string; children: Array<unknown>; attrs: Record<string, string> } | null {
+  for (const child of el.children) {
+    if (typeof child === "string") continue
+    const candidate = child as {
+      local?: string
+      tag: string
+      children: Array<unknown>
+      attrs: Record<string, string>
+    }
+    if ((candidate.local || candidate.tag) === localName) return candidate
+    const nested = findDescendantEl(candidate, localName)
+    if (nested) return nested
   }
   return null
 }
@@ -1340,8 +1432,7 @@ function parseOneCellAnchor(
   altText?: string
   title?: string
 } | null {
-  let fromRow = 0
-  let fromCol = 0
+  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
   let widthEmu = 0
   let heightEmu = 0
   let embedId: string | undefined
@@ -1359,9 +1450,7 @@ function parseOneCellAnchor(
     const local = c.local || c.tag
 
     if (local === "from") {
-      const pos = parseAnchorPosition(c)
-      fromRow = pos.row
-      fromCol = pos.col
+      from = parseAnchorPosition(c)
     } else if (local === "ext") {
       // <xdr:ext cx="..." cy="..."/>
       widthEmu = Number(c.attrs["cx"]) || 0
@@ -1369,6 +1458,16 @@ function parseOneCellAnchor(
     } else if (local === "pic") {
       embedId = findBlipEmbed(c)
       const meta = findCNvPrMeta(c, "nvPicPr")
+      altText = meta.altText
+      title = meta.title
+    }
+  }
+
+  if (!embedId) {
+    const fallbackPic = findDescendantEl(el, "pic")
+    if (fallbackPic) {
+      embedId = findBlipEmbed(fallbackPic)
+      const meta = findCNvPrMeta(fallbackPic, "nvPicPr")
       altText = meta.altText
       title = meta.title
     }
@@ -1394,7 +1493,7 @@ function parseOneCellAnchor(
     mediaPath,
     type: imageType,
     anchor: {
-      from: { row: fromRow, col: fromCol },
+      from,
     },
   }
 
@@ -1432,9 +1531,16 @@ function findCNvPrMeta(
 }
 
 /** Parse row/col from an anchor position element (from or to) */
-function parseAnchorPosition(el: { children: Array<unknown> }): { row: number; col: number } {
+function parseAnchorPosition(el: { children: Array<unknown> }): {
+  row: number
+  col: number
+  rowOff?: number
+  colOff?: number
+} {
   let row = 0
   let col = 0
+  let rowOff: number | undefined
+  let colOff: number | undefined
 
   for (const child of el.children) {
     if (typeof child === "string") continue
@@ -1446,10 +1552,21 @@ function parseAnchorPosition(el: { children: Array<unknown> }): { row: number; c
       row = Number(text) || 0
     } else if (local === "col") {
       col = Number(text) || 0
+    } else if (local === "rowOff") {
+      const value = Number(text)
+      if (Number.isFinite(value) && value !== 0) rowOff = value
+    } else if (local === "colOff") {
+      const value = Number(text)
+      if (Number.isFinite(value) && value !== 0) colOff = value
     }
   }
 
-  return { row, col }
+  return {
+    row,
+    col,
+    ...(rowOff !== undefined ? { rowOff } : {}),
+    ...(colOff !== undefined ? { colOff } : {}),
+  }
 }
 
 /** Find the r:embed attribute on the blip element inside a pic element */

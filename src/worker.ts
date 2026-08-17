@@ -36,6 +36,7 @@ export interface SerializedCell {
   formulaSharedIndex?: Cell["formulaSharedIndex"]
   formulaRef?: Cell["formulaRef"]
   formulaDynamic?: Cell["formulaDynamic"]
+  imageId?: Cell["imageId"]
   richText?: Cell["richText"]
   hyperlink?: Cell["hyperlink"]
   comment?: Cell["comment"]
@@ -82,6 +83,7 @@ export interface SerializedSheet {
   splitPane?: Sheet["splitPane"]
   rowBreaks?: Sheet["rowBreaks"]
   colBreaks?: Sheet["colBreaks"]
+  sheetFormat?: Sheet["sheetFormat"]
   outlineProperties?: Sheet["outlineProperties"]
   /** As a plain array, for the same reason as {@link SerializedSheetImage.data}. */
   backgroundImage?: number[]
@@ -159,6 +161,7 @@ function serializeCell(cell: Cell): SerializedCell {
   if (cell.formulaSharedIndex !== undefined) out.formulaSharedIndex = cell.formulaSharedIndex
   if (cell.formulaRef !== undefined) out.formulaRef = cell.formulaRef
   if (cell.formulaDynamic !== undefined) out.formulaDynamic = cell.formulaDynamic
+  if (cell.imageId !== undefined) out.imageId = cell.imageId
   if (cell.richText !== undefined) out.richText = cell.richText
   if (cell.hyperlink !== undefined) out.hyperlink = cell.hyperlink
   if (cell.comment !== undefined) out.comment = cell.comment
@@ -237,6 +240,7 @@ function serializeSheet(sheet: Sheet): SerializedSheet {
   if (sheet.splitPane) out.splitPane = sheet.splitPane
   if (sheet.rowBreaks) out.rowBreaks = sheet.rowBreaks
   if (sheet.colBreaks) out.colBreaks = sheet.colBreaks
+  if (sheet.sheetFormat) out.sheetFormat = sheet.sheetFormat
   if (sheet.outlineProperties) out.outlineProperties = sheet.outlineProperties
   if (sheet.backgroundImage) out.backgroundImage = Array.from(sheet.backgroundImage)
   if (sheet.sparklines) out.sparklines = sheet.sparklines
@@ -350,6 +354,7 @@ function deserializeCell(sc: SerializedCell): Cell {
   if (sc.formulaSharedIndex !== undefined) cell.formulaSharedIndex = sc.formulaSharedIndex
   if (sc.formulaRef !== undefined) cell.formulaRef = sc.formulaRef
   if (sc.formulaDynamic !== undefined) cell.formulaDynamic = sc.formulaDynamic
+  if (sc.imageId !== undefined) cell.imageId = sc.imageId
   if (sc.richText !== undefined) cell.richText = sc.richText
   if (sc.hyperlink !== undefined) cell.hyperlink = sc.hyperlink
   if (sc.comment !== undefined) cell.comment = sc.comment
@@ -420,6 +425,7 @@ function deserializeSheet(ss: SerializedSheet): Sheet {
   if (ss.splitPane) sheet.splitPane = ss.splitPane
   if (ss.rowBreaks) sheet.rowBreaks = ss.rowBreaks
   if (ss.colBreaks) sheet.colBreaks = ss.colBreaks
+  if (ss.sheetFormat) sheet.sheetFormat = ss.sheetFormat
   if (ss.outlineProperties) sheet.outlineProperties = ss.outlineProperties
   if (ss.backgroundImage) sheet.backgroundImage = new Uint8Array(ss.backgroundImage)
   if (ss.sparklines) sheet.sparklines = ss.sparklines

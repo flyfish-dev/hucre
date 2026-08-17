@@ -62,19 +62,20 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
 
   // ── BIFF version gate ──
   // The first record is the workbook globals BOF; its first u16 is the BIFF
-  // version (0x0600 = BIFF8). BIFF5/7 store strings as codepage byte strings
-  // with a different SST/record layout — parsing them as BIFF8 yields garbage
-  // names and cell text, so reject them with a clear error instead.
+  // version (0x0600 = BIFF8, 0x0500 = BIFF5/7). The Flyfish fork keeps its
+  // legacy BIFF5/7 acceptance path for older WPS and Excel exports. Unknown
+  // versions still fail explicitly instead of being parsed as BIFF8.
   const bof = records[0]
   if (!bof || bof.id !== SID.BOF) {
     throw new ParseError("Invalid XLS: missing BOF record at start of Workbook stream")
   }
+  let biffVersion = 0x0600
   if (bof.data.length >= 2) {
-    const biffVersion = new Reader(bof.data).u16()
-    if (biffVersion !== 0x0600) {
+    biffVersion = new Reader(bof.data).u16()
+    if (biffVersion !== 0x0600 && biffVersion !== 0x0500) {
       throw new ParseError(
         `Unsupported XLS version (BIFF 0x${biffVersion.toString(16)}). ` +
-          "Only BIFF8 (Excel 97-2003) is supported; re-save the file as .xlsx or BIFF8 .xls.",
+          "Only BIFF5/7 and BIFF8 workbooks are supported; re-save the file as .xlsx.",
       )
     }
   }
@@ -171,6 +172,10 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
       ),
     )
   }
+
+  // Some minimal BIFF5/7 producers omit BOUNDSHEET for an otherwise valid,
+  // empty single-sheet workbook. Preserve the fork's established result shape.
+  if (sheets.length === 0 && biffVersion === 0x0500) sheets.push({ name: "Sheet1", rows: [] })
 
   return { sheets }
 }

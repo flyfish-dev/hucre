@@ -35,6 +35,7 @@ const FULL_CELL: Required<Cell> = {
   formulaSharedIndex: 3,
   formulaRef: "A1:A9",
   formulaDynamic: true,
+  imageId: "excel365-rich-value-0",
   richText: [{ text: "hi", font: { italic: true, color: { rgb: "FF0000" } } }],
   hyperlink: { target: "https://example.com", tooltip: "go" },
   comment: { text: "note", author: "Ada" },
@@ -53,6 +54,7 @@ const FULL_SHEET: Required<Sheet> = {
   rowDefs: new Map([[0, { height: 30, hidden: true }]]),
   defaultRowHeight: 24,
   defaultColWidth: 18,
+  sheetFormat: { defaultRowHeight: 24, defaultColWidth: 18, baseColWidth: 10, dyDescent: 0.25 },
   merges: [{ startRow: 0, startCol: 0, endRow: 0, endCol: 1 }],
   dataValidations: [{ type: "list", range: "A1:A9", values: ["x", "y"] }],
   conditionalRules: [

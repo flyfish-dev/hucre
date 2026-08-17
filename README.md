@@ -862,15 +862,23 @@ used by formulas like `[1]Sheet1!A1`. Cached `t="s"` values stay as
 shared-string indices into the _external_ workbook (which hucre cannot
 dereference); resolved strings live in the linked file.
 
-### Cell-Embedded Images (WPS DISPIMG)
+### Cell-Embedded Images (WPS and Microsoft 365)
 
-WPS Office (and recent Excel versions) embed images inside cells via a
-workbook-level `xl/cellimages.xml` registry referenced from
-`=_xlfn.DISPIMG("<id>", 1)` formulas. hucre reads the registry into a
-typed `workbook.cellImages` array and re-declares the part on
-`saveXlsx` so the DISPIMG link survives round-trips — without this the
-relationship and content-type override are dropped and the formula
-loses its target.
+hucre recognizes both incompatible in-cell picture representations:
+
+- WPS Office stores `xl/cellimages.xml` and references its registry from
+  `=_xlfn.DISPIMG("<id>", 1)` formulas.
+- Microsoft 365 "Place in Cell" pictures use worksheet value metadata
+  (`c/@vm`), `xl/metadata.xml`, and the `xl/richData/*` relationship chain.
+
+Both forms are normalized into `workbook.cellImages`; the owning cell also
+receives `cell.imageId`, so renderers do not need to inspect vendor-specific
+formulas or package relationships. Floating drawing-layer pictures remain in
+`sheet.images` with their exact row, column, and EMU offset anchors.
+
+For WPS files, `saveXlsx` re-declares the `cellimages.xml` part so the DISPIMG
+link survives round-trips — without this the relationship and content-type
+override are dropped and the formula loses its target.
 
 ```ts
 import { readXlsx } from "hucre"
@@ -879,6 +887,7 @@ const wb = await readXlsx(buf)
 for (const img of wb.cellImages ?? []) {
   console.log(img.id, img.type, img.description, img.data.byteLength)
 }
+console.log(wb.sheets[0].cells?.get("1,1")?.imageId)
 
 // Standalone parsers when you already have the XML strings.
 import { parseCellImages, assembleCellImages, REL_CELL_IMAGES } from "hucre"

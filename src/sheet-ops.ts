@@ -899,6 +899,7 @@ function cloneCell(cell: Cell): Cell {
   if (cell.formulaSharedIndex !== undefined) result.formulaSharedIndex = cell.formulaSharedIndex
   if (cell.formulaRef !== undefined) result.formulaRef = cell.formulaRef
   if (cell.formulaDynamic !== undefined) result.formulaDynamic = cell.formulaDynamic
+  if (cell.imageId !== undefined) result.imageId = cell.imageId
   if (cell.richText)
     result.richText = cell.richText.map((r) => ({
       text: r.text,
@@ -1085,6 +1086,7 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
   if (sheet.rowBreaks) cloned.rowBreaks = [...sheet.rowBreaks]
   if (sheet.colBreaks) cloned.colBreaks = [...sheet.colBreaks]
   if (sheet.outlineProperties) cloned.outlineProperties = { ...sheet.outlineProperties }
+  if (sheet.sheetFormat) cloned.sheetFormat = { ...sheet.sheetFormat }
   if (sheet.backgroundImage) cloned.backgroundImage = sheet.backgroundImage.slice()
   if (sheet.sparklines) cloned.sparklines = structuredClone(sheet.sparklines)
   if (sheet.textBoxes) cloned.textBoxes = structuredClone(sheet.textBoxes)

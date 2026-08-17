@@ -394,14 +394,14 @@ The same holds for a conditional rule's `style`, which is the workbook's
 These are parsed into the model and preserved through `openXlsx` →
 `saveXlsx`, but there is no way to create one from scratch:
 
-|                                         | model field                                                                 |
-| --------------------------------------- | --------------------------------------------------------------------------- |
-| Slicers and their caches                | `Sheet.slicers`, `Workbook.slicerCaches`                                    |
-| Timeline filters and their caches       | `Sheet.timelines`, `Workbook.timelineCaches`                                |
-| Threaded comments and their person list | `Sheet.threadedComments`, `Workbook.persons`                                |
-| External workbook links                 | `Workbook.externalLinks`                                                    |
-| WPS DISPIMG cell images                 | `Workbook.cellImages`                                                       |
-| Theme colours from the file             | `Workbook.themeColors` — `writeXlsx` always emits the standard Office theme |
+|                                                | model field                                                                 |
+| ---------------------------------------------- | --------------------------------------------------------------------------- |
+| Slicers and their caches                       | `Sheet.slicers`, `Workbook.slicerCaches`                                    |
+| Timeline filters and their caches              | `Sheet.timelines`, `Workbook.timelineCaches`                                |
+| Threaded comments and their person list        | `Sheet.threadedComments`, `Workbook.persons`                                |
+| External workbook links                        | `Workbook.externalLinks`                                                    |
+| WPS DISPIMG and Microsoft 365 in-cell pictures | `Workbook.cellImages`, `Cell.imageId`                                       |
+| Theme colours from the file                    | `Workbook.themeColors` — `writeXlsx` always emits the standard Office theme |
 
 `WriteSheet` has no fields for these, deliberately: a typed field that is
 silently discarded is worse than no field at all, which is why

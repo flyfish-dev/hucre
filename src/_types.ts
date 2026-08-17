@@ -229,6 +229,13 @@ export interface Cell {
    * explicit `"array"` formula does.
    */
   formulaDynamic?: boolean
+  /**
+   * Workbook-level image id when the cell contains a native in-cell
+   * picture. Excel 365 stores this through `vm` / XLRICHVALUE metadata;
+   * WPS commonly stores the equivalent id in a `DISPIMG` formula.
+   * Resolve it against {@link Workbook.cellImages}.
+   */
+  imageId?: string
   richText?: RichTextRun[]
   hyperlink?: Hyperlink
   comment?: CellComment
@@ -1067,20 +1074,21 @@ export interface ExternalLink {
   definedNames?: ExternalDefinedName[]
 }
 
-// ── Cell-Embedded Images (WPS DISPIMG / cellimages) ───────────────
+// ── Cell-Embedded Images (WPS DISPIMG / Excel 365 rich values) ────
 
 /**
- * An image embedded inside a cell via the WPS Office cellimages mechanism
- * (also recognized by recent Excel versions). The image is referenced from
- * a cell formula `=_xlfn.DISPIMG("<id>", 1)` and the binary lives in the
- * package as a regular media part. Unlike `SheetImage` (which is anchored
- * to a drawing rectangle on a sheet), a `CellImage` is workbook-wide and
- * can be referenced from any number of cells.
+ * An image embedded inside a cell. WPS references entries from a
+ * `=_xlfn.DISPIMG("<id>", 1)` formula and `xl/cellimages.xml`; Excel 365
+ * uses `Cell.imageId` resolved through `vm` / XLRICHVALUE metadata and
+ * `xl/richData/*`. The binary lives in the package as a regular media
+ * part. Unlike `SheetImage` (which is anchored to a drawing rectangle on
+ * a sheet), a `CellImage` is workbook-wide and can be referenced from any
+ * number of cells.
  */
 export interface CellImage {
   /**
-   * Stable image identifier as it appears inside the DISPIMG formula
-   * (`name` attribute on `xdr:cNvPr`). For example `"ID_2A8C..."`.
+   * Stable image identifier. For WPS this is the DISPIMG name; for Excel
+   * 365 it is a hucre id derived from the rich-value record index.
    */
   id: string
   /** Image binary, extracted from the package media folder. */
@@ -1452,11 +1460,11 @@ export interface Workbook {
    */
   externalLinks?: ExternalLink[]
   /**
-   * Cell-embedded images (WPS DISPIMG mechanism).
+   * Cell-embedded images (WPS DISPIMG and Excel 365 XLRICHVALUE).
    *
-   * Resolved from `xl/cellimages.xml`. Cells reference these images via
-   * `=_xlfn.DISPIMG("<id>", 1)` formulas — match `CellImage.id` against
-   * the first argument to look up the binary.
+   * WPS images are resolved from `xl/cellimages.xml`; Excel 365 images
+   * come from `xl/richData/*`. Match `Cell.imageId`, or the first DISPIMG
+   * argument on older WPS cells, against `CellImage.id`.
    */
   cellImages?: CellImage[]
   /**

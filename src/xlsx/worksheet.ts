@@ -131,6 +131,11 @@ export interface WorksheetContext {
    * metadata part — see {@link isDynamicArrayCm}.
    */
   dynamicArrayCm?: Set<number>
+  /**
+   * One-based `vm` indexes from Excel 365 value metadata mapped to
+   * workbook-level in-cell picture ids.
+   */
+  richValueImageIdByVm?: ReadonlyMap<number, string>
 }
 
 /**
@@ -329,6 +334,7 @@ function worksheetParser(
 
   // Row definitions (height, hidden, outlineLevel, collapsed)
   const rowDefs = new Map<number, import("../_types").RowDef>()
+  let sheetFormat: import("../_types").SheetFormat | undefined
 
   // Column definitions (width, hidden, outlineLevel, collapsed) parsed from <col> elements
   const columnDefs: import("../_types").ColumnDef[] = []
@@ -396,6 +402,7 @@ function worksheetParser(
   let cellFormulaSi = -1 // shared formula index
   let cellFormulaRef = "" // formula ref range
   let cellFormulaCm = false // dynamic array flag
+  let cellImageId: string | undefined
   let inlineText = ""
 
   // Inline rich text state
@@ -463,8 +470,27 @@ function worksheetParser(
           }
           break
         case "sheetFormatPr": {
+          const parsed: import("../_types").SheetFormat = {}
           const dh = attrs["defaultRowHeight"]
           const dw = attrs["defaultColWidth"]
+          const numericAttributes: Array<[string, keyof import("../_types").SheetFormat]> = [
+            ["defaultRowHeight", "defaultRowHeight"],
+            ["defaultColWidth", "defaultColWidth"],
+            ["baseColWidth", "baseColWidth"],
+            ["outlineLevelRow", "outlineLevelRow"],
+            ["outlineLevelCol", "outlineLevelCol"],
+            ["x14ac:dyDescent", "dyDescent"],
+            ["dyDescent", "dyDescent"],
+          ]
+          for (const [attribute, key] of numericAttributes) {
+            if (parsed[key] !== undefined || attrs[attribute] === undefined) continue
+            const value = Number(attrs[attribute])
+            if (Number.isFinite(value)) (parsed as Record<string, number>)[key] = value
+          }
+          if (attrs["zeroHeight"] === "1" || attrs["zeroHeight"] === "true") {
+            parsed.zeroHeight = true
+          }
+          if (Object.keys(parsed).length > 0) sheetFormat = parsed
           // Excel writes 15 whether or not the sheet means anything by it,
           // so only a value that differs is a statement worth surfacing —
           // otherwise every sheet would come back carrying a default it
@@ -552,6 +578,9 @@ function worksheetParser(
             // which round-tripped with itself and with nothing else
             // (#423).
             cellFormulaCm = isDynamicArrayCm(attrs["cm"], ctx)
+            const vm = Number(attrs["vm"])
+            cellImageId =
+              Number.isInteger(vm) && vm > 0 ? ctx.richValueImageIdByVm?.get(vm) : undefined
             inlineText = ""
             inlineRichText = []
           }
@@ -1011,6 +1040,7 @@ function worksheetParser(
               inlineText !== "" ||
               inlineRichText.length > 0 ||
               cellFormulaText !== "" ||
+              cellImageId !== undefined ||
               cellType === "e" ||
               // An empty *inline* string is still a string. The producer
               // wrote `t="inlineStr"` and an `<is>` to say so, which is
@@ -1044,6 +1074,7 @@ function worksheetParser(
                 cellFormulaSi,
                 cellFormulaRef,
                 cellFormulaCm,
+                cellImageId,
                 effRow,
                 effCol,
               )
@@ -1370,6 +1401,7 @@ function worksheetParser(
     // Attach column definitions (width, hidden, outlineLevel, collapsed)
     if (defaultRowHeight !== undefined) sheet.defaultRowHeight = defaultRowHeight
     if (defaultColWidth !== undefined) sheet.defaultColWidth = defaultColWidth
+    if (sheetFormat) sheet.sheetFormat = sheetFormat
 
     if (columnDefs.some((c) => Object.keys(c).length > 0)) {
       sheet.columns = columnDefs
@@ -1787,6 +1819,7 @@ function processCell(
   formulaSi?: number,
   formulaRef?: string,
   formulaCm?: boolean,
+  imageId?: string,
   fallbackRow?: number,
   fallbackCol?: number,
 ): void {
@@ -2020,6 +2053,7 @@ function processCell(
     richText !== undefined ||
     (ctx.readStyles && ctx.styles && styleIndex >= 0) ||
     isCheckbox ||
+    imageId !== undefined ||
     cellType === "error" ||
     cellType === "formula" ||
     cellType === "richText"
@@ -2031,6 +2065,9 @@ function processCell(
     }
     if (isCheckbox) {
       cell.checkbox = true
+    }
+    if (imageId !== undefined) {
+      cell.imageId = imageId
     }
     if (formula !== undefined) {
       cell.formula = formula

@@ -272,6 +272,11 @@ const SHEET_FIELDS: { [K in keyof Required<WriteSheet>]: Entry<WriteSheet[K]> } 
 
   colBreaks: { value: [1], read: (sheet) => sheet.colBreaks },
 
+  sheetFormat: {
+    value: { defaultRowHeight: 22, defaultColWidth: 16, baseColWidth: 9, dyDescent: 0.25 },
+    read: (sheet) => sheet.sheetFormat,
+  },
+
   rowDefs: {
     value: new Map([[1, { height: 30, hidden: false, outlineLevel: 1 }]]),
     read: (sheet) => ({

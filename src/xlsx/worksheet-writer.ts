@@ -80,6 +80,7 @@ export interface WorksheetResult {
 
 const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+const NS_X14AC = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
 
 // ── Column Letter Conversion ───────────────────────────────────────
 
@@ -429,10 +430,26 @@ export function writeWorksheetXml(
   // hard-coded, which meant a file whose default was 24 lost it on the way
   // through. See #439 §X.
   const formatPrAttrs: Record<string, string | number> = {
-    defaultRowHeight: sheet.defaultRowHeight ?? 15,
+    defaultRowHeight: sheet.defaultRowHeight ?? sheet.sheetFormat?.defaultRowHeight ?? 15,
   }
-  if (sheet.defaultRowHeight !== undefined) formatPrAttrs["customHeight"] = 1
-  if (sheet.defaultColWidth !== undefined) formatPrAttrs["defaultColWidth"] = sheet.defaultColWidth
+  if (sheet.defaultRowHeight !== undefined || sheet.sheetFormat?.defaultRowHeight !== undefined) {
+    formatPrAttrs["customHeight"] = 1
+  }
+  const defaultColWidth = sheet.defaultColWidth ?? sheet.sheetFormat?.defaultColWidth
+  if (defaultColWidth !== undefined) formatPrAttrs["defaultColWidth"] = defaultColWidth
+  if (sheet.sheetFormat?.baseColWidth !== undefined) {
+    formatPrAttrs["baseColWidth"] = sheet.sheetFormat.baseColWidth
+  }
+  if (sheet.sheetFormat?.zeroHeight) formatPrAttrs["zeroHeight"] = 1
+  if (sheet.sheetFormat?.outlineLevelRow !== undefined) {
+    formatPrAttrs["outlineLevelRow"] = sheet.sheetFormat.outlineLevelRow
+  }
+  if (sheet.sheetFormat?.outlineLevelCol !== undefined) {
+    formatPrAttrs["outlineLevelCol"] = sheet.sheetFormat.outlineLevelCol
+  }
+  if (sheet.sheetFormat?.dyDescent !== undefined) {
+    formatPrAttrs["x14ac:dyDescent"] = sheet.sheetFormat.dyDescent
+  }
   parts.push(xmlSelfClose("sheetFormatPr", formatPrAttrs))
 
   // ── Columns ──
@@ -755,7 +772,9 @@ export function writeWorksheetXml(
     }
   }
 
-  const xml = xmlDocument("worksheet", { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }, parts)
+  const worksheetAttrs: Record<string, string> = { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }
+  if (sheet.sheetFormat?.dyDescent !== undefined) worksheetAttrs["xmlns:x14ac"] = NS_X14AC
+  const xml = xmlDocument("worksheet", worksheetAttrs, parts)
 
   return {
     xml,

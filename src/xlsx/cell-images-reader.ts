@@ -34,6 +34,14 @@ export interface ParsedCellImageRef {
   description?: string
 }
 
+/** Extract the workbook image id from a WPS/Excel DISPIMG formula. */
+export function parseDispImageId(formula: string | undefined): string | undefined {
+  if (!formula) return undefined
+  const normalized = formula.trim().replace(/^=/, "")
+  const match = normalized.match(/^(?:_xlfn\.)?DISPIMG\s*\(\s*"((?:[^"]|"")+)"/i)
+  return match?.[1]?.replace(/""/g, '"')
+}
+
 /**
  * Parse `xl/cellimages.xml` into a list of references. The caller is
  * responsible for resolving each `embedRId` against

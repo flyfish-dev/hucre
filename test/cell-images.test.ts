@@ -271,6 +271,7 @@ describe("readXlsx — cellimages integration", () => {
     expect(second?.type).toBe("jpeg")
     expect(second?.description).toBeUndefined()
     expect(second?.data[0]).toBe(0xff) // JPEG SOI
+    expect(wb.sheets[0]?.cells?.get("0,0")?.imageId).toBe("ID_FIRST")
   })
 
   it("omits workbook.cellImages when the part is absent", async () => {
