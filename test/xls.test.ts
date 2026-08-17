@@ -63,7 +63,7 @@ function sstRecord(strings: string[]): number[] {
   return record(SID.SST, body)
 }
 
-function buildXls(): Uint8Array {
+function buildXls(opts: { dateFmtId?: number } = {}): Uint8Array {
   const strings = ["Name", "Score", "Ada"]
 
   const sheet = concat([
@@ -96,7 +96,13 @@ function buildXls(): Uint8Array {
       bof(0x0005),
       record(SID.DATEMODE, u16(0)),
       record(SID.XF, [...u16(0), ...u16(0), ...Array.from({ length: 16 }, () => 0)]), // general
-      record(SID.XF, [...u16(0), ...u16(14), ...Array.from({ length: 16 }, () => 0)]), // date (builtin 14)
+      // The date xf's built-in format id is a parameter: the built-in date
+      // set is wider than the familiar 14-22 block. See the CJK case below.
+      record(SID.XF, [
+        ...u16(0),
+        ...u16(opts.dateFmtId ?? 14),
+        ...Array.from({ length: 16 }, () => 0),
+      ]),
       sstRecord(strings),
       record(SID.BOUNDSHEET, [...u32(sheetPos), 0, 0, ...shortStr("Sheet1")]),
       eof(),
@@ -115,7 +121,10 @@ describe("XLS (BIFF8) reader", () => {
     expect(wb.sheets.length).toBe(1)
     expect(wb.sheets[0].name).toBe("Sheet1")
     const rows = wb.sheets[0].rows
-    expect(rows[0]).toEqual(["Name", "Score"])
+    // Padded to the sheet width, not to this row's own last cell:
+    // `rows` is a dense rectangle, which these readers used to leave
+    // ragged while readXlsx did not. See #494.
+    expect(rows[0]).toEqual(["Name", "Score", null, null])
     expect(rows[1][0]).toBe("Ada")
     expect(rows[1][1]).toBe(95)
     expect(rows[1][2]).toBeCloseTo(3.14, 5)
@@ -126,6 +135,31 @@ describe("XLS (BIFF8) reader", () => {
     expect(rows[3][0]).toBe(10)
     expect(rows[3][1]).toBe(20)
     expect(wb.sheets[0].merges).toEqual([{ startRow: 0, endRow: 0, startCol: 0, endCol: 1 }])
+  })
+
+  // ── #439: the built-in date set is wider than 14-22 / 45-47 ──────────
+  // Built-ins 27-36 (CJK) and 50-58 (Thai/Chinese/Korean) are date and
+  // time formats, and they carry no FORMAT record — so a reader that does
+  // not know them falls through to "not a date" and hands back the raw
+  // serial. This reader used to keep a 12-entry table of its own.
+  describe("built-in date format ids outside the familiar block", () => {
+    const CJK_AND_EXTENDED = [
+      27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+    ]
+
+    for (const id of CJK_AND_EXTENDED) {
+      it(`reads a cell styled with built-in format ${id} as a Date`, async () => {
+        const wb = await readXls(buildXls({ dateFmtId: id }))
+
+        expect(wb.sheets[0].rows[1][3]).toBeInstanceOf(Date)
+      })
+    }
+
+    it("still treats a non-date built-in as a number", async () => {
+      const wb = await readXls(buildXls({ dateFmtId: 3 }))
+
+      expect(wb.sheets[0].rows[1][3]).toBe(45000)
+    })
   })
 
   it("is auto-detected by read()", async () => {

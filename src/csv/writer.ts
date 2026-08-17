@@ -1,4 +1,7 @@
 import type { CellValue, CsvWriteOptions } from "../_types"
+import { escapeFormula } from "./formula"
+import { formatDate as formatExcelDate } from "../_date"
+import { collectHeaders } from "../_objects"
 
 // ── BOM constant ─────────────────────────────────────────────────────
 
@@ -37,7 +40,7 @@ export function formatCsvValue(value: CellValue, options?: CsvWriteOptions): str
   if (opts.escapeFormulae) {
     str = escapeFormula(str)
   }
-  return quoteField(str, opts.delimiter, opts.quote, opts.quoteStyle)
+  return quoteField(str, opts)
 }
 
 /**
@@ -55,11 +58,7 @@ export function writeCsv(rows: CellValue[][], options?: CsvWriteOptions): string
   // Headers row
   if (opts.headers) {
     if (Array.isArray(opts.headers)) {
-      parts.push(
-        opts.headers
-          .map((h) => quoteField(h, opts.delimiter, opts.quote, opts.quoteStyle))
-          .join(opts.delimiter),
-      )
+      parts.push(opts.headers.map((h) => quoteField(h, opts)).join(opts.delimiter))
       if (rows.length > 0) {
         parts.push(opts.lineSeparator)
       }
@@ -102,13 +101,13 @@ export function writeCsvObjects(
     if (data.length === 0) {
       return opts.bom ? UTF8_BOM : ""
     }
-    headers = Object.keys(data[0]!)
+    headers = collectHeaders(data)
   } else {
     // headers === false — no header row, but we still need column order
     if (data.length === 0) {
       return opts.bom ? UTF8_BOM : ""
     }
-    headers = Object.keys(data[0]!)
+    headers = collectHeaders(data)
     // Convert to rows and write without headers
     const rows: CellValue[][] = data.map((obj) =>
       headers.map((key) => {
@@ -142,6 +141,7 @@ interface NormalizedWriteOptions {
   dateFormat: string | undefined
   nullValue: string
   escapeFormulae: boolean
+  comment: string | undefined
 }
 
 function normalizeWriteOptions(options?: CsvWriteOptions): NormalizedWriteOptions {
@@ -155,45 +155,9 @@ function normalizeWriteOptions(options?: CsvWriteOptions): NormalizedWriteOption
     dateFormat: options?.dateFormat,
     nullValue: options?.nullValue ?? "",
     escapeFormulae: options?.escapeFormulae ?? false,
+    // "" would make startsWith() true for every value, so treat it as unset.
+    comment: options?.comment || undefined,
   }
-}
-
-// Characters that trigger formula interpretation in Excel/Sheets/LibreOffice
-// Covers: formulas (=), unary operators (+, -), at-sign (@), whitespace injection (\t, \r, \n), null byte (\0)
-const FORMULA_PREFIXES = ["=", "+", "-", "@", "\t", "\r", "\n", "\0", "|"]
-
-// DDE and dangerous function patterns (case-insensitive)
-const DANGEROUS_PATTERNS = [
-  /^=cmd\b/i,
-  /^=HYPERLINK\s*\(/i,
-  /^=IMPORTXML\s*\(/i,
-  /^=IMPORTDATA\s*\(/i,
-  /^=IMPORTFEED\s*\(/i,
-  /^=IMPORTHTML\s*\(/i,
-  /^=IMPORTRANGE\s*\(/i,
-  /^=IMAGE\s*\(/i,
-]
-
-/**
- * Prefix a string value with a single quote if it starts with a formula-triggering character
- * or matches a dangerous function/DDE pattern.
- */
-function escapeFormula(value: string): string {
-  if (value.length === 0) return value
-
-  // Check prefix characters
-  if (FORMULA_PREFIXES.includes(value[0]!)) {
-    return "'" + value
-  }
-
-  // Check dangerous patterns (DDE, data exfiltration via HYPERLINK, etc.)
-  for (const pattern of DANGEROUS_PATTERNS) {
-    if (pattern.test(value)) {
-      return "'" + value
-    }
-  }
-
-  return value
 }
 
 function formatAndQuote(value: CellValue, opts: NormalizedWriteOptions): string {
@@ -207,82 +171,99 @@ function formatAndQuote(value: CellValue, opts: NormalizedWriteOptions): string 
 
   if (typeof value === "boolean") {
     const raw = value ? "true" : "false"
-    return quoteField(raw, opts.delimiter, opts.quote, opts.quoteStyle)
+    return quoteField(raw, opts)
   }
 
   if (typeof value === "number") {
     const raw = formatNumber(value)
-    return quoteField(raw, opts.delimiter, opts.quote, opts.quoteStyle)
+    return quoteField(raw, opts)
   }
 
   if (value instanceof Date) {
     const raw = formatDate(value, opts.dateFormat)
-    return quoteField(raw, opts.delimiter, opts.quote, opts.quoteStyle)
+    return quoteField(raw, opts)
   }
 
   let str = String(value)
   if (opts.escapeFormulae) {
     str = escapeFormula(str)
   }
-  return quoteField(str, opts.delimiter, opts.quote, opts.quoteStyle)
+  return quoteField(str, opts)
 }
 
-function quoteField(
-  value: string,
-  delimiter: string,
-  quote: string,
-  quoteStyle: "all" | "required" | "none",
-): string {
-  if (quoteStyle === "none") {
+function quoteField(value: string, opts: NormalizedWriteOptions): string {
+  if (opts.quoteStyle === "none") {
     return value
   }
 
   const needsQuoting =
-    quoteStyle === "all" ||
-    value.includes(delimiter) ||
-    value.includes(quote) ||
+    opts.quoteStyle === "all" ||
+    value.includes(opts.delimiter) ||
+    value.includes(opts.quote) ||
     value.includes("\n") ||
-    value.includes("\r")
+    value.includes("\r") ||
+    // A leading comment character is quoted so a reader configured with
+    // `comment` keeps the row instead of dropping the whole line (#408).
+    // The reader only skips *unquoted* leading comment chars, so quoting
+    // is a complete fix — and it is applied wherever the value sits, since
+    // a caller may reorder or concatenate what we hand back.
+    (opts.comment !== undefined && value.startsWith(opts.comment))
 
   if (!needsQuoting) {
     return value
   }
 
   // Escape quote characters by doubling them
-  const escaped = value.replaceAll(quote, quote + quote)
-  return quote + escaped + quote
+  const escaped = value.replaceAll(opts.quote, opts.quote + opts.quote)
+  return opts.quote + escaped + opts.quote
 }
 
+/**
+ * Render a number for CSV.
+ *
+ * Excel shows a value written in exponent notation as `1E-07`, so the
+ * plain decimal form is preferred where there is one — but only when it
+ * is *the same number*. The expansion used to be unconditional, and
+ * `toFixed(20)` caps at twenty decimal places:
+ *
+ *   Number.EPSILON  →  "0.00000000000000022204"   (five digits kept)
+ *   Number.MIN_VALUE →  "0.0"                      (all of them lost)
+ *
+ * So the smallest values a caller could put in a cell came back as zero.
+ * A prettier rendering is not worth a different number. See #474.
+ */
 function formatNumber(n: number): string {
-  // Avoid scientific notation for large integers
+  if (!Number.isFinite(n)) return String(n)
+
+  // Large integers: `1e+21` reads as text in some importers.
   if (Number.isInteger(n) && Math.abs(n) >= 1e15) {
-    return n.toFixed(0)
+    const plain = n.toFixed(0)
+    if (Number(plain) === n) return plain
   }
-  // For very small numbers that would use scientific notation
+
+  // Small magnitudes, where JS switches to exponent notation at 1e-7.
   if (Math.abs(n) > 0 && Math.abs(n) < 1e-6) {
-    return n.toFixed(20).replace(/0+$/, "").replace(/\.$/, ".0")
+    const plain = n.toFixed(20).replace(/0+$/, "").replace(/\.$/, ".0")
+    if (Number(plain) === n) return plain
   }
+
   return String(n)
 }
 
+/**
+ * Render a `Date` for CSV output.
+ *
+ * Delegates to the library's own {@link formatExcelDate}, so a format
+ * string means the same thing here as it does in a `numFmt`, in
+ * `formatValue`, and in the public `formatDate` export. This file used to
+ * carry a private substitute that accepted a different vocabulary
+ * (`YYYY MM DD HH mm ss`), read *local* time components while the
+ * no-format path read UTC, and substituted with a non-global `.replace()`
+ * so a repeated token stayed literal. See #439.
+ */
 function formatDate(d: Date, format?: string): string {
-  if (!format) {
-    return d.toISOString()
-  }
-
-  // Simple date format placeholders
-  const year = d.getFullYear()
-  const month = d.getMonth() + 1
-  const day = d.getDate()
-  const hours = d.getHours()
-  const minutes = d.getMinutes()
-  const seconds = d.getSeconds()
-
-  return format
-    .replace("YYYY", String(year))
-    .replace("MM", String(month).padStart(2, "0"))
-    .replace("DD", String(day).padStart(2, "0"))
-    .replace("HH", String(hours).padStart(2, "0"))
-    .replace("mm", String(minutes).padStart(2, "0"))
-    .replace("ss", String(seconds).padStart(2, "0"))
+  // See #364 — an unparseable Date threw a raw RangeError mid-write.
+  if (Number.isNaN(d.getTime())) return ""
+  if (!format) return d.toISOString()
+  return formatExcelDate(d, format)
 }

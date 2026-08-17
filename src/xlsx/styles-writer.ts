@@ -2,16 +2,18 @@
 // Generates xl/styles.xml for an XLSX package.
 
 import type {
-  CellStyle,
-  FontStyle,
-  FillStyle,
-  BorderStyle,
   AlignmentStyle,
-  Color,
   BorderSide,
+  BorderStyle,
   CellProtection,
+  CellStyle,
+  Color,
+  FillStyle,
+  FontStyle,
 } from "../_types"
 import { xmlDocument, xmlElement, xmlSelfClose } from "../xml/writer"
+import { cloneBorder, cloneFill, cloneFont } from "../_style"
+import { FPB_NS, FPB_XF_EXT_URI } from "./feature-property-bag"
 
 const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
@@ -259,7 +261,25 @@ interface XfEntry {
   hasCheckboxFeature?: boolean
 }
 
-export function createStylesCollector(defaultFont?: FontStyle): StylesCollector {
+export interface StylesCollectorOptions {
+  /**
+   * Reuse a cell format across cells that pass the *same* style object,
+   * skipping the key rebuild. Only sound when the caller cannot mutate a
+   * style between the cells that use it — true for `writeXlsx`, which is
+   * handed the whole document and serialises it without yielding, and false
+   * for the streaming writers, which take rows from caller code.
+   *
+   * Default: false.
+   */
+  reuseStyleIdentity?: boolean
+}
+
+export function createStylesCollector(
+  defaultFont?: FontStyle,
+  options?: StylesCollectorOptions,
+): StylesCollector {
+  const reuseStyleIdentity = options?.reuseStyleIdentity ?? false
+
   // ── Defaults ──
   // Default font (Calibri 11)
   const baseFont: FontStyle = {
@@ -304,13 +324,24 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
   ]
   const xfMap = new Map<string, number>([[defaultXfKey, 0]])
 
+  // The three `add*` registers below snapshot what they are handed.
+  //
+  // The collector keeps those objects until `toXml()` runs, so a caller that
+  // mutates one after use would retroactively change formatting already
+  // assigned to earlier cells — and leave the stored dedup key disagreeing
+  // with the value serialised under it (#437). The copy is the same walk
+  // `cloneSheet` and `cloneCellStyle` use (src/_style.ts).
+  //
+  // Only reached when a format is registered for the first time, so this
+  // costs one copy per distinct format, not per cell.
+
   function addFont(font: FontStyle): number {
     const key = fontKey(font)
     const existing = fontMap.get(key)
     if (existing !== undefined) return existing
 
     const id = fonts.length
-    fonts.push({ key, font })
+    fonts.push({ key, font: cloneFont(font) })
     fontMap.set(key, id)
     return id
   }
@@ -321,7 +352,7 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
     if (existing !== undefined) return existing
 
     const id = fills.length
-    fills.push({ key, fill })
+    fills.push({ key, fill: cloneFill(fill) })
     fillMap.set(key, id)
     return id
   }
@@ -332,7 +363,7 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
     if (existing !== undefined) return existing
 
     const id = borders.length
-    borders.push({ key, border })
+    borders.push({ key, border: cloneBorder(border) })
     borderMap.set(key, id)
     return id
   }
@@ -401,7 +432,23 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
     return registerXf(style ?? {}, true)
   }
 
+  // One style object is typically shared by a whole column, or by the whole
+  // sheet. Keying it by identity skips rebuilding the font/fill/border keys —
+  // each of which serialises part of the style into a string — once per cell.
+  //
+  // Off by default, because it is only sound when the caller cannot mutate a
+  // style between the cells that use it. `writeXlsx` gets the whole document
+  // up front and serialises it without yielding, so nothing of the caller's
+  // runs in between; the streaming writers take rows from caller code and do
+  // not enable it. See `reuseStyleIdentity`.
+  const xfByStyleIdentity = reuseStyleIdentity ? new WeakMap<CellStyle, number>() : undefined
+
   function registerXf(style: CellStyle, checkbox: boolean): number {
+    if (xfByStyleIdentity && !checkbox) {
+      const cached = xfByStyleIdentity.get(style)
+      if (cached !== undefined) return cached
+    }
+
     const fontId = style.font ? addFont(style.font) : 0
     const fillId = style.fill ? addFill(style.fill) : 0
     const borderId = style.border ? addBorder(style.border) : 0
@@ -418,7 +465,10 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
     ].join("|")
 
     const existing = xfMap.get(key)
-    if (existing !== undefined) return existing
+    if (existing !== undefined) {
+      if (xfByStyleIdentity && !checkbox) xfByStyleIdentity.set(style, existing)
+      return existing
+    }
 
     const id = xfs.length
     xfs.push({
@@ -427,11 +477,12 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
       fontId,
       fillId,
       borderId,
-      alignment: style.alignment,
-      protection: style.protection,
+      alignment: style.alignment ? { ...style.alignment } : undefined,
+      protection: style.protection ? { ...style.protection } : undefined,
       hasCheckboxFeature: checkbox || undefined,
     })
     xfMap.set(key, id)
+    if (xfByStyleIdentity && !checkbox) xfByStyleIdentity.set(style, id)
     return id
   }
 
@@ -534,9 +585,8 @@ export function createStylesCollector(defaultFont?: FontStyle): StylesCollector 
               xmlElement(
                 "ext",
                 {
-                  uri: "{C7286773-470A-42A8-94C5-96B5CB345126}",
-                  "xmlns:xfpb":
-                    "http://schemas.microsoft.com/office/spreadsheetml/2022/featurepropertybag",
+                  uri: FPB_XF_EXT_URI,
+                  "xmlns:xfpb": FPB_NS,
                 },
                 xmlSelfClose("xfpb:xfComplement", { i: "0" }),
               ),

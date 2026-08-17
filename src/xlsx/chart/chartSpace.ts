@@ -232,40 +232,10 @@ export function resolveCloneProtection(
   return override
 }
 
-/**
- * Normalize a `plotAreaFillColor` value for the cloned `SheetChart`.
- * Mirrors the writer's `normalizeClonePlotAreaFillColor` — the cloned shape
- * is guaranteed to round-trip through the writer without surprise: a
- * leading `#` and any case are accepted, then the value collapses to
- * the OOXML canonical uppercase form. Malformed inputs (wrong length,
- * non-hex characters, alpha-channel forms, non-string escapes from an
- * untyped caller) collapse to `undefined` so the cloned chart drops
- * the field rather than carry a value the writer would silently elide
- * back to absence.
- */
-export function normalizeClonePlotAreaFillColor(
-  value: ChartColor | undefined,
-): ChartColor | undefined {
-  return normalizeChartColor(value)
-}
-
-/**
- * Normalize a `plotAreaBorderColor` value for the cloned `SheetChart`.
- * Mirrors the writer's `normalizeClonePlotAreaBorderColor` — the cloned
- * shape is guaranteed to round-trip through the writer without
- * surprise: a leading `#` and any case are accepted, then the value
- * collapses to the OOXML canonical uppercase form. Malformed inputs
- * (wrong length, non-hex characters, alpha-channel forms, non-string
- * escapes from an untyped caller) collapse to `undefined` so the
- * cloned chart drops the field rather than carry a value the writer
- * would silently elide back to absence. Mirrors
- * {@link normalizeClonePlotAreaFillColor} — same hex grammar.
- */
-export function normalizeClonePlotAreaBorderColor(
-  value: ChartColor | undefined,
-): ChartColor | undefined {
-  return normalizeChartColor(value)
-}
+// The plot-area fill and border normalizers used to be duplicated here.
+// They were never referenced: the live path is `chart-clone.ts` ->
+// `resolveClonePlotAreaFillColor` / `resolveClonePlotAreaBorderColor` in
+// `plotArea.ts`, which normalize through the same `normalizeChartColor`.
 
 /**
  * Normalize a `chartSpaceFillColor` value for the cloned `SheetChart`.
@@ -279,9 +249,7 @@ export function normalizeClonePlotAreaBorderColor(
  * so the cloned chart drops the field rather than carry a value the
  * writer would silently elide back to absence.
  */
-export function normalizeCloneChartSpaceFillColor(
-  value: ChartColor | undefined,
-): ChartColor | undefined {
+function normalizeCloneChartSpaceFillColor(value: ChartColor | undefined): ChartColor | undefined {
   return normalizeChartColor(value)
 }
 
@@ -328,7 +296,7 @@ export function resolveCloneChartSpaceFillColor(
  * so the cloned chart drops the field rather than carry a value the
  * writer would silently elide back to absence.
  */
-export function normalizeCloneChartSpaceBorderColor(
+function normalizeCloneChartSpaceBorderColor(
   value: ChartColor | undefined,
 ): ChartColor | undefined {
   return normalizeChartColor(value)

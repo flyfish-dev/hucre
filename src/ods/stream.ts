@@ -1,37 +1,78 @@
 // ── Streaming ODS Reader ─────────────────────────────────────────────
 // Yields rows one at a time from an ODS file via SAX parsing.
 
-import type { CellValue } from "../_types"
+import type { CellValue, ReadInput, StreamRow } from "../_types"
 import { ParseError, ZipError } from "../errors"
-import { assertNotEncrypted } from "../_input"
+import { assertNotEncrypted, readInputToUint8Array } from "../_input"
 import { ZipReader } from "../zip/reader"
 import { parseSax } from "../xml/parser"
-import { MAX_COL_INDEX, MAX_ROW_INDEX } from "../limits"
+import { parseOdsDateTime } from "./reader"
+import { MAX_COL_INDEX, MAX_REPEAT_COUNT, MAX_ROW_INDEX } from "../limits"
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function decodeUtf8(data: Uint8Array): string {
+/**
+ * Decode a part with no string-length ceiling — see the fuller note on
+ * the same function in `xlsx/stream-reader.ts`. `ods/reader.ts` has a
+ * `decodeUtf8` that does check and raises the #514 `ParseError`; this
+ * one does not, and the name says so rather than leaving two functions
+ * with one name and two contracts.
+ *
+ * `streamOdsRows` streams the *rows* out of `content.xml` but still
+ * builds the whole part as a string to do it, so an ODS over the ceiling
+ * fails here with V8's raw error — unlike `streamXlsxRows`, which SAX-parses
+ * the worksheet off the decompression stream and never builds one.
+ */
+function decodeUtf8Unchecked(data: Uint8Array): string {
   return new TextDecoder("utf-8").decode(data)
 }
 
-function toUint8Array(input: Uint8Array | ArrayBuffer): Uint8Array {
-  if (input instanceof Uint8Array) return input
-  return new Uint8Array(input)
+/**
+ * Options for {@link streamOdsRows}.
+ *
+ * It previously took none at all, so `maxRows` on a huge file meant
+ * draining the whole thing and counting yourself.
+ */
+export interface OdsStreamReadOptions {
+  /**
+   * Restrict streaming to these sheets, by 0-based index or by name.
+   * Rows from other sheets are skipped.
+   */
+  sheets?: Array<number | string>
+  /** Stop after this many rows across all streamed sheets. */
+  maxRows?: number
+  /**
+   * Zip-bomb ceiling for any one entry; see `ReadOptions.maxDecompressedBytes`.
+   * Default: 2 GiB ({@link MAX_DECOMPRESSED_BYTES}).
+   */
+  maxDecompressedBytes?: number
+}
+
+/**
+ * Resolve the sheet filter to a set of indices, or `undefined` for "all".
+ *
+ * Names cannot be resolved from the row stream alone — the SAX pass does
+ * not surface table names — so only numeric entries are honoured for now
+ * and a name-only filter falls back to streaming everything rather than
+ * silently yielding nothing.
+ */
+function normalizeSheetFilter(sheets: Array<number | string> | undefined): Set<number> | undefined {
+  if (!sheets || sheets.length === 0) return undefined
+  const indices = sheets.filter((s): s is number => typeof s === "number")
+  return indices.length > 0 ? new Set(indices) : undefined
 }
 
 // ── Row parser via SAX ──────────────────────────────────────────────
 
-interface OdsStreamRow {
-  /** 0-based row index within its sheet */
-  index: number
-  /** 0-based index of the sheet (table) this row belongs to */
-  sheetIndex: number
-  /** Cell values for this row */
-  values: CellValue[]
-}
+/**
+ * @deprecated Use {@link StreamRow}. Kept as an alias because it was the
+ * element type of a public async generator; the two shapes were
+ * identical apart from `sheetIndex` now being optional.
+ */
+export type OdsStreamRow = StreamRow
 
-function* parseContentRows(xml: string): Generator<OdsStreamRow, void, undefined> {
-  const completedRows: OdsStreamRow[] = []
+function* parseContentRows(xml: string): Generator<StreamRow, void, undefined> {
+  const completedRows: StreamRow[] = []
 
   let inBody = false
   let inSpreadsheet = false
@@ -39,6 +80,7 @@ function* parseContentRows(xml: string): Generator<OdsStreamRow, void, undefined
   let inRow = false
   let inCell = false
   let inP = false
+  let inAnnotation = false
 
   let sheetIndex = -1
   let currentRowIndex = -1
@@ -46,6 +88,18 @@ function* parseContentRows(xml: string): Generator<OdsStreamRow, void, undefined
   let rowRepeat = 1
   let currentCells: CellValue[] = []
   let cellText = ""
+  /**
+   * How many `<text:p>` this cell has opened.
+   *
+   * The batch reader builds a cell's text as
+   * `paragraphs.map(collectText).join("\n")`, so consecutive paragraphs
+   * are separated by a newline. Streaming has no array to join — the
+   * text accumulates as it arrives — so the separator has to be written
+   * when the *second* and later paragraphs open. A count rather than a
+   * "is cellText empty" test, because an empty paragraph is still a
+   * line: `join("\n")` over `["a", "", "b"]` is `"a\n\nb"`.
+   */
+  let cellParagraphs = 0
   let cellValueType = ""
   let cellValue = ""
   let cellBoolValue = ""
@@ -88,6 +142,7 @@ function* parseContentRows(xml: string): Generator<OdsStreamRow, void, undefined
               MAX_COL_INDEX + 1,
             )
             cellText = ""
+            cellParagraphs = 0
             cellValueType = attrs["office:value-type"] ?? attrs["calcext:value-type"] ?? ""
             cellValue = attrs["office:value"] ?? ""
             cellBoolValue = attrs["office:boolean-value"] ?? ""
@@ -105,15 +160,37 @@ function* parseContentRows(xml: string): Generator<OdsStreamRow, void, undefined
             }
           }
           break
+        case "annotation":
+          // A cell comment carries its own <text:p>. The batch reader
+          // takes only direct children of the cell, so folding the
+          // annotation into the value made the two readers disagree —
+          // the divergence test/ods-stream-parity.test.ts exists to
+          // catch. See #393.
+          inAnnotation = true
+          break
         case "p":
-          if (inCell) inP = true
+          if (inCell && !inAnnotation) {
+            // A cell's paragraphs are its lines. The batch reader joins
+            // them with "\n"; here the newline goes in as each paragraph
+            // after the first opens. Without it a two-paragraph cell —
+            // which is how SheetJS and LibreOffice spell a line break,
+            // where hucre spells it `<text:line-break/>` — came back with
+            // the lines run together. See #464.
+            if (cellParagraphs > 0) cellText += "\n"
+            cellParagraphs++
+            inP = true
+          }
           break
         // Text content special elements — mirror collectText() in reader.ts so
         // the streaming and batch readers return the same string for a cell.
         case "s":
           if (inP && inCell) {
-            const count = Number(attrs["text:c"] ?? "1")
-            cellText += " ".repeat(count > 0 ? count : 1)
+            // Same cap as the batch reader — an uncapped text:c reaches
+            // a raw RangeError. See #363.
+            const raw = Number(attrs["text:c"] ?? "1")
+            const count =
+              !Number.isFinite(raw) || raw < 1 ? 1 : Math.min(Math.trunc(raw), MAX_REPEAT_COUNT)
+            cellText += " ".repeat(count)
           }
           break
         case "line-break":
@@ -135,6 +212,9 @@ function* parseContentRows(xml: string): Generator<OdsStreamRow, void, undefined
       const local = tag.includes(":") ? tag.slice(tag.indexOf(":") + 1) : tag
 
       switch (local) {
+        case "annotation":
+          inAnnotation = false
+          break
         case "p":
           inP = false
           break
@@ -213,10 +293,9 @@ function resolveCellValue(
       if (boolValue === "false") return false
       return null
     case "date":
-      if (dateValue) {
-        const d = new Date(dateValue)
-        if (!Number.isNaN(d.getTime())) return d
-      }
+      // Same UTC reading as readOds — a streamed row must not disagree with
+      // the same file read whole. See #415.
+      if (dateValue) return parseOdsDateTime(dateValue) ?? null
       return null
     case "string":
       return text || ""
@@ -232,9 +311,12 @@ function resolveCellValue(
  * Unzips and parses content.xml with SAX, yielding rows as they are parsed.
  */
 export async function* streamOdsRows(
-  input: Uint8Array | ArrayBuffer,
-): AsyncGenerator<OdsStreamRow, void, undefined> {
-  const data = toUint8Array(input)
+  input: ReadInput,
+  options?: OdsStreamReadOptions,
+): AsyncGenerator<StreamRow, void, undefined> {
+  // Previously Uint8Array | ArrayBuffer only — a streaming reader that
+  // could not take a ReadableStream, unlike streamXlsxRows. See #365.
+  const data = await readInputToUint8Array(input)
 
   // Detect password-protected ODF workbooks (OLE2/CFB envelope) up
   // front so streamers fail fast with a typed `EncryptedFileError`
@@ -244,7 +326,7 @@ export async function* streamOdsRows(
   // 1. Open ZIP archive
   let zip: ZipReader
   try {
-    zip = new ZipReader(data)
+    zip = new ZipReader(data, options?.maxDecompressedBytes)
   } catch (err) {
     if (err instanceof ZipError) throw err
     throw new ParseError("Failed to open ODS file: not a valid ZIP archive", undefined, {
@@ -261,8 +343,18 @@ export async function* streamOdsRows(
   if (!zip.has("content.xml")) {
     throw new ParseError("Invalid ODS: missing content.xml")
   }
-  const contentXml = decodeUtf8(await zip.extract("content.xml"))
+  const contentXml = decodeUtf8Unchecked(await zip.extract("content.xml"))
 
   // 4. Yield rows via SAX
-  yield* parseContentRows(contentXml)
+  // 4. Yield rows via SAX, applying the filters
+  const wanted = normalizeSheetFilter(options?.sheets)
+  const maxRows = options?.maxRows ?? 0
+  let emitted = 0
+
+  for (const row of parseContentRows(contentXml)) {
+    if (wanted !== undefined && !wanted.has(row.sheetIndex ?? 0)) continue
+    if (maxRows > 0 && emitted >= maxRows) return
+    emitted++
+    yield row
+  }
 }

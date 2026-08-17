@@ -3,15 +3,16 @@
 
 import type {
   CellValue,
-  NamedRange,
   WorkbookProperties,
   WriteOptions,
   WriteOutput,
   WriteSheet,
 } from "../_types"
 import { ZipWriter } from "../zip/writer"
+import { splitInlineCellsInSheets, toCellValue } from "../_inline-cells"
 import { writeContentTypes } from "./content-types-writer"
-import { writeFeaturePropertyBagXml } from "./feature-property-bag"
+import { FPB_PART_PATH, writeFeaturePropertyBagXml } from "./feature-property-bag"
+import { METADATA_PART_PATH, writeMetadataXml } from "./metadata"
 import type { ContentTypesOptions } from "./content-types-writer"
 import { writeRootRels, writeWorkbookXml, writeWorkbookRels } from "./workbook-writer"
 import type { PivotCacheRef, PivotCacheRel } from "./workbook-writer"
@@ -19,6 +20,7 @@ import { createStylesCollector } from "./styles-writer"
 import { createSharedStrings, writeSharedStringsXml, writeWorksheetXml } from "./worksheet-writer"
 import type { WorksheetResult } from "./worksheet-writer"
 import { unwrapCellValue } from "./hyperlink"
+import { assignBackgroundImagePaths } from "./background-image"
 import { writeDrawing } from "./drawing-writer"
 import type { DrawingResult } from "./drawing-writer"
 import { writeChart } from "./chart-writer"
@@ -26,12 +28,13 @@ import { encryptAgile } from "./crypto/agile"
 import { writeComments } from "./comments-writer"
 import type { CommentsResult } from "./comments-writer"
 import { writeTable } from "./table-writer"
-import { colToLetter } from "./worksheet-writer"
+import { buildNamedRanges, computeTableRange } from "./derived-ranges"
 import { writePivotTable as writePivotTableParts, resolvePivotSource } from "./pivot-writer"
 import type { PivotWriteResult } from "./pivot-writer"
 import { xmlDocument, xmlSelfClose } from "../xml/writer"
 import { writeCoreProperties, writeAppProperties, writeCustomProperties } from "./doc-props-writer"
 import { writeThemeXml } from "./theme-writer"
+import { validateSheetNames } from "../_validate"
 
 const encoder = /* @__PURE__ */ new TextEncoder()
 
@@ -70,12 +73,22 @@ function effectiveProperties(options: WriteOptions): WorkbookProperties | undefi
  * Returns a Uint8Array containing the ZIP archive.
  */
 export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
-  const { sheets, defaultFont, dateSystem, namedRanges, activeSheet, workbookProtection } = options
+  // A cell object written inline in `rows` becomes a `cells` entry before
+  // anything reads the grid, so every consumer below still sees values.
+  // See #433 and `src/_inline-cells.ts`.
+  const sheets = splitInlineCellsInSheets(options.sheets)
+  const { defaultFont, dateSystem, namedRanges, activeSheet, workbookProtection } = options
+
+  // Before any bytes are produced, so a rejected workbook leaves no
+  // half-written output. See #364.
+  validateSheetNames(sheets)
 
   const properties = effectiveProperties(options)
 
   // Create shared collectors
-  const styles = createStylesCollector(defaultFont)
+  // Safe here: the document arrives whole and is serialised without yielding
+  // to caller code, so a style object cannot change between the cells using it.
+  const styles = createStylesCollector(defaultFont, { reuseStyleIdentity: true })
   const sharedStrings = createSharedStrings()
 
   // Pre-compute global table start indices per sheet
@@ -183,20 +196,14 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
     }
   }
 
-  // Track background image paths per sheet (for picture relationships)
-  const backgroundImagePaths: Array<string | null> = []
-  for (let i = 0; i < sheets.length; i++) {
-    const sheet = sheets[i]
-    if (sheet.backgroundImage) {
-      // Background images are stored as PNG by default
-      const bgPath = `xl/media/image${globalImageIndex}.png`
-      backgroundImagePaths.push(bgPath)
-      imageExtensions.add("png")
-      globalImageIndex++
-    } else {
-      backgroundImagePaths.push(null)
-    }
-  }
+  // Track background image paths per sheet (for picture relationships).
+  // The format comes from the bytes, not from a guess — see #427.
+  const { paths: backgroundImagePaths, nextIndex: afterBackgrounds } = assignBackgroundImagePaths(
+    sheets,
+    globalImageIndex,
+    imageExtensions,
+  )
+  globalImageIndex = afterBackgrounds
 
   // Generate comments data for sheets that have comments
   const commentsResults: Array<CommentsResult | null> = []
@@ -279,6 +286,9 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
   // [Content_Types].xml
   const hasMacros = options.vbaProject !== undefined && options.vbaProject.length > 0
   const hasFeaturePropertyBag = styles.hasCheckboxFeature()
+  // A `cm` on a cell is an index into xl/metadata.xml; the part has to
+  // ship with it or the index resolves to nothing (#423).
+  const hasMetadata = worksheetResults.some((r) => r.hasDynamicArray)
 
   const ctOpts: ContentTypesOptions = {
     sheetCount: sheets.length,
@@ -296,6 +306,7 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
     hasCustomProps,
     hasMacros,
     hasFeaturePropertyBag,
+    hasMetadata,
   }
   zip.add("[Content_Types].xml", encoder.encode(writeContentTypes(ctOpts)))
 
@@ -345,6 +356,10 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
         undefined,
         undefined,
         pivotCacheRels.length > 0 ? pivotCacheRels : undefined,
+        undefined,
+        undefined,
+        undefined,
+        hasMetadata,
       ),
     ),
   )
@@ -360,14 +375,18 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
     zip.add("xl/sharedStrings.xml", encoder.encode(writeSharedStringsXml(sharedStrings)))
   }
 
-  // xl/vbaProject.bin (if macros provided)
-  if (hasFeaturePropertyBag) {
-    zip.add(
-      "xl/featurePropertyBag/featurePropertyBag.xml",
-      encoder.encode(writeFeaturePropertyBagXml()),
-    )
+  // xl/metadata.xml — declared in the content types and related from
+  // the workbook above, so the part itself has to be here.
+  if (hasMetadata) {
+    zip.add(METADATA_PART_PATH, encoder.encode(writeMetadataXml()))
   }
 
+  // xl/featurePropertyBag/featurePropertyBag.xml (Excel 2024 checkboxes)
+  if (hasFeaturePropertyBag) {
+    zip.add(FPB_PART_PATH, encoder.encode(writeFeaturePropertyBagXml()))
+  }
+
+  // xl/vbaProject.bin (if macros provided)
   if (hasMacros) {
     zip.add("xl/vbaProject.bin", options.vbaProject!)
   }
@@ -378,6 +397,21 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
     const drawing = drawingResults[i]
     const comments = commentsResults[i]
 
+    // `result.xml` is one large string — for 100,000 x 12 it is ~42 MB
+    // joined from ~1.3M pieces — and this is the single encode of it.
+    // Building the bytes incrementally instead, so that string never
+    // exists, was proposed in #472 and measured. Every implementable
+    // form of it lost, on identical output bytes:
+    //
+    //   join + one encode (this line)              153-190 ms
+    //   chunked join+encode at ~1 MB                   199 ms
+    //   encodeInto a buffer, one view per piece        439 ms
+    //   encodeInto, five fragments per cell            358 ms
+    //   manual ASCII byte loop, encodeInto fallback    308 ms
+    //
+    // `join` and `TextEncoder.encode` are bulk paths; 1.3M small
+    // JS-level writes do not beat one big one however they are arranged.
+    // The whole step is ~7% of the write, so that is the ceiling anyway.
     zip.add(`xl/worksheets/sheet${i + 1}.xml`, encoder.encode(result.xml))
 
     // Generate worksheet .rels if there are hyperlinks, a drawing, comments, tables, picture, or pivots
@@ -449,7 +483,7 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
       // Background image (picture) relationship
       if (hasPicture && result.pictureRId && backgroundImagePaths[i]) {
         const bgMediaPath = backgroundImagePaths[i]!
-        const relTarget = `../${bgMediaPath.slice(3)}` // Remove "xl/" prefix → "../media/imageN.png"
+        const relTarget = `../${bgMediaPath.slice(3)}` // strip "xl/" → "../media/imageN.<ext>"
         relElements.push(
           xmlSelfClose("Relationship", {
             Id: result.pictureRId,
@@ -566,7 +600,9 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
  */
 function collectSourceRows(sheet: WriteSheet): CellValue[][] {
   if (sheet.rows && sheet.rows.length > 0) {
-    return sheet.rows.map((row) => [...row])
+    // A pivot sources values; `writeXlsx` has already lifted any inline
+    // cell objects, and `toCellValue` keeps this correct on its own.
+    return sheet.rows.map((row) => row.map(toCellValue))
   }
   if (sheet.data && sheet.data.length > 0 && sheet.columns && sheet.columns.length > 0) {
     const out: CellValue[][] = []
@@ -583,80 +619,4 @@ function collectSourceRows(sheet: WriteSheet): CellValue[][] {
     return out
   }
   return []
-}
-
-// ── Named Range Builder ────────────────────────────────────────────────
-
-/**
- * Build the full list of named ranges, merging user-defined ranges with
- * auto-generated _xlnm.Print_Area and _xlnm.Print_Titles from sheet pageSetup.
- */
-function buildNamedRanges(sheets: WriteOptions["sheets"], userRanges?: NamedRange[]): NamedRange[] {
-  const result: NamedRange[] = userRanges ? [...userRanges] : []
-
-  for (const sheet of sheets) {
-    const ps = sheet.pageSetup
-    if (!ps) continue
-
-    // Print area → _xlnm.Print_Area
-    if (ps.printArea) {
-      result.push({
-        name: "_xlnm.Print_Area",
-        range: `${sheet.name}!${ps.printArea}`,
-        scope: sheet.name,
-      })
-    }
-
-    // Print titles (repeat rows and/or columns)
-    const titleParts: string[] = []
-    if (ps.printTitlesRow) {
-      titleParts.push(`${sheet.name}!${ps.printTitlesRow}`)
-    }
-    if (ps.printTitlesColumn) {
-      titleParts.push(`${sheet.name}!${ps.printTitlesColumn}`)
-    }
-    if (titleParts.length > 0) {
-      result.push({
-        name: "_xlnm.Print_Titles",
-        range: titleParts.join(","),
-        scope: sheet.name,
-      })
-    }
-  }
-
-  return result
-}
-
-// ── Table Range Computation ──────────────────────────────────────────
-
-/**
- * Auto-calculate table range from sheet data and table column count.
- * Assumes header row is row 1 and data fills remaining rows.
- */
-function computeTableRange(
-  table: import("../_types").TableDefinition,
-  sheet: import("../_types").WriteSheet,
-): string {
-  const colCount = table.columns.length
-  let rowCount = 0
-
-  if (sheet.rows) {
-    rowCount = sheet.rows.length
-  } else if (sheet.data) {
-    // Object data: data rows + 1 header row (if columns have headers)
-    const hasHeaders = sheet.columns?.some((c) => c.header)
-    rowCount = sheet.data.length + (hasHeaders ? 1 : 0)
-  }
-
-  // Add total row if requested
-  if (table.showTotalRow) {
-    rowCount += 1
-  }
-
-  // Minimum: 1 header row + 0 data rows = 1 row
-  if (rowCount < 1) rowCount = 1
-
-  const startCol = colToLetter(0)
-  const endCol = colToLetter(colCount - 1)
-  return `${startCol}1:${endCol}${rowCount}`
 }

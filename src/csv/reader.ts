@@ -1,4 +1,8 @@
 import type { CellValue, CsvReadOptions } from "../_types"
+import { rowsToObjects } from "../_objects"
+import { unescapeFormula } from "./formula"
+import { inferType } from "../_infer"
+import { decodeCsvInput, type CsvInput } from "./encoding"
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -54,11 +58,15 @@ export function detectDelimiter(input: string): string {
 /**
  * Parse a CSV string into a 2D array of cell values.
  */
-export function parseCsv(input: string, options?: CsvReadOptions): CellValue[][] {
+export function parseCsv(input: CsvInput, options?: CsvReadOptions): CellValue[][] {
   const opts = normalizeReadOptions(options)
 
+  // Bytes are decoded here, honouring the byte-order mark; a string is
+  // whatever the caller already decoded. See ./encoding.ts.
+  let text = decodeCsvInput(input, options?.encoding)
+
   if (opts.skipBom) {
-    input = stripBom(input)
+    text = stripBom(text)
   }
 
   // Skip the first N lines before parsing
@@ -66,11 +74,11 @@ export function parseCsv(input: string, options?: CsvReadOptions): CellValue[][]
   if (skipLines && skipLines > 0) {
     let linesSkipped = 0
     let pos = 0
-    while (linesSkipped < skipLines && pos < input.length) {
-      const ch = input[pos]!
+    while (linesSkipped < skipLines && pos < text.length) {
+      const ch = text[pos]!
       if (ch === "\r") {
         linesSkipped++
-        if (pos + 1 < input.length && input[pos + 1] === "\n") {
+        if (pos + 1 < text.length && text[pos + 1] === "\n") {
           pos += 2
         } else {
           pos++
@@ -82,23 +90,23 @@ export function parseCsv(input: string, options?: CsvReadOptions): CellValue[][]
         pos++
       }
     }
-    input = input.slice(pos)
+    text = text.slice(pos)
   }
 
-  if (input.length === 0) return []
+  if (text.length === 0) return []
 
-  const delimiter = opts.delimiter ?? detectDelimiter(input)
+  const delimiter = opts.delimiter ?? detectDelimiter(text)
   const quote = opts.quote
   const escape = opts.escape
 
   let rows: string[][]
   let firstFieldQuoted: boolean[]
   if (options?.fastMode) {
-    rows = parseFast(input, delimiter)
+    rows = parseFast(text, delimiter)
     // Fast mode does no quote handling, so no field is ever "quoted".
     firstFieldQuoted = Array.from({ length: rows.length }, () => false)
   } else {
-    const parsed = parseRaw(input, delimiter, quote, escape)
+    const parsed = parseRaw(text, delimiter, quote, escape)
     rows = parsed.rows
     firstFieldQuoted = parsed.firstFieldQuoted
   }
@@ -125,6 +133,39 @@ export function parseCsv(input: string, options?: CsvReadOptions): CellValue[][]
     )
   }
 
+  // Undo the writer's formula escape before anything else looks at the
+  // values, so type inference and header names see what was written rather
+  // than `'` + the value (#408).
+  if (opts.unescapeFormulae) {
+    filtered = filtered.map((row) =>
+      row.map((v) => (typeof v === "string" ? unescapeFormula(v) : v)),
+    )
+  }
+
+  // `header: true` only marks the first row — it still comes back, and only
+  // names columns for transformValue. `skipHeaderRow` is the opt-in that
+  // consumes it, honoured by streamCsvRows and, until #408, ignored here.
+  // The row is captured before it goes, because transformValue names its
+  // columns from it either way, and it drops before maxRows so that limit
+  // counts data rows in both readers.
+  // `transformHeader` used to be honoured by parseCsvObjects alone, where
+  // it renames the object keys — even though CsvReadOptions says every one
+  // of its options "means the same thing in all three" readers. Here and in
+  // streamCsvRows it rewrites the header row itself, which then names the
+  // columns `transformValue` sees. See #439 §V.
+  const transformHeader = options?.transformHeader
+  if (opts.header && transformHeader && filtered.length > 0) {
+    filtered = [
+      filtered[0]!.map((value, index) => transformHeader(String(value ?? ""), index)),
+      ...filtered.slice(1),
+    ]
+  }
+
+  const headerRow = opts.header && filtered.length > 0 ? filtered[0]! : null
+  if (opts.header && opts.skipHeaderRow && filtered.length > 0) {
+    filtered = filtered.slice(1)
+  }
+
   // Limit to maxRows data rows
   if (opts.maxRows !== undefined && opts.maxRows >= 0 && filtered.length > opts.maxRows) {
     filtered = filtered.slice(0, opts.maxRows)
@@ -139,9 +180,8 @@ export function parseCsv(input: string, options?: CsvReadOptions): CellValue[][]
   // transformValue callback — applied after type inference
   const transformValue = options?.transformValue
   if (transformValue) {
-    // When we don't have headers we pass column index as the header name
-    // Detect headers from first row if header option is set
-    const headerRow = options?.header && filtered.length > 0 ? filtered[0]! : null
+    // When we don't have headers we pass column index as the header name;
+    // `headerRow` above is the first row when `header` is set.
     filtered = filtered.map((row, rowIdx) =>
       row.map((val, colIdx) => {
         const header = headerRow ? String(headerRow[colIdx] ?? colIdx) : String(colIdx)
@@ -162,13 +202,26 @@ export function parseCsv(input: string, options?: CsvReadOptions): CellValue[][]
 }
 
 /**
+ * Result shape for {@link parseCsvObjects}, mirroring `XlsxObjectsResult`
+ * and `OdsObjectsResult`.
+ *
+ * Named rather than inline so callers can annotate a variable, a function
+ * return, or a Promise with it — the anonymous shape could not be spelled
+ * at all (#365).
+ */
+export interface CsvObjectsResult<T extends Record<string, CellValue> = Record<string, CellValue>> {
+  data: T[]
+  headers: string[]
+}
+
+/**
  * Parse CSV with a header row, returning an array of objects
  * and the detected headers.
  */
 export function parseCsvObjects<T extends Record<string, CellValue> = Record<string, CellValue>>(
-  input: string,
+  input: CsvInput,
   options?: CsvReadOptions & { header: true },
-): { data: T[]; headers: string[] } {
+): CsvObjectsResult<T> {
   // Pass through without transformValue/transformHeader to parseCsv — we handle them here
   const { transformHeader, transformValue, ...restOptions } = options ?? {}
   const rows = parseCsv(input, {
@@ -178,36 +231,15 @@ export function parseCsvObjects<T extends Record<string, CellValue> = Record<str
     transformHeader: undefined,
   })
 
-  if (rows.length === 0) {
-    return { data: [], headers: [] }
-  }
-
-  const headerRow = rows[0]!
-  let headers = headerRow.map((h) => {
-    if (h === null) return ""
-    return String(h).trim()
+  // `skipEmptyRows` is a `parseCsv` option applied above, so the row set
+  // handed over here is already filtered — projecting it must not filter
+  // a second time.
+  return rowsToObjects<T>(rows, {
+    headerRow: 0,
+    skipEmptyRows: false,
+    transformHeader,
+    transformValue,
   })
-
-  // Apply transformHeader callback
-  if (transformHeader) {
-    headers = headers.map((h, i) => transformHeader(h, i))
-  }
-
-  const data: T[] = []
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i]!
-    const obj: Record<string, CellValue> = {}
-    for (let j = 0; j < headers.length; j++) {
-      let val: CellValue = j < row.length ? row[j]! : null
-      if (transformValue) {
-        val = transformValue(val, headers[j]!, i, j)
-      }
-      obj[headers[j]!] = val
-    }
-    data.push(obj as T)
-  }
-
-  return { data, headers }
 }
 
 // ── Fast parser (no quote handling) ──────────────────────────────────
@@ -331,57 +363,6 @@ function parseRaw(
   return { rows, firstFieldQuoted }
 }
 
-// ── Type inference ───────────────────────────────────────────────────
-
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
-
-function inferType(value: CellValue, preserveLeadingZeros: boolean): CellValue {
-  if (value === null) return null
-  if (typeof value !== "string") return value
-
-  const trimmed = value.trim()
-  if (trimmed === "") return value
-
-  // Boolean detection — only the literal true/false. "yes"/"no" are NOT
-  // coerced: they collide with real data (the ISO country code "NO", a
-  // yes/no/maybe survey column) and most CSV libraries don't coerce them.
-  const lower = trimmed.toLowerCase()
-  if (lower === "true") return true
-  if (lower === "false") return false
-
-  // ISO 8601 date detection (must come before number to avoid matching partial numbers)
-  if (ISO_DATE_RE.test(trimmed)) {
-    const d = new Date(trimmed)
-    if (!Number.isNaN(d.getTime())) return d
-  }
-
-  // Leading-zero preservation: keep strings like "0123", "007", "00" as strings.
-  // Exceptions: "0.xxx" decimals are still parsed.
-  if (preserveLeadingZeros && trimmed.length > 1 && trimmed[0] === "0" && trimmed[1] !== ".") {
-    return value
-  }
-
-  // Number detection
-  const asNumber = parseNumber(trimmed)
-  if (asNumber !== null) return asNumber
-
-  return value
-}
-
-function parseNumber(s: string): number | null {
-  // Handle locale-aware numbers like "1,234.56" or "1,234"
-  // Strip commas that are thousands separators (followed by 3 digits)
-  const stripped = s.replace(/,(\d{3})/g, "$1")
-  // Now try parsing
-  if (stripped === "" || stripped === "-" || stripped === "+") return null
-  // Must look like a number (avoid parsing random strings)
-  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(stripped)) return null
-  const n = Number(stripped)
-  if (Number.isNaN(n)) return null
-  if (!Number.isFinite(n)) return null
-  return n
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function normalizeReadOptions(options?: CsvReadOptions) {
@@ -395,6 +376,8 @@ function normalizeReadOptions(options?: CsvReadOptions) {
     skipEmptyRows: options?.skipEmptyRows ?? false,
     comment: options?.comment,
     header: options?.header ?? false,
+    skipHeaderRow: options?.skipHeaderRow ?? false,
+    unescapeFormulae: options?.unescapeFormulae ?? false,
     maxRows: options?.maxRows,
   }
 }
@@ -477,7 +460,12 @@ function countUnquoted(line: string, delimiter: string): number {
   return count
 }
 
-function startsWith(str: string, prefix: string, offset: number): boolean {
+/**
+ * `str.startsWith(prefix, offset)` without allocating — the parsers call
+ * it once per character. Exported for `csv/stream.ts`, which scans the
+ * same delimiters and quotes a character at a time.
+ */
+export function startsWith(str: string, prefix: string, offset: number): boolean {
   if (offset + prefix.length > str.length) return false
   for (let i = 0; i < prefix.length; i++) {
     if (str[offset + i] !== prefix[i]) return false

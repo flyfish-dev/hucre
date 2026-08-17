@@ -19,6 +19,13 @@ export type XmlNode = XmlElement | string
 export interface SaxHandlers {
   onOpenTag?: (tag: string, attrs: Record<string, string>) => void
   onCloseTag?: (tag: string) => void
+  /**
+   * Text content. {@link parseSaxStream} may split a *very* long run
+   * (larger than {@link SAX_TEXT_FLUSH_CHARS}) across several calls rather
+   * than holding it all in one buffer, so handlers should accumulate text
+   * until the enclosing element closes instead of assigning it. Splits
+   * never land inside an entity reference or a surrogate pair.
+   */
   onText?: (text: string) => void
   onCData?: (text: string) => void
 }
@@ -31,6 +38,32 @@ const ENTITY_MAP: Record<string, string> = {
   gt: ">",
   quot: '"',
   apos: "'",
+}
+
+// ── End-of-line normalization ─────────────────────────────────────
+
+/**
+ * Normalize literal line endings, as XML 1.0 §2.11 requires.
+ *
+ * A processor must turn a literal CRLF, and a literal lone CR, into a
+ * single LF *before* the application sees the content. hucre's writer has
+ * always known this — it escapes CR as `&#13;` precisely so a deliberate
+ * one survives — and the parser did not, so the two disagreed.
+ *
+ * Excel writes a multi-line cell with a literal CRLF inside `<t>`, so
+ * `readXlsx` returned `"line one\r\nline two"` where the same authored
+ * workbook saved as XLSB (which stores a bare LF) gave
+ * `"line one\nline two"`. One cell, two containers, two strings. See
+ * #493.
+ *
+ * This runs on the raw source text, before entity decoding, which is the
+ * order the spec gives and the reason it is a separate pass: `&#13;` is a
+ * *character reference*, not a literal line ending, and must come through
+ * as CR untouched.
+ */
+function normalizeEol(text: string): string {
+  if (text.indexOf("\r") === -1) return text
+  return text.replace(/\r\n?/g, "\n")
 }
 
 // ── Entity Decoding ───────────────────────────────────────────────
@@ -104,13 +137,13 @@ function parseAttrs(raw: string): Record<string, string> {
       i++ // skip opening quote
       const valStart = i
       while (i < len && raw.charCodeAt(i) !== quote) i++
-      attrs[name] = decodeEntities(raw.slice(valStart, i))
+      attrs[name] = decodeEntities(normalizeEol(raw.slice(valStart, i)))
       i++ // skip closing quote
     } else {
       // Unquoted value (technically not valid XML, but handle gracefully)
       const valStart = i
       while (i < len && !isWhitespace(raw.charCodeAt(i))) i++
-      attrs[name] = decodeEntities(raw.slice(valStart, i))
+      attrs[name] = decodeEntities(normalizeEol(raw.slice(valStart, i)))
     }
   }
 
@@ -249,7 +282,7 @@ export function parseSax(xml: string, handlers: SaxHandlers): void {
     while (i < len && input.charCodeAt(i) !== 60 /* < */) i++
     const rawText = input.slice(textStart, i)
     if (rawText) {
-      const decoded = decodeEntities(rawText)
+      const decoded = decodeEntities(normalizeEol(rawText))
       handlers.onText?.(decoded)
     }
   }
@@ -265,30 +298,119 @@ export function parseSax(xml: string, handlers: SaxHandlers): void {
 export async function parseSaxStream(
   stream: ReadableStream<Uint8Array>,
   handlers: SaxHandlers,
+  options?: { strict?: boolean },
 ): Promise<void> {
+  const strict = options?.strict ?? false
   const reader = stream.getReader()
   const decoder = new TextDecoder("utf-8")
   let buf = ""
   let bomStripped = false
 
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
+  // Handlers are expected to throw (the XLSX row parser aborts that way),
+  // and so is the source stream. Either way the reader has to be released,
+  // or the ZIP / decompression stream underneath it stays locked for the
+  // life of the process.
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
 
-    if (!bomStripped) {
-      if (buf.charCodeAt(0) === 0xfeff) buf = buf.slice(1)
-      bomStripped = true
+      if (!bomStripped) {
+        if (buf.charCodeAt(0) === 0xfeff) buf = buf.slice(1)
+        bomStripped = true
+      }
+
+      buf = processSaxBuffer(buf, handlers, false, strict)
     }
 
-    buf = processSaxBuffer(buf, handlers, false)
+    // Flush remaining decoder state
+    buf += decoder.decode()
+    if (buf.length > 0) {
+      processSaxBuffer(buf, handlers, true, strict)
+    }
+  } finally {
+    try {
+      await reader.cancel()
+    } catch {
+      // Already closed or errored — nothing left to release.
+    }
+    try {
+      reader.releaseLock()
+    } catch {
+      // ignore
+    }
   }
+}
 
-  // Flush remaining decoder state
-  buf += decoder.decode()
-  if (buf.length > 0) {
-    processSaxBuffer(buf, handlers, true)
+/**
+ * How much text may pile up at the end of a chunk before the streaming
+ * parser flushes it instead of carrying it into the next chunk.
+ *
+ * The carried remainder is re-copied on every chunk, so a single text run
+ * that spans the whole document costs O(n²): measured, one 32 MiB run took
+ * 25 s against 0.4 s for 4 MiB. Flushing bounds the remainder and makes it
+ * linear.
+ *
+ * 256 KiB is well past any legitimate single text node in a spreadsheet
+ * part (an Excel cell tops out at 32,767 characters), so ordinary
+ * documents still see exactly one `onText` call per run and nothing about
+ * their parse changes.
+ */
+export const SAX_TEXT_FLUSH_CHARS: number = 256 * 1024
+
+/** Longest run treated as a possibly-incomplete entity reference (`&#x1F600;` is 9). */
+const MAX_ENTITY_CHARS = 64
+
+/**
+ * Largest index in `[from, to)` at which a text run can be cut without
+ * corrupting it: never inside an entity reference, never between the two
+ * halves of a surrogate pair. Returns `from` when no safe cut exists.
+ */
+function safeTextSplit(buf: string, from: number, to: number): number {
+  let cut = to
+  // An unterminated '&' near the end may be the start of an entity that
+  // continues in the next chunk — hold it back. Beyond MAX_ENTITY_CHARS it
+  // cannot be one, and backing off forever would restore the O(n²) we're
+  // fixing.
+  const amp = buf.lastIndexOf("&", cut - 1)
+  if (amp >= from && to - amp <= MAX_ENTITY_CHARS && buf.indexOf(";", amp) === -1) {
+    cut = amp
   }
+  const last = cut > from ? buf.charCodeAt(cut - 1) : 0
+  if (last >= 0xd800 && last <= 0xdbff)
+    cut-- // don't orphan a high surrogate
+  // A CRLF must not be cut in half either. `normalizeEol` runs per piece
+  // and rewrites a lone CR to LF, so a cut between the CR and its LF
+  // turns one line ending into two — a spurious blank line in a cell,
+  // on the streaming driver only, and only in a text run long enough to
+  // be flushed. Holding the CR back costs one character.
+  else if (last === 13 /* \r */) cut--
+  return cut > from ? cut : from
+}
+
+/**
+ * What to do with a construct the buffer ends in the middle of.
+ *
+ * Mid-stream it is simply incomplete: hand it back and wait for the next
+ * chunk. At the end of the input there is no next chunk, so it is the
+ * same malformed document `parseSax` refuses — but only a caller that
+ * asked for `strict` is told so.
+ *
+ * The split exists because the two callers want different things. The
+ * row streamers have never had an error contract for a truncated
+ * document; they drop the unfinished construct and let the caller notice
+ * the missing rows, and changing that would change what
+ * `streamXlsxRows` does for everyone. The worksheet reader cannot afford
+ * it: since #503 it parses a part over the string ceiling with the same
+ * handlers as the buffered parse, so if it stayed lenient a truncated
+ * 589 MB worksheet would return a short `Sheet` with no error while the
+ * identical part under the ceiling threw. Two drivers over one handler
+ * set have to agree about failure as well as about success.
+ */
+function endOfInput(reject: boolean, buf: string, i: number, message: string): string {
+  if (reject) throw new XmlError(message)
+  return buf.slice(i)
 }
 
 /**
@@ -296,7 +418,12 @@ export async function parseSaxStream(
  * Returns the unprocessed remainder (incomplete tag/text at chunk boundary).
  * When `final` is true, all remaining content must be processable.
  */
-function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): string {
+function processSaxBuffer(
+  buf: string,
+  handlers: SaxHandlers,
+  final: boolean,
+  strict: boolean,
+): string {
   let i = 0
   const len = buf.length
 
@@ -314,7 +441,7 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
         if (buf.slice(i, i + 4) === "<!--") {
           const end = buf.indexOf("-->", i + 4)
           if (end === -1) {
-            return final ? "" : buf.slice(i)
+            return endOfInput(final && strict, buf, i, "Unterminated comment")
           }
           i = end + 3
           continue
@@ -322,7 +449,7 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
         if (buf.slice(i, i + 9) === "<![CDATA[") {
           const end = buf.indexOf("]]>", i + 9)
           if (end === -1) {
-            return final ? "" : buf.slice(i)
+            return endOfInput(final && strict, buf, i, "Unterminated CDATA section")
           }
           const text = buf.slice(i + 9, end)
           handlers.onCData?.(text)
@@ -337,7 +464,7 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
         // DOCTYPE or other declaration — skip
         const end = buf.indexOf(">", i + 2)
         if (end === -1) {
-          return final ? "" : buf.slice(i)
+          return endOfInput(final && strict, buf, i, "Unterminated declaration")
         }
         i = end + 1
         continue
@@ -347,7 +474,7 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
         // Processing instruction: <?...?>
         const end = buf.indexOf("?>", i + 2)
         if (end === -1) {
-          return final ? "" : buf.slice(i)
+          return endOfInput(final && strict, buf, i, "Unterminated processing instruction")
         }
         i = end + 2
         continue
@@ -357,7 +484,7 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
         // Closing tag: </tagName>
         const end = buf.indexOf(">", i + 2)
         if (end === -1) {
-          return final ? "" : buf.slice(i)
+          return endOfInput(final && strict, buf, i, "Unterminated closing tag")
         }
         const tag = buf.slice(i + 2, end).trim()
         handlers.onCloseTag?.(tag)
@@ -381,7 +508,7 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
       }
       if (j >= len) {
         // Tag not complete in this chunk
-        return final ? "" : buf.slice(i)
+        return endOfInput(final && strict, buf, i, "Unterminated opening tag")
       }
 
       const selfClosing = buf.charCodeAt(j - 1) === 47 /* / */
@@ -408,13 +535,22 @@ function processSaxBuffer(buf: string, handlers: SaxHandlers, final: boolean): s
     while (i < len && buf.charCodeAt(i) !== 60 /* < */) i++
 
     if (i >= len && !final) {
-      // Text might continue in next chunk — hold it
+      // Text might continue in the next chunk — hold it. A run longer than
+      // SAX_TEXT_FLUSH_CHARS would be re-copied on every chunk from here on
+      // (quadratic), so flush what is safe to emit and keep only the tail.
+      if (len - textStart > SAX_TEXT_FLUSH_CHARS) {
+        const cut = safeTextSplit(buf, textStart, len)
+        if (cut > textStart) {
+          handlers.onText?.(decodeEntities(normalizeEol(buf.slice(textStart, cut))))
+          return buf.slice(cut)
+        }
+      }
       return buf.slice(textStart)
     }
 
     const rawText = buf.slice(textStart, i)
     if (rawText) {
-      const decoded = decodeEntities(rawText)
+      const decoded = decodeEntities(normalizeEol(rawText))
       handlers.onText?.(decoded)
     }
   }

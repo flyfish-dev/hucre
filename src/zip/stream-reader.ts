@@ -16,9 +16,11 @@
 // recover the bytes consumed so far via {@link ZipStreamReader.drainToBuffer}
 // and fall back to the random-access {@link ZipReader}.
 
+import { byteLimitStream, STREAM_CHUNK_BYTES } from "./byte-limit"
 import { inflate } from "./deflate"
-import { ZipError } from "../errors"
-import { MAX_DECOMPRESSED_BYTES } from "../limits"
+import { ParseError, ZipError } from "../errors"
+import { MAX_DECOMPRESSED_BYTES, MAX_INPUT_BYTES } from "../limits"
+import { canInflateRaw } from "./capability"
 
 const SIG_LOCAL_FILE = 0x04034b50
 const SIG_CENTRAL_DIR = 0x02014b50
@@ -26,21 +28,6 @@ const ZIP64_SENTINEL = 0xffffffff
 const FLAG_DATA_DESCRIPTOR = 0x0008
 
 const EMPTY = new Uint8Array(0)
-
-let hasDecompressionStream: boolean | undefined
-function checkDecompressionStream(): boolean {
-  if (hasDecompressionStream === undefined) {
-    try {
-      hasDecompressionStream =
-        typeof DecompressionStream !== "undefined" &&
-        typeof ReadableStream !== "undefined" &&
-        typeof Response !== "undefined"
-    } catch {
-      hasDecompressionStream = false
-    }
-  }
-  return hasDecompressionStream
-}
 
 /** One local-file-header record surfaced by {@link ZipStreamReader.nextEntry}. */
 export interface ZipStreamEntry {
@@ -222,15 +209,30 @@ export class ZipStreamReader {
       },
     })
     if (entry.compressionMethod === 0) return raw
-    if (checkDecompressionStream()) {
-      return raw.pipeThrough(
-        new DecompressionStream("deflate-raw") as unknown as ReadableWritablePair<
-          Uint8Array,
-          Uint8Array
-        >,
-      ) as ReadableStream<Uint8Array>
+    // Same ceiling on both branches: the declared uncompressed size when the
+    // header states one, the absolute cap otherwise. The native path used to
+    // enforce neither, so a bomb streamed out unbounded.
+    const cap =
+      entry.uncompressedSize > 0
+        ? Math.min(entry.uncompressedSize, MAX_DECOMPRESSED_BYTES)
+        : MAX_DECOMPRESSED_BYTES
+    if (canInflateRaw()) {
+      return (
+        raw.pipeThrough(
+          new DecompressionStream("deflate-raw") as unknown as ReadableWritablePair<
+            Uint8Array,
+            Uint8Array
+          >,
+        ) as ReadableStream<Uint8Array>
+      ).pipeThrough(byteLimitStream(cap))
     }
     // No DecompressionStream — buffer the compressed body and inflate once.
+    // The result is handed on in pieces rather than as one enqueue: a
+    // consumer that accumulates what it is given (`parseSaxStream` does
+    // `buf += decoder.decode(chunk)`) would otherwise rebuild the very
+    // string the streaming path exists to avoid, and this is the branch
+    // the Deno/browser/Workers claims rest on. Same reason as the twin
+    // paths in `reader.ts`. See #503.
     return new ReadableStream<Uint8Array>({
       async start(controller) {
         const chunks: Uint8Array[] = []
@@ -240,11 +242,12 @@ export class ZipStreamReader {
           if (done) break
           if (value) chunks.push(value)
         }
-        const cap =
-          entry.uncompressedSize > 0
-            ? Math.min(entry.uncompressedSize, MAX_DECOMPRESSED_BYTES)
-            : MAX_DECOMPRESSED_BYTES
-        controller.enqueue(inflate(concat(chunks), cap))
+        const inflated = inflate(concat(chunks), cap)
+        for (let at = 0; at < inflated.length; at += STREAM_CHUNK_BYTES) {
+          controller.enqueue(
+            inflated.subarray(at, Math.min(at + STREAM_CHUNK_BYTES, inflated.length)),
+          )
+        }
         controller.close()
       },
     })
@@ -255,26 +258,54 @@ export class ZipStreamReader {
    * rest of the source) so the caller can fall back to a random-access
    * reader. Only valid while the fallback log is intact (before
    * {@link entryStream} has been called).
+   *
+   * Buffering is bounded by `maxBytes` (default {@link MAX_INPUT_BYTES}):
+   * this is the one place the streaming reader gives up on streaming and
+   * holds the whole archive, so it needs the same ceiling as the buffered
+   * entry points.
    */
-  async drainToBuffer(): Promise<Uint8Array> {
+  async drainToBuffer(maxBytes: number = MAX_INPUT_BYTES): Promise<Uint8Array> {
     if (!this.fallbackLog) {
       throw new ZipError("ZipStreamReader: cannot fall back after streaming started")
     }
+    const cap = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : MAX_INPUT_BYTES
     const chunks = this.fallbackLog
     this.fallbackLog = null
+    let total = 0
+    for (const c of chunks) total += c.length
     // Pull whatever remains from the source (stop logging — we own `chunks`).
     for (;;) {
       const { value, done } = await this.reader.read()
       if (done) break
-      if (value) chunks.push(value)
+      if (value) {
+        total += value.length
+        if (total > cap) {
+          throw new ParseError(
+            `Input stream exceeds the maximum of ${cap} bytes. ` +
+              "Raise `maxInputBytes` if the file really is this large.",
+          )
+        }
+        chunks.push(value)
+      }
     }
     return concat(chunks)
   }
 
-  /** Release the underlying reader lock. */
+  /**
+   * Cancel the source and release the underlying reader lock. Safe to call
+   * more than once, and on an already-exhausted stream. Callers must invoke
+   * it when they abandon the reader (an error mid-parse, most commonly),
+   * otherwise the source stays locked and whatever backs it — a socket, a
+   * file handle — is never released.
+   */
   async close(): Promise<void> {
     try {
       await this.reader.cancel()
+    } catch {
+      // ignore
+    }
+    try {
+      this.reader.releaseLock()
     } catch {
       // ignore
     }

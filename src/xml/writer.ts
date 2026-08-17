@@ -30,8 +30,30 @@ function isIllegalXmlChar(code: number): boolean {
   )
 }
 
+/**
+ * How a carriage return is spelled in text content.
+ *
+ * A literal CR does not survive a parse: XML 1.0 §2.11 folds CR and CRLF
+ * to LF before the application ever sees them, so carrying one takes an
+ * escape. There are two, and they belong to different formats:
+ *
+ * - `"ooxml"` — `_x000D_`, Excel's convention. Correct for XLSX, where
+ *   the reader decodes it back. **Meaningless in any other format**: to
+ *   a consumer that does not know the convention it is seven literal
+ *   characters, which is what LibreOffice showed when the ODS writer
+ *   inherited this spelling.
+ * - `"charRef"` — `&#13;`, which is simply XML. A character reference is
+ *   not subject to §2.11 (that covers literal CR in the source), so it
+ *   survives a conforming parse anywhere.
+ *
+ * `"charRef"` is the right answer for everything except OOXML, and is
+ * only not the default because XLSX is the larger caller and Excel
+ * expects its own spelling.
+ */
+export type CrSpelling = "ooxml" | "charRef"
+
 /** Escape text content for safe embedding in XML */
-export function xmlEscape(text: string): string {
+export function xmlEscape(text: string, cr: CrSpelling = "ooxml"): string {
   let result = ""
   let last = 0
 
@@ -49,7 +71,7 @@ export function xmlEscape(text: string): string {
         replacement = "&gt;"
         break
       case 13: // CR — encode so it round-trips through XML newline normalization
-        replacement = xEscape(13)
+        replacement = cr === "charRef" ? "&#13;" : xEscape(13)
         break
       default:
         // Strip/encode XML-1.0-illegal control chars so output is always
@@ -154,6 +176,30 @@ function serializeAttrs(attrs: Record<string, AttrValue> | undefined): string {
 /** Build a self-closing XML element string */
 export function xmlSelfClose(tag: string, attrs?: Record<string, AttrValue>): string {
   return `<${tag}${serializeAttrs(attrs)}/>`
+}
+
+/**
+ * Build an OOXML `<t>` element, declaring `xml:space="preserve"` when the
+ * text has whitespace an XML consumer is entitled to collapse.
+ *
+ * Every `<t>` in the package has to make this decision — shared strings,
+ * inline strings, and each rich-text run — and the check used to be
+ * copy-pasted at each site. The inline-string branch of the worksheet
+ * writer was the copy that never got it, so `writeXlsx` with
+ * `stringMode: "inline"` emitted `<t>  padded  </t>` and Excel trimmed
+ * the padding. One function, so there is nothing left to forget.
+ */
+export function xmlTextElement(value: string): string {
+  const escaped = xmlEscape(value)
+  const needsPreserve =
+    value.length > 0 &&
+    (value[0] === " " ||
+      value[value.length - 1] === " " ||
+      value.includes("\n") ||
+      value.includes("\t"))
+  return needsPreserve
+    ? `<t xml:space="preserve">${escaped}</t>`
+    : xmlElement("t", undefined, escaped)
 }
 
 /** Build an XML element string with optional children */

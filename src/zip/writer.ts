@@ -3,6 +3,8 @@
 // Supports STORE (method 0) and DEFLATE (method 8).
 
 import { crc32, deflate } from "./deflate"
+import { canDeflateRaw } from "./capability"
+import { ZipError } from "../errors"
 
 // ── ZIP Signatures ──────────────────────────────────────────────────
 
@@ -12,24 +14,8 @@ const SIG_END_OF_CENTRAL_DIR = 0x06054b50
 
 // ── Compression ─────────────────────────────────────────────────────
 
-let hasCompressionStream: boolean | undefined
-
-function checkCompressionStream(): boolean {
-  if (hasCompressionStream === undefined) {
-    try {
-      hasCompressionStream =
-        typeof CompressionStream !== "undefined" &&
-        typeof ReadableStream !== "undefined" &&
-        typeof Response !== "undefined"
-    } catch {
-      hasCompressionStream = false
-    }
-  }
-  return hasCompressionStream
-}
-
 async function compressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
-  if (checkCompressionStream()) {
+  if (canDeflateRaw()) {
     try {
       const cs = new CompressionStream("deflate-raw")
       const writer = cs.writable.getWriter()
@@ -75,9 +61,18 @@ interface PendingEntry {
 
 export class ZipWriter {
   private entries: PendingEntry[] = []
+  private paths = new Set<string>()
 
   /** Add a file entry to the archive */
   add(path: string, data: Uint8Array, options?: { compress?: boolean }): void {
+    // An OOXML package with two parts of one name is a file Excel refuses
+    // to open, and `extract` would quietly hand back whichever came last.
+    // The streaming writer has always refused this; the buffered one
+    // accepted it silently. See #439 §AY.
+    if (this.paths.has(path)) {
+      throw new ZipError(`Duplicate ZIP entry: "${path}"`)
+    }
+    this.paths.add(path)
     const compress = options?.compress ?? true
     this.entries.push({ path, data, compress })
   }

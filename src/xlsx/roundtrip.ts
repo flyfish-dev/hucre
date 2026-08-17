@@ -1,17 +1,9 @@
 // ── XLSX Round-Trip Preservation ─────────────────────────────────────
 // Read an XLSX file, modify cells, write it back without losing charts,
-// images, macros, shapes, or other features that defter doesn't natively
+// images, macros, shapes, or other features that hucre doesn't natively
 // understand.
 
-import type {
-  Sheet,
-  Workbook,
-  ReadOptions,
-  WriteSheet,
-  NamedRange,
-  Chart,
-  SheetChart,
-} from "../_types"
+import type { Sheet, Workbook, ReadOptions, WriteSheet, Chart, SheetChart } from "../_types"
 import { readXlsx } from "./reader"
 import { ZipReader } from "../zip/reader"
 import { ZipWriter } from "../zip/writer"
@@ -27,32 +19,61 @@ import {
 import { parseRelationships } from "./relationships"
 import { createStylesCollector } from "./styles-writer"
 import { createSharedStrings, writeSharedStringsXml, writeWorksheetXml } from "./worksheet-writer"
+import {
+  FEATURE_PROPERTY_BAG_PART_PATH,
+  FPB_PART_PATH,
+  writeFeaturePropertyBagXml,
+} from "./feature-property-bag"
+import { METADATA_PART_PATH, writeMetadataXml } from "./metadata"
 import type { WorksheetResult } from "./worksheet-writer"
 import { writeDrawing } from "./drawing-writer"
 import type { DrawingResult } from "./drawing-writer"
 import { writeChart } from "./chart-writer"
 import { cloneChart } from "./chart-clone"
 import { isOle2Container } from "../_input"
-import { EncryptedFileError } from "../errors"
+import { EncryptedFileError, InvalidArgumentError } from "../errors"
 import { decryptAgile, encryptAgile } from "./crypto/agile"
+import { assignBackgroundImagePaths } from "./background-image"
 import { writeComments } from "./comments-writer"
 import type { CommentsResult } from "./comments-writer"
 import { writeTable } from "./table-writer"
-import { colToLetter } from "./worksheet-writer"
+import { buildNamedRanges, computeTableRange } from "./derived-ranges"
 import { xmlDocument, xmlSelfClose } from "../xml/writer"
 import { writeCoreProperties, writeAppProperties } from "./doc-props-writer"
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export interface RoundtripWorkbook extends Workbook {
+/**
+ * Everything `saveXlsx` needs from the original file in order to re-emit
+ * the parts this library does not model. Deliberately **not** part of the
+ * public surface: it is reachable only through the opaque
+ * {@link ROUNDTRIP_STATE} key, so the preservation strategy can change
+ * without a breaking release.
+ *
+ * @internal
+ */
+export interface RoundtripState {
   /** Raw ZIP entries from the original file (for preservation) */
-  _rawEntries: Map<string, Uint8Array>
+  rawEntries: Map<string, Uint8Array>
   /** Paths of parts that were modified and need regeneration */
-  _modifiedParts: Set<string>
+  modifiedParts: Set<string>
   /** Original content types XML */
-  _contentTypes: string
+  contentTypes: string
   /** Original root rels XML */
-  _rootRels: string
+  rootRels: string
+}
+
+/**
+ * Opaque key under which {@link openXlsx} stashes the preservation state on
+ * the workbook it returns. A symbol, and defined non-enumerably, so the
+ * state never shows up in `Object.keys`, `JSON.stringify`, or a spread —
+ * consumers cannot accidentally grow a dependency on its shape.
+ *
+ * @internal
+ */
+export const ROUNDTRIP_STATE: unique symbol = Symbol("hucre.xlsx.roundtripState")
+
+export interface RoundtripWorkbook extends Workbook {
   /**
    * Whether the workbook contains VBA macros (xl/vbaProject.bin).
    * When true, saveXlsx uses XLSM content types
@@ -60,6 +81,28 @@ export interface RoundtripWorkbook extends Workbook {
    * The output should be saved with an `.xlsm` extension.
    */
   hasMacros?: boolean
+  /**
+   * Internal preservation state. Opaque by design — read or write it and
+   * your code breaks on the next patch release.
+   *
+   * @internal
+   */
+  readonly [ROUNDTRIP_STATE]: RoundtripState
+}
+
+/**
+ * Read the preservation state off a workbook produced by {@link openXlsx}.
+ *
+ * @internal
+ */
+function roundtripState(workbook: RoundtripWorkbook): RoundtripState {
+  const state = workbook[ROUNDTRIP_STATE]
+  if (!state) {
+    throw new InvalidArgumentError(
+      "saveXlsx expects a workbook returned by openXlsx — this one carries no round-trip state. Use writeXlsx to write a plain Workbook.",
+    )
+  }
+  return state
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -74,6 +117,7 @@ const REL_COMMENTS = "http://schemas.openxmlformats.org/officeDocument/2006/rela
 const REL_VML_DRAWING =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing"
 const REL_TABLE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table"
+const REL_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
 const REL_SLICER = "http://schemas.microsoft.com/office/2007/relationships/slicer"
 const REL_TIMELINE = "http://schemas.microsoft.com/office/2011/relationships/timeline"
 const REL_THREADED_COMMENT =
@@ -82,7 +126,7 @@ const REL_PIVOT_TABLE =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable"
 
 /**
- * Parts that defter regenerates from parsed data.
+ * Parts that hucre regenerates from parsed data.
  * Matched case-insensitively with normalized paths.
  */
 const REGENERATED_PREFIXES = [
@@ -127,7 +171,7 @@ export async function openXlsx(
   // the raw-entry capture below see the plaintext OOXML ZIP.
   if (isOle2Container(data)) {
     if (options?.password) {
-      data = await decryptAgile(data, options.password)
+      data = await decryptAgile(data, options.password, options.maxSpinCount)
     } else {
       throw new EncryptedFileError("xlsx")
     }
@@ -137,7 +181,7 @@ export async function openXlsx(
   const workbook = await readXlsx(data, options)
 
   // 2. Extract ALL raw ZIP entries
-  const zip = new ZipReader(data)
+  const zip = new ZipReader(data, options?.maxDecompressedBytes)
   const rawEntries = await zip.extractAll()
 
   // 3. Read content types and root rels for preservation
@@ -150,15 +194,23 @@ export async function openXlsx(
   // 4. Detect VBA macros
   const hasMacros = rawEntries.has("xl/vbaProject.bin")
 
-  // 5. Build RoundtripWorkbook
-  const rtWorkbook: RoundtripWorkbook = {
-    ...workbook,
-    _rawEntries: rawEntries,
-    _modifiedParts: new Set<string>(),
-    _contentTypes: contentTypes,
-    _rootRels: rootRels,
-    hasMacros,
+  // 5. Build RoundtripWorkbook. The preservation state is attached under a
+  //    non-enumerable symbol so it survives `saveXlsx` without becoming a
+  //    frozen part of the public shape.
+  const rtWorkbook = { ...workbook, hasMacros } as RoundtripWorkbook
+
+  const state: RoundtripState = {
+    rawEntries,
+    modifiedParts: new Set<string>(),
+    contentTypes,
+    rootRels,
   }
+  Object.defineProperty(rtWorkbook, ROUNDTRIP_STATE, {
+    value: state,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  })
 
   return rtWorkbook
 }
@@ -175,6 +227,7 @@ export async function saveXlsx(
   saveOptions?: { encryption?: { password: string; spinCount?: number } },
 ): Promise<Uint8Array> {
   const { sheets, properties, namedRanges, dateSystem, defaultFont, activeSheet } = workbook
+  const { rawEntries } = roundtripState(workbook)
 
   // Convert Sheet[] to WriteSheet[] for the writer infrastructure
   const writeSheets: WriteSheet[] = sheets.map((sheet) => ({
@@ -197,6 +250,21 @@ export async function saveXlsx(
     tables: sheet.tables,
     sheetFormat: sheet.sheetFormat,
     rowDefs: sheet.rowDefs,
+    // Everything below is read by the reader and understood by the
+    // writer, and was simply missing from this map — so opening a
+    // workbook and saving it back destroyed it. See #359.
+    splitPane: sheet.splitPane,
+    rowBreaks: sheet.rowBreaks,
+    colBreaks: sheet.colBreaks,
+    outlineProperties: sheet.outlineProperties,
+    sparklines: sheet.sparklines,
+    textBoxes: sheet.textBoxes,
+    backgroundImage: sheet.backgroundImage,
+    // `threadedComments`, `pivotTables`, `charts` and `a11y` are absent on
+    // purpose: the writer cannot author them, so they survive this path by
+    // raw-part preservation instead. `WriteSheet` no longer declares a
+    // `threadedComments` field at all, which is what stops someone adding
+    // a line here and assuming it does something — see #404.
   }))
 
   // Create shared collectors
@@ -230,28 +298,58 @@ export async function saveXlsx(
   }
 
   const hasSharedStrings = sharedStrings.count() > 0
+  // Any cell written with `cm` needs xl/metadata.xml alongside it. When
+  // the opened package already carried one we drop those bytes and emit
+  // ours instead: the indexes on the cells are ours (always 1), so the
+  // records they resolve against have to be too — and two entries for
+  // the same path would be a corrupt archive. See #423.
+  const hasMetadata = worksheetResults.some((r) => r.hasDynamicArray)
 
   // Generate drawing data for sheets that have images
   const drawingResults: Array<DrawingResult | null> = []
   const drawingIndices: number[] = []
   const imageExtensions = new Set<string>()
+  // Where each sheet's images started in the global media numbering. The
+  // chart pass below rebuilds some of these drawings and has to hand
+  // `writeDrawing` the same start index, or the second pass would number
+  // the media parts differently from the ones actually written. See #465.
+  const imageStartIndices: number[] = []
   let globalImageIndex = 1
 
   for (let i = 0; i < writeSheets.length; i++) {
     const sheet = writeSheets[i]
-    if (sheet.images && sheet.images.length > 0) {
-      const result = writeDrawing(sheet.images, globalImageIndex)
+    const images = sheet.images ?? []
+    const hasTextBoxes = sheet.textBoxes !== undefined && sheet.textBoxes.length > 0
+    imageStartIndices.push(globalImageIndex)
+    // A drawing part hosts images *and* text boxes. Gating on images
+    // alone meant a text-box-only sheet produced no drawing, and a sheet
+    // with both produced one that silently dropped the text boxes —
+    // writer.ts has always handled both. See #359.
+    if (images.length > 0 || hasTextBoxes) {
+      const result = writeDrawing(images, globalImageIndex, sheet.textBoxes)
       drawingResults.push(result)
       drawingIndices.push(i + 1)
       for (const img of result.images) {
         const ext = img.path.split(".").pop()
         if (ext) imageExtensions.add(ext)
       }
-      globalImageIndex += sheet.images.length
+      globalImageIndex += images.length
     } else {
       drawingResults.push(null)
     }
   }
+
+  // Background images live in xl/media alongside drawing images, so the
+  // index has to come from the same counter — numbering them
+  // independently would collide. Shared with writer.ts rather than
+  // mirrored: two copies is how both ended up hard-coding .png for every
+  // image, whatever it was. See #367, #427.
+  const { paths: backgroundImagePaths, nextIndex: afterBackgrounds } = assignBackgroundImagePaths(
+    writeSheets,
+    globalImageIndex,
+    imageExtensions,
+  )
+  globalImageIndex = afterBackgrounds
 
   // Generate comments data for sheets that have comments
   const commentsResults: Array<CommentsResult | null> = []
@@ -328,16 +426,16 @@ export async function saveXlsx(
   const threadedCommentSheetIndices: number[] = []
   for (let i = 0; i < worksheetResults.length; i++) {
     const probe = `xl/threadedComments/threadedComment${i + 1}.xml`
-    if (workbook._rawEntries.has(probe)) threadedCommentSheetIndices.push(i + 1)
+    if (rawEntries.has(probe)) threadedCommentSheetIndices.push(i + 1)
   }
-  const hasPersons = workbook._rawEntries.has("xl/persons/person.xml")
+  const hasPersons = rawEntries.has("xl/persons/person.xml")
 
   // Collect external link parts that survived in the raw entries.
   // Roundtrip preserves the externalLinkN.xml bodies and their _rels;
   // the workbook.xml + workbook.xml.rels are regenerated and need to
   // re-declare each link so Excel keeps the references.
   const externalLinkIndices: number[] = []
-  for (const path of workbook._rawEntries.keys()) {
+  for (const path of rawEntries.keys()) {
     const m = path.match(/^xl\/externalLinks\/externalLink(\d+)\.xml$/i)
     if (m) externalLinkIndices.push(parseInt(m[1], 10))
   }
@@ -360,7 +458,7 @@ export async function saveXlsx(
   // workbook (xl/slicers/slicer3.xml may belong to sheet2, etc.).
   const slicerIndices: number[] = []
   const timelineIndices: number[] = []
-  for (const path of workbook._rawEntries.keys()) {
+  for (const path of rawEntries.keys()) {
     let m = path.match(/^xl\/pivotCache\/pivotCacheDefinition(\d+)\.xml$/i)
     if (m) {
       pivotCacheDefinitionIndices.push(parseInt(m[1], 10))
@@ -404,7 +502,7 @@ export async function saveXlsx(
 
   // Detect WPS-style cell-images registry. The XML body and its rels
   // sit at xl/cellimages.xml and xl/_rels/cellimages.xml.rels — both
-  // survive in `_rawEntries`, but the workbook.xml.rels is regenerated
+  // survive in the preserved raw entries, but the workbook.xml.rels is regenerated
   // and must re-declare the relationship so Excel/WPS still resolve
   // `=_xlfn.DISPIMG("<id>", 1)` formulas.
   //
@@ -412,8 +510,8 @@ export async function saveXlsx(
   // those paths would normally be filtered out as "regenerated" because
   // sheet drawings re-emit them, so we collect the explicit paths here
   // and preserve them later.
-  const hasCellImages = workbook._rawEntries.has("xl/cellimages.xml")
-  const cellImageMediaPaths = collectCellImageMediaPaths(workbook._rawEntries)
+  const hasCellImages = rawEntries.has("xl/cellimages.xml")
+  const cellImageMediaPaths = collectCellImageMediaPaths(rawEntries)
 
   // rIds for external link relationships: assigned after all
   // sheet/styles/sharedStrings/theme/macros/featurePropertyBag/persons rIds.
@@ -423,6 +521,7 @@ export async function saveXlsx(
     !!workbook.hasMacros,
     false, // featurePropertyBag — not yet roundtripped
     hasPersons,
+    hasMetadata,
   )
   const externalLinkRels = externalLinkIndices.map((idx) => ({
     rId: `rId${nextWorkbookRelId++}`,
@@ -464,13 +563,13 @@ export async function saveXlsx(
   // sheet's original rels (xl/worksheets/_rels/sheetN.xml.rels) so the
   // regenerated rels can re-declare them. We only need the (sheetIndex
   // → list of {target}) mapping; rIds are reassigned per sheet below.
-  const sheetSlicerTargets = collectSheetCacheTargets(workbook, sheets, "slicer")
-  const sheetTimelineTargets = collectSheetCacheTargets(workbook, sheets, "timeline")
+  const sheetSlicerTargets = collectSheetCacheTargets(rawEntries, sheets, "slicer")
+  const sheetTimelineTargets = collectSheetCacheTargets(rawEntries, sheets, "timeline")
 
   // Map each pivot table to the sheet that hosts it. The mapping is
   // recovered by walking each sheet's original _rels file — that's
   // where Excel stored the pivotTable -> sheet wiring originally.
-  const sheetPivotTableTargets = collectSheetPivotTableTargets(workbook, sheets)
+  const sheetPivotTableTargets = collectSheetPivotTableTargets(rawEntries, sheets)
 
   // ── Chart preservation ─────────────────────────────────────────
   // Detect chart parts that survived in the raw entries. We need to:
@@ -482,14 +581,14 @@ export async function saveXlsx(
   //      and Excel drops the chart on next open.
   //
   // For sheets that hucre *does* regenerate (because the sheet has
-  // hucre-managed images), the chart graphicFrame inside the drawing
-  // is currently rebuilt without the chart anchor; that's a Phase 2
-  // limitation — for now we still preserve the chart bodies so a
-  // future merge step can re-anchor them.
+  // hucre-managed images), the charts are re-authored from the model
+  // into that same drawing by the model-chart pass below, anchors and
+  // all — see #465. Preserving the original bodies here still matters
+  // for every sheet hucre leaves alone.
   const chartIndices: number[] = []
   const chartStyleIndices: number[] = []
   const chartColorsIndices: number[] = []
-  for (const path of workbook._rawEntries.keys()) {
+  for (const path of rawEntries.keys()) {
     let m = path.match(/^xl\/charts\/chart(\d+)\.xml$/i)
     if (m) {
       chartIndices.push(parseInt(m[1], 10))
@@ -533,7 +632,7 @@ export async function saveXlsx(
     }
     // First pass: discover which drawing files have chart references.
     const chartDrawingNumbers = new Set<number>()
-    for (const [path, data] of workbook._rawEntries) {
+    for (const [path, data] of rawEntries) {
       const m = path.match(/^xl\/drawings\/drawing(\d+)\.xml$/i)
       if (!m) continue
       const drawingNum = parseInt(m[1], 10)
@@ -543,7 +642,7 @@ export async function saveXlsx(
       preservedDrawingPaths.add(path.toLowerCase())
       preservedDrawingNumbers.push(drawingNum)
       const relsPath = `xl/drawings/_rels/drawing${drawingNum}.xml.rels`
-      if (workbook._rawEntries.has(relsPath)) {
+      if (rawEntries.has(relsPath)) {
         preservedDrawingPaths.add(relsPath.toLowerCase())
       }
     }
@@ -555,7 +654,7 @@ export async function saveXlsx(
       for (let i = 0; i < sheets.length; i++) {
         const expected = `xl/worksheets/_rels/sheet${i + 1}.xml.rels`
         let bytes: Uint8Array | undefined
-        for (const [p, d] of workbook._rawEntries) {
+        for (const [p, d] of rawEntries) {
           if (p.toLowerCase() === expected) {
             bytes = d
             break
@@ -583,14 +682,18 @@ export async function saveXlsx(
   // charts appended to a workbook after openXlsx — are serialized here
   // through the same drawing + chart pipeline the fresh writer uses.
   //
-  // SAFETY: we only emit model charts for a sheet that has NO drawing of
-  // its own already in play — no hucre-regenerated image drawing
-  // (`drawingResults[i]`), no preserved original chart drawing
-  // (`sheetPreservedDrawingTargets[i]`), and no other original drawing
-  // relationship. That keeps this purely additive: it never rewrites or
-  // collides with a drawing the roundtrip is already preserving. Adding
-  // a chart to a sheet that already owns a drawing is out of scope for
-  // the roundtrip path — use the fresh writeXlsx path for that.
+  // SAFETY: we never touch a drawing the roundtrip is *preserving* —
+  // a preserved original chart drawing (`sheetPreservedDrawingTargets[i]`)
+  // or any other original drawing relationship is left exactly alone, so
+  // this can neither rewrite nor collide with foreign XML.
+  //
+  // A drawing hucre itself regenerated this run (`drawingResults[i]`, for
+  // images and text boxes) is different: hucre owns every byte of it, so
+  // the charts are folded into that same drawing rather than skipped.
+  // Skipping was the old behaviour and it lost the chart outright — a
+  // sheet with both an image and a chart came back with the image and no
+  // chart at all, because the worksheet carries one `<drawing>` element
+  // and the regenerated one had no graphicFrame in it. See #465.
   type ChartFileEntry = { globalIndex: number; xml: string; rels: string }
   interface ModelChartDrawing {
     drawing: DrawingResult
@@ -598,11 +701,13 @@ export async function saveXlsx(
     charts: ChartFileEntry[]
   }
   const modelChartDrawings: Array<ModelChartDrawing | null> = sheets.map(() => null)
+  /** Chart bodies folded into a sheet's regenerated *image* drawing (#465). */
+  const imageDrawingCharts: Array<ChartFileEntry[]> = sheets.map(() => [])
   const newModelChartIndices: number[] = []
   {
     const sheetHasOriginalDrawingRel = (i: number): boolean => {
       const expected = `xl/worksheets/_rels/sheet${i + 1}.xml.rels`
-      for (const [p, d] of workbook._rawEntries) {
+      for (const [p, d] of rawEntries) {
         if (p.toLowerCase() !== expected) continue
         return parseRelationships(new TextDecoder("utf-8").decode(d)).some((r) =>
           r.type.endsWith("/relationships/drawing"),
@@ -614,7 +719,7 @@ export async function saveXlsx(
     // Allocate drawing / chart numbers past anything already used so the
     // new parts never collide with a preserved or regenerated drawing.
     const usedDrawingNumbers = new Set<number>(preservedDrawingNumbers)
-    for (const path of workbook._rawEntries.keys()) {
+    for (const path of rawEntries.keys()) {
       const m = path.match(/^xl\/drawings\/drawing(\d+)\.xml$/i)
       if (m) usedDrawingNumbers.add(parseInt(m[1], 10))
     }
@@ -627,16 +732,18 @@ export async function saveXlsx(
     for (let i = 0; i < sheets.length; i++) {
       const srcCharts = sheets[i].charts
       if (!srcCharts || srcCharts.length === 0) continue
-      // Skip sheets that already own a drawing — see SAFETY note above.
-      if (drawingResults[i]) continue
-      if (sheetPreservedDrawingTargets[i] !== undefined) continue
-      if (sheetHasOriginalDrawingRel(i)) continue
+      // Never touch a drawing we are preserving — see SAFETY note above.
+      // A drawing hucre regenerated this run is ours to extend, and is
+      // handled by the `ownsImageDrawing` branch below.
+      const ownsImageDrawing = drawingResults[i] !== null
+      if (!ownsImageDrawing) {
+        if (sheetPreservedDrawingTargets[i] !== undefined) continue
+        if (sheetHasOriginalDrawingRel(i)) continue
+      }
 
       const writeCharts = toWriteCharts(srcCharts as Array<Chart | SheetChart>)
       if (writeCharts.length === 0) continue
 
-      const drawingNumber = nextDrawingNumber++
-      const drawing = writeDrawing([], globalImageIndex, undefined, writeCharts, nextChartNumber)
       const charts: ChartFileEntry[] = []
       for (let c = 0; c < writeCharts.length; c++) {
         const written = writeChart(writeCharts[c], sheets[i].name)
@@ -644,12 +751,32 @@ export async function saveXlsx(
         charts.push({ globalIndex: g, xml: written.chartXml, rels: written.chartRels })
         newModelChartIndices.push(g)
       }
+
+      if (ownsImageDrawing) {
+        // Rebuild the drawing hucre already produced for this sheet's
+        // images and text boxes, this time with the graphicFrames in it.
+        // Same drawing number (i + 1) and same media start index, so the
+        // worksheet's existing `<drawing>` reference and every image part
+        // this loop already accounted for stay exactly as they were.
+        const sheet = writeSheets[i]
+        drawingResults[i] = writeDrawing(
+          sheet.images ?? [],
+          imageStartIndices[i],
+          sheet.textBoxes,
+          writeCharts,
+          nextChartNumber,
+        )
+        imageDrawingCharts[i] = charts
+      } else {
+        const drawingNumber = nextDrawingNumber++
+        const drawing = writeDrawing([], globalImageIndex, undefined, writeCharts, nextChartNumber)
+        modelChartDrawings[i] = { drawing, drawingNumber, charts }
+        drawingIndices.push(drawingNumber)
+        regeneratedPaths.add(`xl/drawings/drawing${drawingNumber}.xml`)
+        regeneratedPaths.add(`xl/drawings/_rels/drawing${drawingNumber}.xml.rels`)
+      }
       nextChartNumber += writeCharts.length
 
-      modelChartDrawings[i] = { drawing, drawingNumber, charts }
-      drawingIndices.push(drawingNumber)
-      regeneratedPaths.add(`xl/drawings/drawing${drawingNumber}.xml`)
-      regeneratedPaths.add(`xl/drawings/_rels/drawing${drawingNumber}.xml.rels`)
       for (const cf of charts) {
         regeneratedPaths.add(`xl/charts/chart${cf.globalIndex}.xml`)
         regeneratedPaths.add(`xl/charts/_rels/chart${cf.globalIndex}.xml.rels`)
@@ -657,11 +784,16 @@ export async function saveXlsx(
     }
   }
 
+  // Known before the preservation walk because the worksheets were
+  // serialized far above — the walk needs it to skip the opened package's
+  // own copy of the part we are about to emit.
+  const hasFeaturePropertyBag = styles.hasCheckboxFeature()
+
   // Build ZIP archive
   const zip = new ZipWriter()
 
   // 1. Add all preserved raw entries (parts we don't regenerate)
-  for (const [path, data] of workbook._rawEntries) {
+  for (const [path, data] of rawEntries) {
     // Remove calcChain.xml — it becomes stale when formulas change.
     // Excel rebuilds it automatically when opening the file.
     if (path.toLowerCase() === "xl/calcchain.xml") continue
@@ -690,6 +822,20 @@ export async function saveXlsx(
       if (isRegenerated && cellImageMediaPaths.has(lowerPath)) {
         isRegenerated = false
       }
+      // The opened package's own metadata part is replaced, not kept,
+      // whenever we emit ours — see `hasMetadata` above.
+      if (!isRegenerated && hasMetadata && lowerPath === METADATA_PART_PATH) {
+        isRegenerated = true
+      }
+      // Same for the feature property bag, which had no such rule: a
+      // workbook opened with Excel 2024 checkboxes had its bag preserved
+      // *and* re-emitted, so the saved package carried the part twice.
+      // Excel treats a package with two parts of one name as damaged.
+      // `ZipWriter` used to accept the duplicate silently, which is how
+      // this survived — see #439 §AY.
+      if (!isRegenerated && hasFeaturePropertyBag && lowerPath === FEATURE_PROPERTY_BAG_PART_PATH) {
+        isRegenerated = true
+      }
       // Drawings whose only contents are chart graphicFrames don't get
       // re-emitted by hucre's drawing writer; force-preserve them so
       // the chart references survive intact.
@@ -711,6 +857,9 @@ export async function saveXlsx(
   // Excel doesn't see the preserved bytes as orphan.
   const allDrawingIndices = mergeSortedUnique(drawingIndices, preservedDrawingNumbers)
   const allChartIndices = mergeSortedUnique(chartIndices, newModelChartIndices)
+  // Worksheets are already serialized by this point, so the collector
+  // knows whether any cell asked for a checkbox xf. Previously hardcoded
+  // false, which dropped Excel 2024 checkboxes on every round trip (#359).
   const ctOpts: ContentTypesOptions = {
     sheetCount: writeSheets.length,
     hasSharedStrings,
@@ -738,6 +887,8 @@ export async function saveXlsx(
     hasCoreProps: true,
     hasAppProps: true,
     hasMacros: workbook.hasMacros,
+    hasFeaturePropertyBag,
+    hasMetadata,
   }
   zip.add("[Content_Types].xml", encoder.encode(writeContentTypes(ctOpts)))
 
@@ -758,7 +909,10 @@ export async function saveXlsx(
         allNamedRanges.length > 0 ? allNamedRanges : undefined,
         dateSystem,
         activeSheet,
-        undefined,
+        // The reader populates this; passing undefined here silently
+        // unlocked every structurally-protected workbook that went
+        // through open → save. See #359.
+        workbook.workbookProtection,
         externalLinkRels.length > 0 ? externalLinkRels : undefined,
         pivotCacheRefs.length > 0 ? pivotCacheRefs : undefined,
         slicerCacheRels.length > 0 ? slicerCacheRels : undefined,
@@ -775,19 +929,32 @@ export async function saveXlsx(
         writeSheets.length,
         hasSharedStrings,
         workbook.hasMacros,
-        false, // hasFeaturePropertyBag — not yet roundtripped
+        hasFeaturePropertyBag,
         hasPersons,
         externalLinkRels.length > 0 ? externalLinkRels : undefined,
         pivotCacheRels.length > 0 ? pivotCacheRels : undefined,
         slicerCacheRels.length > 0 ? slicerCacheRels : undefined,
         timelineCacheRels.length > 0 ? timelineCacheRels : undefined,
         hasCellImages,
+        hasMetadata,
       ),
     ),
   )
 
   // xl/styles.xml
   zip.add("xl/styles.xml", encoder.encode(styles.toXml()))
+
+  // xl/metadata.xml — declared above, so the part has to exist. Any
+  // copy the opened package carried was skipped during preservation.
+  if (hasMetadata) {
+    zip.add(METADATA_PART_PATH, encoder.encode(writeMetadataXml()))
+  }
+
+  // xl/featurePropertyBag/featurePropertyBag.xml — declared above, so
+  // the part has to exist.
+  if (hasFeaturePropertyBag) {
+    zip.add(FPB_PART_PATH, encoder.encode(writeFeaturePropertyBagXml()))
+  }
 
   // xl/sharedStrings.xml
   if (hasSharedStrings) {
@@ -825,6 +992,10 @@ export async function saveXlsx(
     // the reference below.
     const modelDrawing = modelChartDrawings[i]
     const hasModelChartDrawing = modelDrawing !== null
+    // The worksheet writer emits <picture r:id> whenever the sheet has a
+    // background image; without the matching relationship and media part
+    // that reference dangles, which Excel reports as corrupt. See #367.
+    const hasPicture = result.pictureRId !== null && backgroundImagePaths[i] !== null
     let worksheetXml = result.xml
 
     if (
@@ -837,7 +1008,8 @@ export async function saveXlsx(
       hasThreadedComments ||
       hasSheetPivotTables ||
       hasPreservedDrawing ||
-      hasModelChartDrawing
+      hasModelChartDrawing ||
+      hasPicture
     ) {
       const relElements: string[] = []
       // Track the highest existing rId so newly added slicer/timeline
@@ -905,6 +1077,21 @@ export async function saveXlsx(
         bumpToAfter(tableEntry.rId)
       }
 
+      // Background image (picture) relationship. The worksheet writer has
+      // already emitted <picture r:id> pointing at this rId. See #367.
+      if (hasPicture && result.pictureRId && backgroundImagePaths[i]) {
+        const bgMediaPath = backgroundImagePaths[i]!
+        relElements.push(
+          xmlSelfClose("Relationship", {
+            Id: result.pictureRId,
+            Type: REL_IMAGE,
+            // "xl/media/imageN.<ext>" → "../media/imageN.<ext>"
+            Target: `../${bgMediaPath.slice(3)}`,
+          }),
+        )
+        bumpToAfter(result.pictureRId)
+      }
+
       // Re-emit slicer relationships read from the original sheet rels.
       // The rIds shift to avoid collisions; they don't need to match the
       // original because hucre regenerates the worksheet body without
@@ -943,7 +1130,7 @@ export async function saveXlsx(
             Target: preservedDrawingTarget,
           }),
         )
-        worksheetXml = injectWorksheetDrawing(worksheetXml, preservedDrawingRId)
+        worksheetXml = insertDrawingElement(worksheetXml, result, preservedDrawingRId)
       }
 
       // Wire up the model-chart drawing (issue #136): emit the drawing
@@ -957,7 +1144,7 @@ export async function saveXlsx(
             Target: `../drawings/drawing${modelDrawing.drawingNumber}.xml`,
           }),
         )
-        worksheetXml = injectWorksheetDrawing(worksheetXml, modelDrawingRId)
+        worksheetXml = insertDrawingElement(worksheetXml, result, modelDrawingRId)
       }
 
       // Threaded comments (Excel 365). The rId only needs to be unique
@@ -995,12 +1182,24 @@ export async function saveXlsx(
     // re-anchor injection above can patch the XML before it's written.
     zip.add(`xl/worksheets/sheet${i + 1}.xml`, encoder.encode(worksheetXml))
 
+    // Background image bytes. Stored uncompressed — PNG/JPEG are already
+    // compressed, so deflating again only costs time.
+    const bgPath = backgroundImagePaths[i]
+    if (hasPicture && bgPath && writeSheets[i]!.backgroundImage) {
+      zip.add(bgPath, writeSheets[i]!.backgroundImage!, { compress: false })
+    }
+
     // Add drawing files
     if (drawing) {
       zip.add(`xl/drawings/drawing${i + 1}.xml`, encoder.encode(drawing.drawingXml))
       zip.add(`xl/drawings/_rels/drawing${i + 1}.xml.rels`, encoder.encode(drawing.drawingRels))
       for (const img of drawing.images) {
         zip.add(img.path, img.data, { compress: false })
+      }
+      // Charts folded into this same drawing (#465).
+      for (const cf of imageDrawingCharts[i]) {
+        zip.add(`xl/charts/chart${cf.globalIndex}.xml`, encoder.encode(cf.xml))
+        zip.add(`xl/charts/_rels/chart${cf.globalIndex}.xml.rels`, encoder.encode(cf.rels))
       }
     }
 
@@ -1091,42 +1290,32 @@ const REL_TYPE_SLICER = /\/relationships\/slicer$/
 const REL_TYPE_TIMELINE = /\/relationships\/timeline$/
 
 /**
- * Insert `<drawing r:id="rIdN"/>` into a worksheet body emitted by the
- * worksheet writer. Per OOXML schema (CT_Worksheet) the element must
- * appear after `cellWatches`/`ignoredErrors`/`smartTags` and before
- * `legacyDrawing` / `legacyDrawingHF` / `picture` / `oleObjects` /
- * `controls` / `webPublishItems` / `tableParts` / `extLst`.
+ * Insert `<drawing r:id="rIdN"/>` into a worksheet body the writer just
+ * produced.
  *
- * The writer never emits a `<drawing>` for chart-only sheets, so we
- * splice one into the regenerated XML at the first valid insertion
- * point. Falls back to inserting just before `</worksheet>` when none
- * of the later-position siblings are present.
+ * Per CT_Worksheet the element must appear after
+ * `cellWatches`/`ignoredErrors`/`smartTags` and before `legacyDrawing`,
+ * `picture`, `oleObjects`, `controls`, `webPublishItems`, `tableParts`
+ * and `extLst`. The writer never emits one for a sheet whose drawing is
+ * *preserved* rather than generated, and the body is serialized before
+ * the rId is known — so one has to go in afterwards.
+ *
+ * This used to find the spot by searching the finished string for
+ * thirteen candidate successor tags and inserting before the first
+ * present, falling back to `</worksheet>`. Safe, because the input is
+ * hucre's own output and cell text is escaped — but it was a heuristic
+ * standing in for something the writer knows exactly. It now says so:
+ * `drawingInsertOffset` is the position, and this is one splice. See
+ * #474.
  */
-function injectWorksheetDrawing(worksheetXml: string, rId: string): string {
-  if (worksheetXml.includes("<drawing ")) return worksheetXml // already present
-  const tag = `<drawing r:id="${rId}"/>`
-  const candidates = [
-    "<legacyDrawing ",
-    "<legacyDrawingHF ",
-    "<picture ",
-    "<oleObjects ",
-    "<oleObjects>",
-    "<controls ",
-    "<controls>",
-    "<webPublishItems ",
-    "<webPublishItems>",
-    "<tableParts ",
-    "<tableParts>",
-    "<extLst ",
-    "<extLst>",
-  ]
-  for (const c of candidates) {
-    const idx = worksheetXml.indexOf(c)
-    if (idx >= 0) return worksheetXml.slice(0, idx) + tag + worksheetXml.slice(idx)
-  }
-  const closeIdx = worksheetXml.lastIndexOf("</worksheet>")
-  if (closeIdx < 0) return worksheetXml
-  return worksheetXml.slice(0, closeIdx) + tag + worksheetXml.slice(closeIdx)
+function insertDrawingElement(worksheetXml: string, result: WorksheetResult, rId: string): string {
+  // A sheet that already has its own drawing is not this function's
+  // business; the caller's guards mean it should never arrive here.
+  if (worksheetXml.includes("<drawing ")) return worksheetXml
+
+  const at = result.drawingInsertOffset
+  if (at < 0 || at > worksheetXml.length) return worksheetXml
+  return `${worksheetXml.slice(0, at)}<drawing r:id="${rId}"/>${worksheetXml.slice(at)}`
 }
 
 /**
@@ -1214,7 +1403,7 @@ function toWriteCharts(charts: Array<Chart | SheetChart>): SheetChart[] {
  * `"../slicers/slicer1.xml"`).
  */
 function collectSheetCacheTargets(
-  workbook: { _rawEntries: Map<string, Uint8Array> },
+  rawEntries: ReadonlyMap<string, Uint8Array>,
   sheets: Sheet[],
   kind: "slicer" | "timeline",
 ): string[][] {
@@ -1227,7 +1416,7 @@ function collectSheetCacheTargets(
     // case — match case-insensitively.
     const expected = `xl/worksheets/_rels/sheet${i + 1}.xml.rels`
     let bytes: Uint8Array | undefined
-    for (const [path, data] of workbook._rawEntries) {
+    for (const [path, data] of rawEntries) {
       if (path.toLowerCase() === expected) {
         bytes = data
         break
@@ -1255,14 +1444,14 @@ function collectSheetCacheTargets(
  * into the regenerated rels.
  */
 function collectSheetPivotTableTargets(
-  workbook: RoundtripWorkbook,
+  rawEntries: ReadonlyMap<string, Uint8Array>,
   sheets: ReadonlyArray<{ name: string }>,
 ): string[][] {
   const decoder = new TextDecoder("utf-8")
   const out: string[][] = sheets.map(() => [])
   for (let i = 0; i < sheets.length; i++) {
     const relsPath = `xl/worksheets/_rels/sheet${i + 1}.xml.rels`
-    const data = workbook._rawEntries.get(relsPath)
+    const data = rawEntries.get(relsPath)
     if (!data) continue
     let rels
     try {
@@ -1284,8 +1473,8 @@ function collectSheetPivotTableTargets(
  * Mirror the `nextRid` counter inside `writeWorkbookRels` to determine
  * the starting rId for external link relationships. Keep this in sync
  * with `writeWorkbookRels` — order is: worksheets, styles, optional
- * sharedStrings, theme, optional vbaProject, optional FeaturePropertyBag,
- * optional persons, then externalLinks.
+ * sharedStrings, theme, optional metadata, optional vbaProject, optional
+ * FeaturePropertyBag, optional persons, then externalLinks.
  */
 function computeExternalLinkRelStart(
   sheetCount: number,
@@ -1293,76 +1482,15 @@ function computeExternalLinkRelStart(
   hasMacros: boolean,
   hasFeaturePropertyBag: boolean,
   hasPersons: boolean,
+  hasMetadata: boolean,
 ): number {
   let next = sheetCount + 1 // worksheets occupy rId1..rId{sheetCount}
   next++ // styles
   if (hasSharedStrings) next++
   next++ // theme
+  if (hasMetadata) next++
   if (hasMacros) next++
   if (hasFeaturePropertyBag) next++
   if (hasPersons) next++
   return next
-}
-
-/**
- * Build the full list of named ranges, merging user-defined ranges with
- * auto-generated _xlnm.Print_Area and _xlnm.Print_Titles from sheet pageSetup.
- */
-function buildNamedRanges(sheets: WriteSheet[], userRanges?: NamedRange[]): NamedRange[] {
-  const result: NamedRange[] = userRanges ? [...userRanges] : []
-
-  for (const sheet of sheets) {
-    const ps = sheet.pageSetup
-    if (!ps) continue
-
-    if (ps.printArea) {
-      result.push({
-        name: "_xlnm.Print_Area",
-        range: `${sheet.name}!${ps.printArea}`,
-        scope: sheet.name,
-      })
-    }
-
-    const titleParts: string[] = []
-    if (ps.printTitlesRow) {
-      titleParts.push(`${sheet.name}!${ps.printTitlesRow}`)
-    }
-    if (ps.printTitlesColumn) {
-      titleParts.push(`${sheet.name}!${ps.printTitlesColumn}`)
-    }
-    if (titleParts.length > 0) {
-      result.push({
-        name: "_xlnm.Print_Titles",
-        range: titleParts.join(","),
-        scope: sheet.name,
-      })
-    }
-  }
-
-  return result
-}
-
-/**
- * Auto-calculate table range from sheet data and table column count.
- */
-function computeTableRange(table: import("../_types").TableDefinition, sheet: WriteSheet): string {
-  const colCount = table.columns.length
-  let rowCount = 0
-
-  if (sheet.rows) {
-    rowCount = sheet.rows.length
-  } else if (sheet.data) {
-    const hasHeaders = sheet.columns?.some((c) => c.header)
-    rowCount = sheet.data.length + (hasHeaders ? 1 : 0)
-  }
-
-  if (table.showTotalRow) {
-    rowCount += 1
-  }
-
-  if (rowCount < 1) rowCount = 1
-
-  const startCol = colToLetter(0)
-  const endCol = colToLetter(colCount - 1)
-  return `${startCol}1:${endCol}${rowCount}`
 }

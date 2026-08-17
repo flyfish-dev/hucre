@@ -48,6 +48,11 @@ export function serialToDate(serial: number, is1904?: boolean): Date {
   // - Serial 60 = phantom "Feb 29, 1900"
   // - Serials > 60: subtract 1 to account for the phantom day
 
+  // Serial 60 is the phantom 29 February 1900, a date with no instant to
+  // map to. It collapses onto 28 February — the same Date serial 59 gives —
+  // so a workbook that really contains 60 shifts by a day on rewrite.
+  // Documented in docs/PARITY.md rather than papered over: any other
+  // mapping would put a real date on a serial Excel does not agree exists.
   if (serial === LOTUS_BUG_SERIAL) {
     // Return "Feb 29, 1900" even though it doesn't exist historically.
     // Excel treats this as a real date, so we must too.
@@ -72,9 +77,18 @@ export function serialToDate(serial: number, is1904?: boolean): Date {
 
 /**
  * Convert a JavaScript Date to an Excel serial number.
- * Uses UTC components of the date.
  *
- * @param date - JavaScript Date (UTC components are used)
+ * The **instant** is converted, against a UTC epoch — not the wall-clock
+ * date the machine would show. `new Date(2024, 0, 15)` is local midnight,
+ * which in UTC+3 is 21:00 on the 14th, and comes out as 45305.875 rather
+ * than 45306. That is not a bug to route around: hucre reads UTC
+ * components on every date path, which is what keeps the readers, the
+ * writers and `formatValue` consistent with each other.
+ *
+ * Build the instant you mean — `Date.UTC(2024, 0, 15)` — when you mean a
+ * calendar day.
+ *
+ * @param date - JavaScript Date; its instant is converted
  * @param is1904 - Whether to use the 1904 date system (default: false = 1900)
  * @returns Excel serial number (with fractional time portion)
  */
@@ -142,6 +156,22 @@ const DATE_FORMAT_IDS = new Set([
   57,
   58,
 ])
+
+/**
+ * Whether a built-in `numFmtId` names a date or time format.
+ *
+ * The set covers ECMA-376 §18.8.30's date and time built-ins, including
+ * the CJK block (27-36) and the Thai/Chinese/Korean extended block
+ * (50-58). Those two blocks carry no `formatCode` in the file, so a
+ * reader that misses them has no second chance: the cell falls through
+ * to "not a date" and the serial number is handed back raw.
+ *
+ * The XLS and XLSB readers each used to keep a 12-entry table of their
+ * own, missing both blocks — see #439.
+ */
+export function isBuiltinDateFormatId(id: number): boolean {
+  return DATE_FORMAT_IDS.has(id)
+}
 
 /**
  * Check if an Excel number format string represents a date/time format.
@@ -536,6 +566,53 @@ function tokenize(format: string): string[] {
   }
 
   return tokens
+}
+
+/**
+ * Strict ISO 8601 shape accepted by type inference: a bare date, or a date
+ * with a time and an optional zone. Deliberately narrower than
+ * {@link parseDate} — inference runs over every string cell in a file, so it
+ * must not claim `"3/4/2021"` (ambiguous) or `"2021"` (a year, or a number).
+ */
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
+
+/**
+ * Revive an ISO 8601 string as a `Date`, or return null if it is not one.
+ *
+ * Shared by the CSV and JSON readers so `typeInference` means the same thing
+ * in both — they used to disagree, because only CSV had a notion of dates at
+ * all and JSON handed ISO strings back as strings (#409).
+ *
+ * @param value - Candidate string (trimmed by the caller or here)
+ * @returns Date, or null when the string is not a valid ISO 8601 instant
+ */
+export function reviveIsoDate(value: string): Date | null {
+  const trimmed = value.trim()
+  if (!ISO_DATE_RE.test(trimmed)) return null
+  const d = new Date(trimmed)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/**
+ * Parse an ISO-8601-shaped date-time, reading an unqualified time as UTC.
+ *
+ * `new Date("2024-01-15T10:30:00")` is **local** time under ECMA-262, so
+ * the same file read in Istanbul and in Tokyo produces instants six hours
+ * apart. Every format hucre reads records an absolute moment, so a bare
+ * time is taken to mean UTC — an explicit `Z` or `+02:00` is what the
+ * file says and is honoured untouched.
+ *
+ * Third home for this fix: ODS cell values (#415), ODS streaming, and now
+ * `docProps/core.xml`, where a non-compliant producer that omits the zone
+ * designator W3CDTF requires used to shift `created` / `modified` by the
+ * reader's offset. See #474.
+ */
+export function parseUtcDefaultDateTime(text: string): Date | undefined {
+  const trimmed = text.trim()
+  const timeAt = trimmed.indexOf("T")
+  const zoned = timeAt >= 0 && /(?:Z|[+-]\d{2}:?\d{2})$/.test(trimmed.slice(timeAt + 1))
+  const date = new Date(timeAt >= 0 && !zoned ? `${trimmed}Z` : trimmed)
+  return Number.isNaN(date.getTime()) ? undefined : date
 }
 
 /**

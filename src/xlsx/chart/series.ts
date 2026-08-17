@@ -195,7 +195,7 @@ export interface SeriesOptions {
  * present. Bare ranges like `B2:B10` are auto-qualified with the
  * owning sheet's name.
  */
-export function qualifyRef(ref: string, sheetName: string): string {
+function qualifyRef(ref: string, sheetName: string): string {
   if (ref.includes("!")) return ref
   return `${quoteSheetName(sheetName)}!${ref}`
 }
@@ -205,7 +205,7 @@ export function qualifyRef(ref: string, sheetName: string): string {
  * unsafe in a 3D reference (whitespace, punctuation, etc.). Single
  * quotes inside the name are doubled per the OOXML spec.
  */
-export function quoteSheetName(name: string): string {
+function quoteSheetName(name: string): string {
   if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return name
   return `'${name.replace(/'/g, "''")}'`
 }
@@ -397,7 +397,7 @@ function parseChartPointValue(value: string, numeric: boolean): number | string 
  * writer's elision logic, so collapsing them keeps the parsed shape
  * minimal.
  */
-export function parseSmooth(ser: XmlElement): boolean | undefined {
+function parseSmooth(ser: XmlElement): boolean | undefined {
   const el = findChild(ser, "smooth")
   if (!el) return undefined
   const v = readBoolAttr(el)
@@ -412,7 +412,7 @@ export function parseSmooth(ser: XmlElement): boolean | undefined {
  * `false` round-trip identically through the writer's elision logic,
  * so collapsing them keeps the parsed shape minimal.
  */
-export function parseInvertIfNegative(ser: XmlElement): boolean | undefined {
+function parseInvertIfNegative(ser: XmlElement): boolean | undefined {
   const el = findChild(ser, "invertIfNegative")
   if (!el) return undefined
   const v = readBoolAttr(el)
@@ -431,7 +431,7 @@ export function parseInvertIfNegative(ser: XmlElement): boolean | undefined {
  * minimal. Non-integer input rounds to the nearest integer for parity
  * with the writer (Excel's UI accepts integer percentages only).
  */
-export function parseExplosion(ser: XmlElement): number | undefined {
+function parseExplosion(ser: XmlElement): number | undefined {
   const el = findChild(ser, "explosion")
   if (!el) return undefined
   const raw = el.attrs.val
@@ -659,7 +659,7 @@ export function parseSeriesStroke(ser: XmlElement): ChartLineStroke | undefined 
  * input) so the writer can elide the element entirely; absence and `0`
  * round-trip identically through the parser's collapse logic.
  */
-export function clampExplosion(value: number | undefined): number | undefined {
+function clampExplosion(value: number | undefined): number | undefined {
   if (value === undefined || !Number.isFinite(value)) return undefined
   const rounded = Math.round(value)
   if (rounded <= 0) return undefined
@@ -836,9 +836,7 @@ export function buildSeries(
  * `undefined` for unrecognized values so the writer can elide
  * `<a:prstDash>` rather than emit a token Excel will reject.
  */
-export function normalizeDashStyle(
-  value: ChartLineDashStyle | undefined,
-): ChartLineDashStyle | undefined {
+function normalizeDashStyle(value: ChartLineDashStyle | undefined): ChartLineDashStyle | undefined {
   if (value === undefined) return undefined
   return VALID_DASH_STYLES.has(value) ? value : undefined
 }
@@ -942,7 +940,7 @@ export function buildSeriesSpPr(
  * Returns `undefined` for non-finite values so the writer can elide
  * `<c:size>` (Excel falls back to its series-rotation default).
  */
-export function clampMarkerSize(value: number | undefined): number | undefined {
+function clampMarkerSize(value: number | undefined): number | undefined {
   if (value === undefined || !Number.isFinite(value)) return undefined
   const rounded = Math.round(value)
   if (rounded < MARKER_SIZE_MIN) return MARKER_SIZE_MIN
@@ -955,7 +953,7 @@ export function clampMarkerSize(value: number | undefined): number | undefined {
  * Returns `undefined` for unrecognized values so the writer can elide
  * `<c:symbol>` rather than emit a token Excel will reject.
  */
-export function normalizeMarkerSymbol(
+function normalizeMarkerSymbol(
   value: ChartMarkerSymbol | undefined,
 ): ChartMarkerSymbol | undefined {
   if (value === undefined) return undefined
@@ -1016,7 +1014,7 @@ export function buildSeriesMarker(marker: ChartMarker | undefined): string | und
  * so the writer can elide the element rather than emit a bare
  * `<a:ln/>` that Excel paints with the inherited default.
  */
-export function resolveStroke(
+function resolveStroke(
   sourceStroke: ChartLineStroke | undefined,
   override: ChartLineStroke | null | undefined,
 ): ChartLineStroke | undefined {
@@ -1028,7 +1026,7 @@ export function resolveStroke(
   return cloneStroke(override)
 }
 
-export function cloneStroke(source: ChartLineStroke): ChartLineStroke | undefined {
+function cloneStroke(source: ChartLineStroke): ChartLineStroke | undefined {
   const out: ChartLineStroke = {}
   if (source.dash !== undefined) out.dash = source.dash
   if (typeof source.width === "number" && Number.isFinite(source.width)) out.width = source.width
@@ -1050,7 +1048,7 @@ export function cloneStroke(source: ChartLineStroke): ChartLineStroke | undefine
  * to `undefined` so absence and the OOXML default round-trip identically
  * (the writer emits straight segments either way).
  */
-export function resolveSmooth(
+function resolveSmooth(
   sourceSmooth: boolean | undefined,
   override: boolean | null | undefined,
 ): boolean | undefined {
@@ -1073,7 +1071,7 @@ export function resolveSmooth(
  * to `undefined` so absence and the OOXML default round-trip identically
  * (the writer omits `<c:invertIfNegative>` either way).
  */
-export function resolveInvertIfNegative(
+function resolveInvertIfNegative(
   sourceFlag: boolean | undefined,
   override: boolean | null | undefined,
 ): boolean | undefined {
@@ -1099,7 +1097,7 @@ export function resolveInvertIfNegative(
  * applies the final `0..400` clamp at emit time so a parsed-then-cloned
  * value remains visible on the resulting `SheetChart` object.
  */
-export function resolveExplosion(
+function resolveExplosion(
   sourceValue: number | undefined,
   override: number | null | undefined,
 ): number | undefined {
@@ -1127,7 +1125,7 @@ export function resolveExplosion(
  * `undefined` so the writer can elide the element rather than emit a
  * bare `<c:marker/>` that Excel paints with the inherited default.
  */
-export function resolveMarker(
+function resolveMarker(
   sourceMarker: ChartMarker | undefined,
   override: ChartMarker | null | undefined,
 ): ChartMarker | undefined {

@@ -1,0 +1,26 @@
+{
+  "csv (hucre/csv)": {
+    "min": 10315,
+    "gzip": 4038
+  },
+  "readXlsx (hucre/xlsx)": {
+    "min": 138926,
+    "gzip": 39085
+  },
+  "read+write xlsx (hucre/xlsx)": {
+    "min": 271860,
+    "gzip": 75215
+  },
+  "everything (hucre)": {
+    "min": 505600,
+    "gzip": 144358
+  },
+  "writeXlsx (hucre)": {
+    "min": 137825,
+    "gzip": 39445
+  },
+  "readOds (hucre/ods)": {
+    "min": 29733,
+    "gzip": 10454
+  }
+}

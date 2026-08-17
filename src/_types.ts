@@ -196,6 +196,14 @@ export interface CellComment {
 export interface Cell {
   value: CellValue
   type: CellType
+  /**
+   * The cell's format.
+   *
+   * On a cell that came from a reader, the nested `font` / `fill` /
+   * `border` objects are **shared** with every other cell of the same
+   * format — see {@link ReadOptions.readStyles}. Copy with
+   * `cloneCellStyle` before mutating one cell's format in place.
+   */
   style?: CellStyle
   /**
    * Render this cell as an Excel 2024 native checkbox. Only meaningful for
@@ -215,7 +223,11 @@ export interface Cell {
   formulaSharedIndex?: number
   /** Range this formula applies to (ref attribute on master cell) */
   formulaRef?: string
-  /** Dynamic array flag (cm="1") */
+  /**
+   * Dynamic array flag (`cm="1"`). Independent of {@link formulaType} —
+   * a spilling function set as a plain formula carries it just as an
+   * explicit `"array"` formula does.
+   */
   formulaDynamic?: boolean
   richText?: RichTextRun[]
   hyperlink?: Hyperlink
@@ -233,9 +245,13 @@ export interface ColumnDef {
   width?: number
   /** Auto-calculate optimal width from cell content */
   autoWidth?: boolean
-  /** Default style for the column */
+  /**
+   * Default style for every cell in the column. Applies whether the rows
+   * come from {@link WriteSheet.data} or {@link WriteSheet.rows} — on the
+   * `data[]` path the generated header row gets it too.
+   */
   style?: CellStyle
-  /** Number format */
+  /** Number format. Folded into {@link style}; an explicit `style.numFmt` wins. */
   numFmt?: string
   /** Hide column */
   hidden?: boolean
@@ -400,16 +416,60 @@ export interface NamedRange {
 
 // ── Page Setup / Print ─────────────────────────────────────────────
 
-export type PaperSize =
+/**
+ * A paper size, either by name or by its raw OOXML `paperSize` code.
+ *
+ * The names cover what people ask for; the number is the escape hatch.
+ * Excel defines about 120 codes and hucre used to model nine, dropping
+ * anything else **silently** on read — so a workbook set to A6 lost its
+ * page size with no error and nothing in the parity statement. A code
+ * with no name here now round-trips as the number it is. See #439 §Q.
+ */
+export type PaperSize = PaperSizeName | (number & {})
+
+export type PaperSizeName =
   | "letter"
+  | "letterSmall"
+  | "tabloid"
+  | "ledger"
   | "legal"
+  | "statement"
+  | "executive"
   | "a3"
   | "a4"
+  | "a4Small"
   | "a5"
   | "b4"
   | "b5"
-  | "executive"
-  | "tabloid"
+  | "folio"
+  | "quarto"
+  | "note"
+  | "envelope9"
+  | "envelope10"
+  | "envelope11"
+  | "envelope12"
+  | "envelope14"
+  | "cSheet"
+  | "dSheet"
+  | "eSheet"
+  | "envelopeDL"
+  | "envelopeC5"
+  | "envelopeC3"
+  | "envelopeC4"
+  | "envelopeC6"
+  | "envelopeC65"
+  | "envelopeB4"
+  | "envelopeB5"
+  | "envelopeB6"
+  | "envelopeItaly"
+  | "envelopeMonarch"
+  | "envelopePersonal"
+  | "fanfoldUS"
+  | "fanfoldGermanStd"
+  | "fanfoldGermanLegal"
+  | "a6"
+  | "japanesePostcard"
+  | "japaneseDoublePostcard"
 
 export interface PageSetup {
   paperSize?: PaperSize
@@ -419,13 +479,70 @@ export interface PageSetup {
   fitToHeight?: number
   scale?: number
   margins?: PageMargins
+  /**
+   * Print area as a bare A1 range (e.g. `"$A$1:$D$50"`), without a sheet
+   * qualifier. Stored in the file as the reserved `_xlnm.Print_Area`
+   * defined name; the reader folds that name back into this field rather
+   * than surfacing it in {@link Workbook.namedRanges}, so the setting has
+   * one representation in both directions.
+   */
   printArea?: string
+  /** Rows repeated at the top of every page (e.g. `"$1:$1"`). Stored in `_xlnm.Print_Titles`. */
   printTitlesRow?: string
+  /** Columns repeated at the left of every page (e.g. `"$A:$A"`). Stored in `_xlnm.Print_Titles`. */
   printTitlesColumn?: string
   showGridLines?: boolean
   showRowColHeaders?: boolean
   horizontalCentered?: boolean
   verticalCentered?: boolean
+  /**
+   * Page number to print on the first page. Excel only honours it when
+   * `useFirstPageNumber` is also set, and the writer sets that flag for
+   * you whenever this is present — a `firstPageNumber` that silently did
+   * nothing would be worse than not having the field.
+   */
+  firstPageNumber?: number
+  /**
+   * Whether {@link firstPageNumber} is used at all. Written implicitly
+   * with `firstPageNumber`; carried here so a file that sets the flag
+   * without the number, or vice versa, round-trips as it was.
+   */
+  useFirstPageNumber?: boolean
+  /**
+   * Order pages are laid out in when the sheet is wider and taller than
+   * one page. Default: `"downThenOver"`.
+   */
+  pageOrder?: "downThenOver" | "overThenDown"
+  /** Print without colour. */
+  blackAndWhite?: boolean
+  /** Print without graphics. */
+  draft?: boolean
+  /** Where cell comments are printed. Default: `"none"`. */
+  cellComments?: "none" | "asDisplayed" | "atEnd"
+  /** How cells holding errors are printed. Default: `"displayed"`. */
+  errors?: "displayed" | "blank" | "dash" | "NA"
+  /** Number of copies. Default: 1. */
+  copies?: number
+  /** Horizontal print resolution in DPI. Default: 600. */
+  horizontalDpi?: number
+  /** Vertical print resolution in DPI. Default: 600. */
+  verticalDpi?: number
+  /**
+   * Custom page width as an ST_PositiveUniversalMeasure — a number with a
+   * unit, e.g. `"210mm"`, `"8.5in"`, `"21cm"`. The only way to express a
+   * page size that has no {@link PaperSize} code.
+   *
+   * Excel reads this in preference to `paperSize` when both are present.
+   * Set it together with {@link paperHeight}; one alone describes nothing.
+   */
+  paperWidth?: string
+  /** Custom page height; see {@link paperWidth}. */
+  paperHeight?: string
+  /**
+   * Whether the printer's own defaults are used for the settings this
+   * sheet does not name. Default: true.
+   */
+  usePrinterDefaults?: boolean
 }
 
 export interface PageMargins {
@@ -547,6 +664,11 @@ export interface SheetImage {
     from: { row: number; col: number; rowOff?: number; colOff?: number }
     to?: { row: number; col: number; rowOff?: number; colOff?: number }
   }
+  /**
+   * Rendered size in pixels at 96 DPI, stored as EMU in the drawing's
+   * `<a:ext>`. Absent on write means the writer's own default size, which
+   * is then what the reader reports — a file records a size either way.
+   */
   width?: number
   height?: number
   /** Alternative text for screen readers (lands in xdr:cNvPr/@descr). */
@@ -700,7 +822,11 @@ export interface TableDefinition {
   showRowStripes?: boolean
   /** Show banded columns. Default: false */
   showColumnStripes?: boolean
-  /** Show auto-filter. Default: true */
+  /**
+   * Show auto-filter. Default when writing: true. On read this reports
+   * whether the table part actually carries an `<autoFilter>` — a table
+   * without one has no filter dropdowns, so it reads back `false`.
+   */
   showAutoFilter?: boolean
   /** Show total row. Default: false */
   showTotalRow?: boolean
@@ -753,9 +879,47 @@ export interface RowDef {
 
 // ── Sheet ──────────────────────────────────────────────────────────
 
+/**
+ * What kind of sheet a tab holds.
+ *
+ * `xl/workbook.xml`'s `<sheets>` lists every tab whatever its kind —
+ * ECMA-376 `CT_Sheet` covers worksheets, chart sheets, dialog sheets and
+ * macro sheets alike, and the *relationship type* is what tells them
+ * apart. Only a worksheet has cells.
+ */
+export type SheetKind = "worksheet" | "chartsheet" | "dialogsheet" | "macrosheet"
+
 export interface Sheet {
   name: string
+  /**
+   * Cell values as a **dense rectangle**: every row is an array, every
+   * row is the same length, and no element is `undefined`.
+   *
+   * That is what makes `rows[r][c]` safe without a guard on either
+   * index, and it is what the readers' bounding-box limits are sized
+   * against — the cost of a sheet is its box, not its cell count, which
+   * is why {@link ReadOptions.maxTotalCells} bounds the product.
+   *
+   * It went unwritten and two readers did not hold it: `readXls` and
+   * `readXlsb` padded a row only to its own last cell and never
+   * allocated a row Excel left empty, so one authored sheet saved three
+   * ways came back three shapes, and a gap row came back as `undefined`
+   * — which `CellValue` cannot express. See #494.
+   */
   rows: CellValue[][]
+  /**
+   * The kind of tab this is. Absent means `"worksheet"`, which is what
+   * all but a handful of sheets are.
+   *
+   * A workbook containing a chart sheet used to fail to read *entirely*
+   * — the chart sheet's relationship is not a `worksheet` one, so the
+   * lookup missed and the reader threw, taking every ordinary worksheet
+   * beside it down too. Non-worksheet tabs are now read as empty sheets
+   * so the indices still line up with Excel's tab bar, and this field is
+   * what tells you one apart from a worksheet that happens to be empty.
+   * Read-only: hucre cannot author a chart sheet. See #499.
+   */
+  kind?: SheetKind
   /** Detailed cell data (keyed by "row,col" e.g. "0,2") */
   cells?: Map<string, Cell>
   columns?: ColumnDef[]
@@ -763,6 +927,22 @@ export interface Sheet {
   sheetFormat?: SheetFormat
   /** Row-level properties (keyed by 0-based row index) */
   rowDefs?: Map<number, RowDef>
+  /**
+   * Default row height in points, for rows with no `rowDefs` entry.
+   * Excel's own default is 15. Written to `<sheetFormatPr defaultRowHeight>`.
+   *
+   * Before this existed the writer emitted a hard-coded 15 and the reader
+   * looked at `<sheetFormatPr>` not at all, so a workbook whose default was
+   * 24 came back through readXlsx → writeXlsx with every unstyled row
+   * shortened. See #439 §X.
+   */
+  defaultRowHeight?: number
+  /**
+   * Default column width in characters, for columns with no `columns[]`
+   * entry. Written to `<sheetFormatPr defaultColWidth>`; absent means
+   * Excel picks its own from the default font.
+   */
+  defaultColWidth?: number
   merges?: MergeRange[]
   dataValidations?: DataValidation[]
   conditionalRules?: ConditionalRule[]
@@ -1240,9 +1420,18 @@ export interface Workbook {
   namedRanges?: NamedRange[]
   /** Date system: 1900 (default/Windows) or 1904 (Mac) */
   dateSystem?: "1900" | "1904"
-  /** Default font for the workbook */
+  /**
+   * Default font for the workbook — `fonts[0]` in `xl/styles.xml`, the
+   * entry every cell format inherits from unless it names another.
+   */
   defaultFont?: FontStyle
-  /** Active sheet index */
+  /**
+   * Active sheet index — the tab the file opens on.
+   *
+   * Undefined when the file opens on the first tab: `activeTab="0"` is the
+   * OOXML default and is indistinguishable from a file that says nothing,
+   * so both collapse to `undefined` and round-trip identically.
+   */
   activeSheet?: number
   /** Theme color palette (resolved from xl/theme/theme1.xml) */
   themeColors?: string[]
@@ -1288,6 +1477,27 @@ export interface Workbook {
   timelineCaches?: TimelineCache[]
 }
 
+// ── Read diagnostics ───────────────────────────────────────────────
+
+/** What a reader had to drop, and where. */
+export interface ReadWarning {
+  /** What kind of problem this is, for programmatic handling. */
+  code:
+    | "unresolved-shared-string"
+    | "unresolved-style"
+    | "unresolved-dxf"
+    | "unresolved-hyperlink"
+    | "unusable-paper-size"
+    | "malformed-cell-ref"
+  /** A sentence a person can act on. */
+  message: string
+  /** The sheet it happened in, when the reader knows. */
+  sheet?: string
+  /** 0-based cell position, when the problem is a cell's. */
+  row?: number
+  col?: number
+}
+
 // ── Read Options ───────────────────────────────────────────────────
 
 /**
@@ -1316,6 +1526,27 @@ export interface SheetFilterInfo {
  */
 export type SheetFilter = (info: SheetFilterInfo, index: number) => boolean
 
+/**
+ * Options accepted by every reader.
+ *
+ * Support is not uniform, and the type cannot express that — so it is
+ * stated here rather than left for a caller to discover:
+ *
+ * | option       | xlsx | ods | xlsb | xls |
+ * | ------------ | ---- | --- | ---- | --- |
+ * | `sheets`     | yes  | yes | no   | no  |
+ * | `dateSystem` | yes  | no  | yes  | yes |
+ * | `readStyles` | yes  | yes | no   | no  |
+ * | `password`   | yes  | no  | yes  | no  |
+ * | `maxRows`    | yes  | no  | no   | no  |
+ * | `range`      | yes  | no  | no   | no  |
+ *
+ * `maxInputBytes` applies wherever the input is a `ReadableStream`.
+ *
+ * `headerRow` and `schema` used to live here and were honoured by no
+ * reader at all; they were removed before v1 rather than frozen. Header
+ * selection belongs on the `*Objects` readers, which do implement it.
+ */
 export interface ReadOptions {
   /**
    * Which sheets to read.
@@ -1328,13 +1559,19 @@ export interface ReadOptions {
    * Default: all sheets.
    */
   sheets?: Array<number | string> | SheetFilter
-  /** Which row is the header row (1-based). Default: none */
-  headerRow?: number
-  /** Schema for validation and type coercion */
-  schema?: SchemaDefinition
   /** Date system override. Default: auto-detect from file */
   dateSystem?: "1900" | "1904" | "auto"
-  /** Whether to read styles. Default: false (faster without) */
+  /**
+   * Whether to read styles. Default: false (faster without).
+   *
+   * **A resolved style's parts are shared, not copied.** `xl/styles.xml`
+   * holds one font, fill and border record per distinct format, and every
+   * cell that indexes it gets that same object — copying per cell nearly
+   * doubles peak memory on a styled read for a guarantee most callers
+   * never need. So `cells.get(a).style.font === cells.get(b).style.font`
+   * whenever `a` and `b` share a format, and writing through one changes
+   * both. Use `cloneCellStyle` before editing a single cell's format.
+   */
   readStyles?: boolean
   /** Password for encrypted files */
   password?: string
@@ -1342,6 +1579,94 @@ export interface ReadOptions {
   maxRows?: number
   /** Cell range to read (e.g. "A1:D10"). Only cells within this range are returned. */
   range?: string
+  /**
+   * Maximum number of bytes buffered from a `ReadableStream` input.
+   * Default: 1 GiB ({@link MAX_INPUT_BYTES}). A stream that exceeds it
+   * fails with a `ParseError` instead of growing until the process runs
+   * out of memory. Ignored for `Uint8Array` / `ArrayBuffer` input, which
+   * the caller has already allocated.
+   */
+  maxInputBytes?: number
+  /**
+   * Return cells without materializing the grid. Default: false.
+   *
+   * `Sheet.rows` is a dense rectangle, so the cost of a read is the
+   * bounding box rather than the cell count — which is right for almost
+   * every sheet and wrong for a sparse one. A real workbook with 82,000
+   * values scattered over a 305,612,208-slot box (0.03% filled) could
+   * not be read at all: raising {@link maxTotalCells} trades a clean
+   * error for a multi-gigabyte allocation, `range` needs you to already
+   * know where the data is, and `maxRows` bounds rows when the problem
+   * is columns. See #501.
+   *
+   * With this set, `rows` comes back empty and every cell that carries
+   * something is in {@link Sheet.cells}, keyed `"row,col"`. Memory then
+   * tracks the values rather than the box, and the bounding-box limit
+   * does not apply because nothing dense is built.
+   *
+   * `streamXlsxRows` is the other answer and the better one when you
+   * only need to walk the rows once; this is for random access, or for
+   * when you want a `Workbook`.
+   *
+   * XLSX only.
+   */
+  sparse?: boolean
+  /**
+   * Maximum number of cells a single sheet may be normalized into —
+   * `rows` is a dense rectangle, so this bounds the bounding box rather
+   * than the cell count. Default: 20,000,000 ({@link MAX_TOTAL_CELLS}).
+   *
+   * The default refuses two legal cells at `A1` and `XFD1048576`, which
+   * describe 1.7e10 slots from a few hundred bytes of XML. It also
+   * refuses a legitimate 25-million-cell sheet, which is why this is a
+   * number rather than a ceiling: raise it when you know the file, and
+   * budget roughly 8 bytes per slot for the array alone.
+   *
+   * Honoured by `readXlsx`, `readOds` and `readXls`.
+   */
+  maxTotalCells?: number
+  /**
+   * Maximum number of bytes any single ZIP entry may decompress to.
+   * Default: 2 GiB ({@link MAX_DECOMPRESSED_BYTES}).
+   *
+   * This is the zip-bomb bound — an entry that claims a small compressed
+   * size and expands past it fails with a `ZipError` rather than being
+   * allowed to allocate. Raising it is the one on this list where a
+   * caller should be sure the input is trusted.
+   *
+   * Honoured wherever the container is a ZIP: `readXlsx`, `readOds`.
+   */
+  maxDecompressedBytes?: number
+  /**
+   * Maximum password-derivation spin count accepted from an encrypted
+   * workbook. Default: 10,000,000 ({@link MAX_SPIN_COUNT}).
+   *
+   * Office writes 100,000. The bound exists so a hostile file cannot
+   * name a count that pins a CPU for minutes; raising it means agreeing
+   * to spend that time.
+   */
+  maxSpinCount?: number
+  /**
+   * Called for each thing a reader had to drop.
+   *
+   * The readers are lenient on purpose — a corrupt reference yields
+   * `null` rather than an exception, because a spreadsheet is a format
+   * you receive rather than one you control. But leniency used to be the
+   * *only* mode: a cell pointing at a shared string that is not there
+   * came back as `null`, indistinguishable from a cell that was
+   * genuinely empty, and nothing said which. See #439 §S.
+   *
+   * ```ts
+   * const warnings: ReadWarning[] = []
+   * const wb = await readXlsx(bytes, { onWarning: (w) => warnings.push(w) })
+   * if (warnings.length) console.warn(`${warnings.length} problem(s) in this file`)
+   * ```
+   *
+   * Nothing changes when it is omitted. This is a side channel, not part
+   * of the document, which is why it is a callback rather than a field on
+   * `Workbook`.
+   */
+  onWarning?: (warning: ReadWarning) => void
 }
 
 // ── Write Options ──────────────────────────────────────────────────
@@ -1383,8 +1708,17 @@ export interface WriteOptions {
 export interface WriteSheet {
   name: string
   columns?: ColumnDef[]
-  /** Raw row data (array of arrays) */
-  rows?: CellValue[][]
+  /**
+   * Raw row data (array of arrays).
+   *
+   * An entry is a {@link CellValue}, or a cell object — `{ value, style }`,
+   * `{ formula }`, anything a {@link Cell} carries — written where the
+   * value goes. The streaming writers have taken that shape since they
+   * existed; the buffered ones now do too, so styling one cell no longer
+   * means naming its position again in {@link cells} (#433). Where both
+   * describe a position, {@link cells} wins.
+   */
+  rows?: Array<Array<CellValue | Partial<Cell>>>
   /**
    * Object data (array of objects — uses column keys). A value may be a scalar
    * {@link CellValue} or a rich {@link HyperlinkValue} for inline clickable links.
@@ -1392,7 +1726,29 @@ export interface WriteSheet {
   data?: Array<Record<string, CellValue | HyperlinkValue>>
   /** Detailed cell overrides (keyed by "row,col") */
   cells?: Map<string, Partial<Cell>>
-  merges?: MergeRange[]
+  /**
+   * Default row height in points, for rows with no `rowDefs` entry.
+   * Excel's own default is 15. Written to `<sheetFormatPr defaultRowHeight>`.
+   *
+   * Before this existed the writer emitted a hard-coded 15 and the reader
+   * looked at `<sheetFormatPr>` not at all, so a workbook whose default was
+   * 24 came back through readXlsx → writeXlsx with every unstyled row
+   * shortened. See #439 §X.
+   */
+  defaultRowHeight?: number
+  /**
+   * Default column width in characters, for columns with no `columns[]`
+   * entry. Written to `<sheetFormatPr defaultColWidth>`; absent means
+   * Excel picks its own from the default font.
+   */
+  defaultColWidth?: number
+  /**
+   * Merged ranges, as coordinates or as A1 strings — `"A1:C1"` and
+   * `{ startRow: 0, startCol: 0, endRow: 0, endCol: 2 }` mean the same
+   * thing. See #474; the read model stays coordinates, because that is
+   * what the reader produces.
+   */
+  merges?: Array<MergeRange | string>
   dataValidations?: DataValidation[]
   conditionalRules?: ConditionalRule[]
   autoFilter?: AutoFilter
@@ -1428,8 +1784,13 @@ export interface WriteSheet {
    * share the worksheet's drawing part with images and text boxes.
    */
   charts?: SheetChart[]
-  /** Excel 365 threaded comments for this sheet. */
-  threadedComments?: ThreadedComment[]
+  // No `threadedComments` here, deliberately. Authoring Excel 365 threaded
+  // comments is a roadmap item, not a shipped feature: it needs a
+  // `xl/threadedComments/` part, a workbook-wide `xl/persons/person.xml`,
+  // and the legacy `<comment>` fallback Excel expects alongside them. The
+  // field used to sit here typed and accepted, and was silently discarded
+  // — see #404. `Sheet.threadedComments` is real: they are read, and
+  // preserved through `openXlsx` → `saveXlsx`.
   /**
    * Pivot tables anchored on this sheet. The source data is read from
    * either the same sheet or a sibling sheet identified by
@@ -1451,14 +1812,44 @@ export interface OutlineProperties {
 
 // ── CSV Options ────────────────────────────────────────────────────
 
+/**
+ * Options shared by `parseCsv`, `parseCsvObjects` and `streamCsvRows` —
+ * every one of them means the same thing in all three.
+ *
+ * `schema` used to live here and was honoured by no CSV reader at all; it
+ * was removed before v1 rather than frozen. Validate with
+ * `validateWithSchema` on the parsed rows, which does implement it.
+ */
 export interface CsvReadOptions {
+  /**
+   * How to decode byte input. Ignored when a string is passed — the
+   * caller has already decided.
+   *
+   * Any label from the WHATWG Encoding Standard, which is what
+   * `TextDecoder` accepts: `"utf-8"`, `"utf-16le"`, `"windows-1254"`,
+   * `"iso-8859-9"`, and the rest. Default: the encoding the file's
+   * byte-order mark declares, or UTF-8 when it carries none.
+   *
+   * There is no detection beyond the mark. A mark is a statement the file
+   * makes about itself; telling windows-1254 from windows-1252 by byte
+   * frequency is a guess, and a wrong one often enough to be worse than
+   * asking. If your source is a legacy-encoded export — Excel on a
+   * Turkish or Central European Windows, say — name it. See #475.
+   */
+  encoding?: string
   /** Field delimiter. Default: auto-detect */
   delimiter?: string
-  /** Line separator. Default: auto-detect */
-  lineSeparator?: string
   /** Quote character. Default: " */
   quote?: string
-  /** Escape character. Default: " (RFC 4180 doubled quotes) */
+  /**
+   * Escape character. Default: " (RFC 4180 doubled quotes)
+   *
+   * Read-only on purpose: set it to read a foreign dialect (a backslash
+   * escape, say), but the writers always emit RFC 4180 doubled quotes.
+   * Writing a backslash dialect losslessly would need the escape character
+   * itself escaped, which this parser does not decode — a half-implemented
+   * `escape` on the write side would corrupt a value ending in one.
+   */
   escape?: string
   /** Whether first row is header. Default: false */
   header?: boolean
@@ -1468,10 +1859,6 @@ export interface CsvReadOptions {
   typeInference?: boolean
   /** Keep strings with leading zeros (e.g. "0123") as strings instead of converting to numbers. Default: true */
   preserveLeadingZeros?: boolean
-  /** Schema for validation */
-  schema?: SchemaDefinition
-  /** Encoding. Default: "utf-8" */
-  encoding?: string
   /** Skip empty rows. Default: false */
   skipEmptyRows?: boolean
   /** Comment character (lines starting with this are skipped) */
@@ -1488,6 +1875,27 @@ export interface CsvReadOptions {
   transformValue?: (value: CellValue, header: string, row: number, col: number) => CellValue
   /** Fast mode: skip quote handling and just split by delimiter/newlines. Faster for files known to have no quoted fields. Default: false */
   fastMode?: boolean
+  /**
+   * Drop the header row from the output instead of yielding it.
+   *
+   * `header: true` only marks the first row as a header — it is still
+   * returned, and only used to name columns for {@link transformValue}.
+   * Set this when you want the header consumed rather than emitted.
+   * Default: false
+   */
+  skipHeaderRow?: boolean
+  /**
+   * Undo {@link CsvWriteOptions.escapeFormulae}: drop the leading `'` from
+   * values that start with one of the characters the writer escapes for
+   * (`= + - @ | \t \r \n \0`). Runs before type inference, so `'-5` reads
+   * back as the number -5. Default: false
+   *
+   * Set it only for input produced with `escapeFormulae: true` — a source
+   * value that genuinely began `'-5` is written unescaped, and this cannot
+   * tell the two apart. Values whose apostrophe is followed by anything
+   * else (`'quoted'`, `'tis`) are never touched.
+   */
+  unescapeFormulae?: boolean
 }
 
 export interface CsvWriteOptions {
@@ -1503,12 +1911,51 @@ export interface CsvWriteOptions {
   headers?: string[] | boolean
   /** Prepend UTF-8 BOM (for Excel compatibility). Default: false */
   bom?: boolean
-  /** Date format string. Default: ISO 8601 */
+  /**
+   * Date format string. Default: ISO 8601 (`toISOString()`).
+   *
+   * Takes the same tokens as the exported `formatDate` and as a `numFmt`
+   * anywhere else in the library — `yyyy`/`yy`, `mmmm`/`mmm`/`mm`/`m`,
+   * `dddd`/`ddd`/`dd`/`d`, `hh`/`h`, `mm`/`m` (minutes, after an hour
+   * token), `ss`, `AM/PM` — and is case-insensitive, so `YYYY-MM-DD` and
+   * `yyyy-mm-dd` both work. Components are read in **UTC**, matching the
+   * ISO default and every other date path in the library.
+   *
+   * **One-way.** The readers recognize ISO 8601 and nothing else, so a
+   * `Date` written with the default round-trips as a `Date` under
+   * `typeInference`, while any custom format comes back a string — a
+   * reader cannot tell `03/04/2024` in one convention from the other.
+   * Use a custom format for output people read, not for output hucre
+   * reads back.
+   */
   dateFormat?: string
-  /** Null/undefined representation. Default: "" */
+  /**
+   * Null/undefined representation. Default: ""
+   *
+   * **One-way.** CSV has no null, so nothing on the read side turns the
+   * token back into `null` — `nullValue: "NULL"` reads as the string
+   * `"NULL"`, and the default reads as `""`. That is true of the default
+   * too, which is why there is no inverse option: restoring `null` for
+   * `""` would have to guess for every empty field in the file.
+   */
   nullValue?: string
-  /** Escape formula injection by prefixing cells starting with =, +, -, @, \t, \r with a single quote. Default: false */
+  /**
+   * Escape formula injection by prefixing cells starting with =, +, -, @, \t, \r with a single quote. Default: false
+   *
+   * Reverse it on the way back in with
+   * {@link CsvReadOptions.unescapeFormulae}; without that, the `'` is
+   * part of the value and every round trip keeps it (#408).
+   */
   escapeFormulae?: boolean
+  /**
+   * Comment character used by the reader this output is written for.
+   * Values starting with it are quoted, so the reader keeps them as data
+   * instead of discarding the line. Default: unset — a value starting with
+   * `#` is written bare, and a reader with `comment: "#"` drops the row.
+   *
+   * No effect under `quoteStyle: "none"`, which cannot quote anything.
+   */
+  comment?: string
   /** Column keys to include (for writeCsvObjects). When provided, only these columns are output in this order. */
   columns?: string[]
 }
@@ -1542,7 +1989,14 @@ export interface SchemaField {
 
 export type SchemaDefinition = Record<string, SchemaField>
 
-export interface ValidationError {
+/**
+ * One row/column schema failure produced by `validateWithSchema`.
+ *
+ * Named `SchemaValidationIssue` rather than `ValidationError` because the
+ * `ValidationError` *class* (see `./errors`) is what strict mode throws;
+ * this is the plain record collected in non-strict mode.
+ */
+export interface SchemaValidationIssue {
   /** 1-based row number */
   row: number
   /** Column name or index */
@@ -1555,28 +2009,70 @@ export interface ValidationError {
   field: string
 }
 
-export interface ReadResult<T = Record<string, unknown>> {
-  /** Parsed and validated rows */
-  data: T[]
-  /** Validation errors (if schema provided) */
-  errors: ValidationError[]
-  /** Raw sheet data */
-  sheets: Sheet[]
-}
+// ── Streaming ──────────────────────────────────────────────────────
 
-// ── Streaming Types ────────────────────────────────────────────────
-
-export interface StreamReadOptions extends ReadOptions {
-  /** Batch size for row events. Default: 1 */
-  batchSize?: number
-}
-
-export interface StreamWriteOptions extends WriteOptions {
-  /** Sheet being written */
-  sheet: WriteSheet
+/**
+ * One row yielded by a streaming reader.
+ *
+ * Shared by `streamXlsxRows` and `streamOdsRows`, which previously had
+ * two near-identical shapes under two names. `index` is carried because
+ * sheet rows are sparse — a file may jump from row 1 to row 500, and
+ * position in the iteration cannot recover that.
+ *
+ * `streamCsvRows` deliberately yields a bare `CellValue[]` instead: CSV
+ * rows are dense and positional, so an index would be pure ceremony, and
+ * the bare array is what keeps it the streaming mirror of `parseCsv`.
+ */
+export interface StreamRow {
+  /** 0-based row index within its sheet */
+  index: number
+  /**
+   * 0-based index of the sheet this row came from. Present only for
+   * readers that stream more than one sheet.
+   */
+  sheetIndex?: number
+  /** Cell values for this row */
+  values: CellValue[]
 }
 
 // ── Input/Output Types ─────────────────────────────────────────────
 
 export type ReadInput = Uint8Array | ArrayBuffer | ReadableStream<Uint8Array>
 export type WriteOutput = Uint8Array
+
+// ── Incremental writers ────────────────────────────────────────────
+
+/**
+ * The vocabulary `XlsxStreamWriter`, `CsvStreamWriter` and
+ * `NdjsonStreamWriter` share, so a format-agnostic export helper can be
+ * written once.
+ *
+ * The README has claimed this since before v1 and nothing enforced it:
+ * there was no `implements` anywhere in `src/`, so when #436 widened
+ * `XlsxStreamWriter.addRow` to accept `StreamStyledCell`, nothing failed
+ * and the drift was left for a reader to discover. Declaring the type is
+ * what turns the next divergence into a compile error. See #468.
+ *
+ * Two of the members are deliberately loose, because the three writers
+ * genuinely differ and pretending otherwise would be worse than saying so:
+ *
+ * - **`finish()`** returns `string` from the text writers and
+ *   `Promise<Uint8Array>` from XLSX. A helper written against this
+ *   interface has to `await` it — which is harmless on a `string` — and
+ *   narrow the result before using it. Converging the two is a real API
+ *   decision and a breaking one; the interface is worth having either way.
+ * - **`addRow` / `addObject`** promise only the narrow parameter here.
+ *   `XlsxStreamWriter` accepts more (`StreamStyledCell`, `unknown`
+ *   values), which is contravariant and therefore fine — a writer may
+ *   take more than the interface promises, never less.
+ */
+export interface SpreadsheetStreamWriter {
+  /** Append a row of positional values. */
+  addRow(values: CellValue[]): void
+  /** Append a row from an object, projected through the writer's columns. */
+  addObject(item: Record<string, CellValue>): void
+  /** Close the writer and return its output. */
+  finish(): string | Promise<Uint8Array>
+  /** Output as a `ReadableStream<Uint8Array>`. */
+  toStream(): ReadableStream<Uint8Array>
+}

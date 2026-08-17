@@ -2,6 +2,8 @@
 // Reads Office Open XML (.xlsx) spreadsheet files.
 
 import type {
+  Sheet,
+  SheetKind,
   Workbook,
   ReadOptions,
   ReadInput,
@@ -19,6 +21,7 @@ import type {
   TimelineCache,
   ChartAnchor,
 } from "../_types"
+import { decodePart, isPartTooLargeToDecode, MAX_STRING_LENGTH } from "../_decode"
 import { parsePersons, parseThreadedComments } from "./threaded-comments-reader"
 import { parseExternalLink } from "./external-link-reader"
 import { assembleCellImages, parseCellImages, REL_CELL_IMAGES } from "./cell-images-reader"
@@ -31,10 +34,12 @@ import { decryptAgile } from "./crypto/agile"
 import { ZipReader } from "../zip/reader"
 import { parseXml } from "../xml/parser"
 import { parseContentTypes } from "./content-types"
-import { parseRelationships } from "./relationships"
+import { dirname, findRIdAttr, parseRelationships, resolvePath } from "./relationships"
 import { parseSharedStrings } from "./shared-strings"
 import { parseStyles } from "./styles"
-import { parseWorksheet } from "./worksheet"
+import { parseWorksheet, parseWorksheetStream } from "./worksheet"
+import type { WorksheetContext } from "./worksheet"
+import { parseDynamicArrayCellMetadata } from "./metadata"
 import type { ParsedStyles } from "./styles"
 import type { SharedString } from "./shared-strings"
 import type { Relationship } from "./relationships"
@@ -64,39 +69,62 @@ export function matchesRelType(rel: string, type: string): boolean {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function decodeUtf8(data: Uint8Array): string {
-  return new TextDecoder("utf-8").decode(data)
+function decodeUtf8(data: Uint8Array, path = "(unknown)"): string {
+  return decodePart(data, path)
 }
 
 /**
- * Resolve a relative target path against a base directory.
- * E.g. resolve("xl/_rels", "../worksheets/sheet1.xml") → "xl/worksheets/sheet1.xml"
+ * Read one worksheet part into a `Sheet`, whatever size it is.
+ *
+ * A worksheet over V8's 0x1fffffe8-character ceiling cannot be turned
+ * into a string at all, so buffering it and parsing the string — what
+ * this did until #503 — could not work however much memory the machine
+ * had. `readXlsx` threw on eleven of the twelve workbooks over 100 MB in
+ * a corpus of ~600 instrument exports; the largest worksheet part in it
+ * is 589 MB.
+ *
+ * The part is parsed from the ZIP entry's stream instead, by the same
+ * handlers the buffered parse uses (`parseWorksheetStream`), so there is
+ * no second model-building path to keep in step.
+ *
+ * Which path is taken is not the caller's business — the ceiling is an
+ * implementation limit of a decoder, not a property of the workbook, and
+ * an option to work around it would only make every caller who meets one
+ * of these files handle it themselves. So it is decided here:
+ *
+ *  - The declared size settles it before anything is decompressed. It is
+ *    a *byte* count against a *character* ceiling, so a multibyte part
+ *    can be sent to the streaming path that the buffered one would have
+ *    managed. That costs nothing: same handlers, same `Sheet`.
+ *  - When the ZIP declares no size, the buffered path runs and the
+ *    ceiling error it raises is the signal to retry as a stream. That
+ *    pays for the decompression twice, which is why it is the fallback
+ *    and not the rule.
+ *
+ * One difference is worth knowing about: the streaming ZIP path does not
+ * verify CRC-32 (it has no whole entry to check), so a part read this way
+ * is not checked for corruption the way a buffered one is. That is the
+ * same trade `streamXlsxRows` has always made.
  */
-function resolvePath(base: string, target: string): string {
-  // If target starts with /, it's absolute from the package root
-  if (target.startsWith("/")) return target.slice(1)
-
-  const baseParts = base.split("/").filter(Boolean)
-  const targetParts = target.split("/").filter(Boolean)
-
-  for (const part of targetParts) {
-    if (part === "..") {
-      baseParts.pop()
-    } else if (part !== ".") {
-      baseParts.push(part)
+async function readWorksheet(
+  zip: ZipReader,
+  wsPath: string,
+  name: string,
+  ctx: WorksheetContext,
+): Promise<Sheet> {
+  const declared = zip.declaredSize(wsPath)
+  if (declared === undefined || declared <= MAX_STRING_LENGTH) {
+    try {
+      return parseWorksheet(decodeUtf8(await zip.extract(wsPath), wsPath), name, ctx)
+    } catch (error) {
+      // Only `tooLargeToDecode` produces this one, so a `ParseError` the
+      // handlers raised — a malformed ref, the cell bound — is rethrown
+      // rather than retried. Retrying it would parse the part twice to
+      // arrive at the same error.
+      if (!isPartTooLargeToDecode(error)) throw error
     }
   }
-
-  return baseParts.join("/")
-}
-
-/**
- * Get the directory portion of a path.
- * E.g. "xl/workbook.xml" → "xl"
- */
-function dirname(path: string): string {
-  const idx = path.lastIndexOf("/")
-  return idx === -1 ? "" : path.slice(0, idx)
+  return parseWorksheetStream(zip.extractStream(wsPath), name, ctx)
 }
 
 // ── Main Reader ──────────────────────────────────────────────────────
@@ -111,14 +139,14 @@ function dirname(path: string): string {
  * you need row-level streaming with low per-row memory.
  */
 export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
-  let data = await readInputToUint8Array(input)
+  let data = await readInputToUint8Array(input, options?.maxInputBytes)
 
   // Password-protected workbooks arrive as an OLE2/CFB envelope. With a
   // password we decrypt the inner OOXML ZIP and continue; without one we
   // surface a typed `EncryptedFileError` instead of a generic ZIP failure.
   if (isOle2Container(data)) {
     if (options?.password) {
-      data = await decryptAgile(data, options.password)
+      data = await decryptAgile(data, options.password, options.maxSpinCount)
     } else {
       throw new EncryptedFileError("xlsx")
     }
@@ -127,7 +155,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   // 1. Open ZIP archive
   let zip: ZipReader
   try {
-    zip = new ZipReader(data)
+    zip = new ZipReader(data, options?.maxDecompressedBytes)
   } catch (err) {
     if (err instanceof ZipError) throw err
     throw new ParseError("Failed to open XLSX file: not a valid ZIP archive", undefined, {
@@ -139,14 +167,17 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   if (!zip.has("[Content_Types].xml")) {
     throw new ParseError("Invalid XLSX: missing [Content_Types].xml")
   }
-  const contentTypesXml = decodeUtf8(await zip.extract("[Content_Types].xml"))
+  const contentTypesXml = decodeUtf8(
+    await zip.extract("[Content_Types].xml"),
+    "[Content_Types].xml",
+  )
   parseContentTypes(contentTypesXml) // Validate, not strictly needed for reading
 
   // 3. Parse _rels/.rels to find the workbook path
   if (!zip.has("_rels/.rels")) {
     throw new ParseError("Invalid XLSX: missing _rels/.rels")
   }
-  const rootRelsXml = decodeUtf8(await zip.extract("_rels/.rels"))
+  const rootRelsXml = decodeUtf8(await zip.extract("_rels/.rels"), "_rels/.rels")
   const rootRels = parseRelationships(rootRelsXml)
   const workbookRel = rootRels.find((r) => matchesRelType(r.type, "officeDocument"))
   if (!workbookRel) {
@@ -165,7 +196,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
 
   let workbookRels: Relationship[] = []
   if (zip.has(workbookRelsPath)) {
-    const wbRelsXml = decodeUtf8(await zip.extract(workbookRelsPath))
+    const wbRelsXml = decodeUtf8(await zip.extract(workbookRelsPath), workbookRelsPath)
     workbookRels = parseRelationships(wbRelsXml)
   }
 
@@ -173,12 +204,13 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   if (!zip.has(workbookPath)) {
     throw new ParseError(`Invalid XLSX: missing workbook at ${workbookPath}`)
   }
-  const workbookXml = decodeUtf8(await zip.extract(workbookPath))
+  const workbookXml = decodeUtf8(await zip.extract(workbookPath), workbookPath)
   const {
     sheets: sheetInfos,
     dateSystem,
     namedRanges,
     workbookProtection,
+    activeSheet,
     pivotCacheRefs,
   } = parseWorkbookXml(workbookXml, options)
 
@@ -188,7 +220,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   if (ssRel) {
     const ssPath = resolvePath(workbookDir, ssRel.target)
     if (zip.has(ssPath)) {
-      const ssXml = decodeUtf8(await zip.extract(ssPath))
+      const ssXml = decodeUtf8(await zip.extract(ssPath), ssPath)
       sharedStrings = parseSharedStrings(ssXml)
     }
   }
@@ -199,7 +231,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   if (stylesRel) {
     const stylesPath = resolvePath(workbookDir, stylesRel.target)
     if (zip.has(stylesPath)) {
-      const stylesXml = decodeUtf8(await zip.extract(stylesPath))
+      const stylesXml = decodeUtf8(await zip.extract(stylesPath), stylesPath)
       parsedStyles = parseStyles(stylesXml)
     }
   }
@@ -208,7 +240,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   let themeColors: string[] | undefined
   const themePath = workbookDir ? `${workbookDir}/theme/theme1.xml` : "theme/theme1.xml"
   if (zip.has(themePath)) {
-    const themeXml = decodeUtf8(await zip.extract(themePath))
+    const themeXml = decodeUtf8(await zip.extract(themePath), themePath)
     themeColors = parseThemeColors(themeXml)
   }
 
@@ -219,7 +251,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   if (personsRel) {
     const personsPath = resolvePath(workbookDir, personsRel.target)
     if (zip.has(personsPath)) {
-      const personsXml = decodeUtf8(await zip.extract(personsPath))
+      const personsXml = decodeUtf8(await zip.extract(personsPath), personsPath)
       persons = parsePersons(personsXml)
     }
   }
@@ -235,10 +267,10 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   for (const rel of externalLinkRels) {
     const linkPath = resolvePath(workbookDir, rel.target)
     if (!zip.has(linkPath)) continue
-    const linkXml = decodeUtf8(await zip.extract(linkPath))
+    const linkXml = decodeUtf8(await zip.extract(linkPath), linkPath)
     const linkRelsPath = relsPathFor(linkPath)
     const linkRelsXml = zip.has(linkRelsPath)
-      ? decodeUtf8(await zip.extract(linkRelsPath))
+      ? decodeUtf8(await zip.extract(linkRelsPath), linkRelsPath)
       : undefined
     externalLinks.push(parseExternalLink(linkXml, linkRelsXml))
   }
@@ -253,7 +285,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   if (cellImagesRel) {
     const cellImagesPath = resolvePath(workbookDir, cellImagesRel.target)
     if (zip.has(cellImagesPath)) {
-      const ciXml = decodeUtf8(await zip.extract(cellImagesPath))
+      const ciXml = decodeUtf8(await zip.extract(cellImagesPath), cellImagesPath)
       const refs = parseCellImages(ciXml)
 
       // Resolve each embed rId against the sibling _rels file and
@@ -262,7 +294,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
       const ciDir = dirname(cellImagesPath)
       const media = new Map<string, { data: Uint8Array; type: SheetImage["type"] }>()
       if (zip.has(ciRelsPath)) {
-        const ciRelsXml = decodeUtf8(await zip.extract(ciRelsPath))
+        const ciRelsXml = decodeUtf8(await zip.extract(ciRelsPath), ciRelsPath)
         for (const rel of parseRelationships(ciRelsXml)) {
           if (!matchesRelType(rel.type, "image")) continue
           const mediaPath = resolvePath(ciDir, rel.target)
@@ -291,14 +323,14 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
     if (!rel) continue
     const cachePath = resolvePath(workbookDir, rel.target)
     if (!zip.has(cachePath)) continue
-    const cacheXml = decodeUtf8(await zip.extract(cachePath))
+    const cacheXml = decodeUtf8(await zip.extract(cachePath), cachePath)
     const cache = parsePivotCacheDefinition(cacheXml)
     if (!cache) continue
     cache.cacheId = ref.cacheId
     // Detect a sibling pivotCacheRecords part via the cache's _rels.
     const cacheRelsPath = relsPathFor(cachePath)
     if (zip.has(cacheRelsPath)) {
-      const cacheRelsXml = decodeUtf8(await zip.extract(cacheRelsPath))
+      const cacheRelsXml = decodeUtf8(await zip.extract(cacheRelsPath), cacheRelsPath)
       const cacheRels = parseRelationships(cacheRelsXml)
       if (cacheRels.some((r) => matchesRelType(r.type, "pivotCacheRecords"))) {
         cache.hasRecords = true
@@ -324,7 +356,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   for (const rel of slicerCacheRels) {
     const cachePath = resolvePath(workbookDir, rel.target)
     if (!zip.has(cachePath)) continue
-    const cacheXml = decodeUtf8(await zip.extract(cachePath))
+    const cacheXml = decodeUtf8(await zip.extract(cachePath), cachePath)
     const cache = parseSlicerCache(cacheXml)
     if (cache) slicerCaches.push(cache)
   }
@@ -338,16 +370,41 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   for (const rel of timelineCacheRels) {
     const cachePath = resolvePath(workbookDir, rel.target)
     if (!zip.has(cachePath)) continue
-    const cacheXml = decodeUtf8(await zip.extract(cachePath))
+    const cacheXml = decodeUtf8(await zip.extract(cachePath), cachePath)
     const cache = parseTimelineCache(cacheXml)
     if (cache) timelineCaches.push(cache)
   }
 
+  // 7i. Parse cell metadata (xl/metadata.xml). Cells point into its
+  // cellMetadata collection with `cm`; for hucre the only records that
+  // matter are the dynamic-array (XLDAPR) ones. Resolved once for the
+  // whole package because the part is workbook-level.
+  let dynamicArrayCm: Set<number> | undefined
+  const metadataRel = workbookRels.find((r) => matchesRelType(r.type, "sheetMetadata"))
+  if (metadataRel) {
+    const metadataPath = resolvePath(workbookDir, metadataRel.target)
+    if (zip.has(metadataPath)) {
+      dynamicArrayCm = parseDynamicArrayCellMetadata(
+        decodeUtf8(await zip.extract(metadataPath), metadataPath),
+      )
+    }
+  }
+
   // 8. Build a map of rId → sheet relationship for worksheet paths
   const sheetRelMap = new Map<string, string>()
+  // …and one for the tabs that are not worksheets. `<sheets>` lists
+  // every tab whatever its kind and the relationship type is what tells
+  // them apart, so a chart sheet's rId simply never entered the map
+  // above — and the lookup below threw, taking every ordinary worksheet
+  // in the book down with it. See #499.
+  const nonWorksheetKinds = new Map<string, SheetKind>()
   for (const rel of workbookRels) {
     if (matchesRelType(rel.type, "worksheet")) {
       sheetRelMap.set(rel.id, resolvePath(workbookDir, rel.target))
+    } else if (matchesRelType(rel.type, "chartsheet")) {
+      nonWorksheetKinds.set(rel.id, "chartsheet")
+    } else if (matchesRelType(rel.type, "dialogsheet")) {
+      nonWorksheetKinds.set(rel.id, "dialogsheet")
     }
   }
 
@@ -359,18 +416,34 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
 
   const sheets = []
   for (const info of sheetsToRead) {
+    // A tab that is not a worksheet has no cells to read. It becomes an
+    // empty sheet rather than being skipped, so `sheets: [2]` still
+    // selects what Excel's third tab is — renumbering would be a quieter
+    // kind of wrong.
+    const kind = nonWorksheetKinds.get(info.rId)
+    if (kind !== undefined) {
+      const placeholder: Sheet = { name: info.name, rows: [], kind }
+      if (info.state === "hidden") placeholder.hidden = true
+      if (info.state === "veryHidden") placeholder.veryHidden = true
+      sheets.push(placeholder)
+      continue
+    }
+
     const wsPath = sheetRelMap.get(info.rId)
     if (!wsPath || !zip.has(wsPath)) {
       throw new ParseError(`Invalid XLSX: missing worksheet file for sheet "${info.name}"`)
     }
 
-    // Check for worksheet-level relationships (hyperlinks, etc.)
+    // Check for worksheet-level relationships (hyperlinks, etc.).
+    // relsPathFor handles a root-level part; the hand-rolled slice here
+    // ate the first character when dirname returned "", so sheet1.xml
+    // looked for _rels/heet1.xml.rels and every relationship-reached
+    // feature silently vanished. See #391.
     const wsDir = dirname(wsPath)
-    const wsFileName = wsPath.slice(wsDir.length + 1)
-    const wsRelsPath = wsDir ? `${wsDir}/_rels/${wsFileName}.rels` : `_rels/${wsFileName}.rels`
+    const wsRelsPath = relsPathFor(wsPath)
     let worksheetRels: Relationship[] | undefined
     if (zip.has(wsRelsPath)) {
-      const wsRelsXml = decodeUtf8(await zip.extract(wsRelsPath))
+      const wsRelsXml = decodeUtf8(await zip.extract(wsRelsPath), wsRelsPath)
       worksheetRels = parseRelationships(wsRelsXml)
     }
 
@@ -382,10 +455,14 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
       worksheetRels,
       maxRows: options?.maxRows,
       range: options?.range,
+      maxTotalCells: options?.maxTotalCells,
+      sparse: options?.sparse,
+      dynamicArrayCm,
+      sheetName: info.name,
+      onWarning: options?.onWarning,
     }
 
-    const wsXml = decodeUtf8(await zip.extract(wsPath))
-    const sheet = parseWorksheet(wsXml, info.name, worksheetCtx)
+    const sheet = await readWorksheet(zip, wsPath, info.name, worksheetCtx)
     if (info.state === "hidden") sheet.hidden = true
     if (info.state === "veryHidden") sheet.veryHidden = true
 
@@ -410,10 +487,12 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
           const charts: import("../_types").Chart[] = []
           for (const chartRef of drawing.chartRefs) {
             if (!zip.has(chartRef.path)) continue
-            const chartXml = decodeUtf8(await zip.extract(chartRef.path))
+            const chartXml = decodeUtf8(await zip.extract(chartRef.path), chartRef.path)
             const chart = parseChart(chartXml)
             if (!chart) continue
             if (chartRef.anchor) chart.anchor = chartRef.anchor
+            if (chartRef.altText) chart.altText = chartRef.altText
+            if (chartRef.frameTitle) chart.frameTitle = chartRef.frameTitle
             charts.push(chart)
           }
           if (charts.length > 0) sheet.charts = charts
@@ -427,7 +506,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
       if (commentsRel) {
         const commentsPath = resolvePath(wsDir, commentsRel.target)
         if (zip.has(commentsPath)) {
-          const commentsXml = decodeUtf8(await zip.extract(commentsPath))
+          const commentsXml = decodeUtf8(await zip.extract(commentsPath), commentsPath)
           const commentsMap = parseComments(commentsXml)
 
           // Attach comments to cell objects
@@ -460,7 +539,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
       if (threadedRel) {
         const tcPath = resolvePath(wsDir, threadedRel.target)
         if (zip.has(tcPath)) {
-          const tcXml = decodeUtf8(await zip.extract(tcPath))
+          const tcXml = decodeUtf8(await zip.extract(tcPath), tcPath)
           const threaded = parseThreadedComments(tcXml)
           if (threaded.length > 0) sheet.threadedComments = threaded
         }
@@ -475,7 +554,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
         for (const tableRel of tableRels) {
           const tablePath = resolvePath(wsDir, tableRel.target)
           if (zip.has(tablePath)) {
-            const tableXml = decodeUtf8(await zip.extract(tablePath))
+            const tableXml = decodeUtf8(await zip.extract(tablePath), tablePath)
             const tableDef = parseTableXml(tableXml)
             if (tableDef) {
               tables.push(tableDef)
@@ -510,7 +589,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
         for (const ptRel of pivotTableRels) {
           const ptPath = resolvePath(wsDir, ptRel.target)
           if (!zip.has(ptPath)) continue
-          const ptXml = decodeUtf8(await zip.extract(ptPath))
+          const ptXml = decodeUtf8(await zip.extract(ptPath), ptPath)
           const pivot = parsePivotTable(ptXml)
           if (!pivot) continue
           // Resolve the pivot's owning cache via its sibling _rels —
@@ -519,7 +598,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
           // stay tolerant of caches living anywhere under xl/.
           const ptRelsPath = relsPathFor(ptPath)
           if (zip.has(ptRelsPath)) {
-            const ptRelsXml = decodeUtf8(await zip.extract(ptRelsPath))
+            const ptRelsXml = decodeUtf8(await zip.extract(ptRelsPath), ptRelsPath)
             const ptInternalRels = parseRelationships(ptRelsXml)
             const cacheRel = ptInternalRels.find((r) =>
               matchesRelType(r.type, "pivotCacheDefinition"),
@@ -555,7 +634,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
         for (const rel of slicerRels) {
           const path = resolvePath(wsDir, rel.target)
           if (!zip.has(path)) continue
-          const slicerXml = decodeUtf8(await zip.extract(path))
+          const slicerXml = decodeUtf8(await zip.extract(path), path)
           for (const s of parseSlicers(slicerXml)) slicers.push(s)
         }
         if (slicers.length > 0) sheet.slicers = slicers
@@ -568,7 +647,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
         for (const rel of timelineRels) {
           const path = resolvePath(wsDir, rel.target)
           if (!zip.has(path)) continue
-          const tlXml = decodeUtf8(await zip.extract(path))
+          const tlXml = decodeUtf8(await zip.extract(path), path)
           for (const t of parseTimelines(tlXml)) timelines.push(t)
         }
         if (timelines.length > 0) sheet.timelines = timelines
@@ -582,7 +661,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   let properties: import("../_types").WorkbookProperties | undefined
 
   if (zip.has("docProps/core.xml")) {
-    const coreXml = decodeUtf8(await zip.extract("docProps/core.xml"))
+    const coreXml = decodeUtf8(await zip.extract("docProps/core.xml"), "docProps/core.xml")
     const coreProps = parseCoreProperties(coreXml)
     if (Object.keys(coreProps).length > 0) {
       properties = { ...coreProps }
@@ -590,7 +669,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   }
 
   if (zip.has("docProps/app.xml")) {
-    const appXml = decodeUtf8(await zip.extract("docProps/app.xml"))
+    const appXml = decodeUtf8(await zip.extract("docProps/app.xml"), "docProps/app.xml")
     const appProps = parseAppProperties(appXml)
     if (Object.keys(appProps).length > 0) {
       properties = { ...properties, ...appProps }
@@ -598,7 +677,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   }
 
   if (zip.has("docProps/custom.xml")) {
-    const customXml = decodeUtf8(await zip.extract("docProps/custom.xml"))
+    const customXml = decodeUtf8(await zip.extract("docProps/custom.xml"), "docProps/custom.xml")
     const customProps = parseCustomProperties(customXml)
     if (Object.keys(customProps).length > 0) {
       if (!properties) properties = {}
@@ -612,12 +691,9 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
     dateSystem,
   }
 
-  if (parsedStyles?.fonts[0]) {
-    workbook.defaultFont = parsedStyles.fonts[0]
-  }
-
-  if (namedRanges.length > 0) {
-    workbook.namedRanges = namedRanges
+  const remainingNames = applyPrintDefinedNames(sheets, namedRanges)
+  if (remainingNames.length > 0) {
+    workbook.namedRanges = remainingNames
   }
 
   if (properties) {
@@ -630,6 +706,18 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
 
   if (workbookProtection) {
     workbook.workbookProtection = workbookProtection
+  }
+
+  if (activeSheet !== undefined) {
+    workbook.activeSheet = activeSheet
+  }
+
+  // The workbook's default font is fonts[0] in styles.xml — the entry
+  // every xf inherits from unless it names another. Surfacing it closes
+  // the WriteOptions.defaultFont round trip.
+  const baseFont = parsedStyles?.fonts[0]
+  if (baseFont && Object.keys(baseFont).length > 0) {
+    workbook.defaultFont = baseFont
   }
 
   if (persons && persons.length > 0) {
@@ -720,6 +808,10 @@ interface DrawingChartRef {
   path: string
   /** Cell anchor surfaced through {@link Chart.anchor}. */
   anchor?: ChartAnchor
+  /** `<xdr:cNvPr @descr>` surfaced through {@link Chart.altText}. */
+  altText?: string
+  /** `<xdr:cNvPr @title>` surfaced through {@link Chart.frameTitle}. */
+  frameTitle?: string
 }
 
 interface DrawingExtraction {
@@ -744,14 +836,13 @@ async function extractSheetDrawing(
 ): Promise<DrawingExtraction> {
   if (!zip.has(drawingPath)) return { images: [], textBoxes: [], chartRefs: [] }
 
-  const drawingXml = decodeUtf8(await zip.extract(drawingPath))
+  const drawingXml = decodeUtf8(await zip.extract(drawingPath), drawingPath)
 
-  // Parse drawing relationships
+  // Parse drawing relationships. Same fix as the worksheet path — the
+  // hand-rolled slice dropped the first character for a root-level
+  // drawing. See #391.
   const drawDir = dirname(drawingPath)
-  const drawFileName = drawingPath.slice(drawDir.length + 1)
-  const drawRelsPath = drawDir
-    ? `${drawDir}/_rels/${drawFileName}.rels`
-    : `_rels/${drawFileName}.rels`
+  const drawRelsPath = relsPathFor(drawingPath)
 
   const imageRelMap = new Map<string, string>()
   // Chart relationships are resolved by the same .rels file. We collect
@@ -759,7 +850,7 @@ async function extractSheetDrawing(
   // graphicFrame walk below can map each chart reference to a file.
   const chartRelMap = new Map<string, string>()
   if (zip.has(drawRelsPath)) {
-    const drawRelsXml = decodeUtf8(await zip.extract(drawRelsPath))
+    const drawRelsXml = decodeUtf8(await zip.extract(drawRelsPath), drawRelsPath)
     const drawRels = parseRelationships(drawRelsXml)
     for (const rel of drawRels) {
       if (matchesRelType(rel.type, "image")) {
@@ -795,6 +886,14 @@ async function extractSheetDrawing(
           const anchor = local === "absoluteAnchor" ? undefined : parseChartCellAnchor(child, local)
           const ref: DrawingChartRef = { path: chartPath }
           if (anchor) ref.anchor = anchor
+          // Accessibility metadata sits on the frame in the drawing, not
+          // in the chart part — collect it while we still have the anchor.
+          const frame = findChildEl(child, "graphicFrame")
+          if (frame) {
+            const meta = findCNvPrMeta(frame, "nvGraphicFramePr")
+            if (meta.altText) ref.altText = meta.altText
+            if (meta.title) ref.frameTitle = meta.title
+          }
           chartRefs.push(ref)
         }
       }
@@ -819,6 +918,8 @@ async function extractSheetDrawing(
             type: imageInfo.type,
             anchor: imageInfo.anchor,
           }
+          if (imageInfo.width !== undefined) img.width = imageInfo.width
+          if (imageInfo.height !== undefined) img.height = imageInfo.height
           if (imageInfo.altText !== undefined) img.altText = imageInfo.altText
           if (imageInfo.title !== undefined) img.title = imageInfo.title
           images.push(img)
@@ -914,14 +1015,19 @@ function parseTwoCellAnchor(
   mediaPath: string
   type: SheetImage["type"]
   anchor: SheetImage["anchor"]
+  width?: number
+  height?: number
   altText?: string
   title?: string
 } | null {
-  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
-  let to: NonNullable<SheetImage["anchor"]["to"]> = { row: 0, col: 0 }
+  let fromRow = 0
+  let fromCol = 0
+  let toRow = 0
+  let toCol = 0
   let embedId: string | undefined
   let altText: string | undefined
   let title: string | undefined
+  let size: { width: number; height: number } | undefined
 
   for (const child of el.children) {
     if (typeof child === "string") continue
@@ -934,14 +1040,19 @@ function parseTwoCellAnchor(
     const local = c.local || c.tag
 
     if (local === "from") {
-      from = parseAnchorPosition(c)
+      const pos = parseAnchorPosition(c)
+      fromRow = pos.row
+      fromCol = pos.col
     } else if (local === "to") {
-      to = parseAnchorPosition(c)
+      const pos = parseAnchorPosition(c)
+      toRow = pos.row
+      toCol = pos.col
     } else if (local === "pic") {
       embedId = findBlipEmbed(c)
       const meta = findCNvPrMeta(c, "nvPicPr")
       altText = meta.altText
       title = meta.title
+      size = findShapeExtent(c)
     }
   }
 
@@ -958,25 +1069,60 @@ function parseTwoCellAnchor(
     mediaPath: string
     type: SheetImage["type"]
     anchor: SheetImage["anchor"]
+    width?: number
+    height?: number
     altText?: string
     title?: string
   } = {
     mediaPath,
     type: imageType,
     anchor: {
-      from,
-      to,
+      from: { row: fromRow, col: fromCol },
+      to: { row: toRow, col: toCol },
     },
+  }
+  if (size) {
+    result.width = size.width
+    result.height = size.height
   }
   if (altText) result.altText = altText
   if (title) result.title = title
   return result
 }
 
+/**
+ * Pull the rendered size off a `<xdr:pic>` / `<xdr:sp>` shape's
+ * `<xdr:spPr><a:xfrm><a:ext cx cy>`, converted from EMU to pixels.
+ *
+ * On a `twoCellAnchor` the from/to cells are what Excel actually honours,
+ * but `a:ext` is still required by the schema and every writer — hucre's
+ * included — records the intended size there. Reading it is the only way
+ * to recover {@link SheetImage.width} from a hucre-written file, which
+ * always uses `twoCellAnchor` (#407).
+ */
+function findShapeExtent(shapeEl: {
+  children: Array<unknown>
+}): { width: number; height: number } | undefined {
+  const spPr = findChildEl(shapeEl, "spPr")
+  if (!spPr) return undefined
+  const xfrm = findChildEl(spPr, "xfrm")
+  if (!xfrm) return undefined
+  const ext = findChildEl(xfrm, "ext")
+  if (!ext) return undefined
+  const cx = Number(ext.attrs["cx"])
+  const cy = Number(ext.attrs["cy"])
+  // A zero / absent extent is a placeholder, not a 0×0 shape — the chart
+  // writer emits exactly that. Report nothing rather than a size of 0.
+  if (!(cx > 0) || !(cy > 0)) return undefined
+  return { width: Math.round(cx / EMU_PER_PIXEL), height: Math.round(cy / EMU_PER_PIXEL) }
+}
+
 /** Parse a twoCellAnchor element that contains a textbox shape (sp with txBox="1") */
 function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextBox | null {
-  let from: SheetTextBox["anchor"]["from"] = { row: 0, col: 0 }
-  let to: NonNullable<SheetTextBox["anchor"]["to"]> = { row: 0, col: 0 }
+  let fromRow = 0
+  let fromCol = 0
+  let toRow = 0
+  let toCol = 0
   let spElement: any = null
 
   for (const child of el.children) {
@@ -990,9 +1136,13 @@ function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextB
     const local = c.local || c.tag
 
     if (local === "from") {
-      from = parseAnchorPosition(c)
+      const pos = parseAnchorPosition(c)
+      fromRow = pos.row
+      fromCol = pos.col
     } else if (local === "to") {
-      to = parseAnchorPosition(c)
+      const pos = parseAnchorPosition(c)
+      toRow = pos.row
+      toCol = pos.col
     } else if (local === "sp") {
       // Check if this is a textbox shape
       const nvSpPr = findChildEl(c, "nvSpPr")
@@ -1061,9 +1211,15 @@ function parseTwoCellAnchorTextBox(el: { children: Array<unknown> }): SheetTextB
   const tb: SheetTextBox = {
     text,
     anchor: {
-      from,
-      to,
+      from: { row: fromRow, col: fromCol },
+      to: { row: toRow, col: toCol },
     },
+  }
+
+  const size = findShapeExtent(spElement)
+  if (size) {
+    tb.width = size.width
+    tb.height = size.height
   }
 
   // Pull alt text / title off cNvPr so screen-reader metadata round-trips.
@@ -1184,7 +1340,8 @@ function parseOneCellAnchor(
   altText?: string
   title?: string
 } | null {
-  let from: SheetImage["anchor"]["from"] = { row: 0, col: 0 }
+  let fromRow = 0
+  let fromCol = 0
   let widthEmu = 0
   let heightEmu = 0
   let embedId: string | undefined
@@ -1202,7 +1359,9 @@ function parseOneCellAnchor(
     const local = c.local || c.tag
 
     if (local === "from") {
-      from = parseAnchorPosition(c)
+      const pos = parseAnchorPosition(c)
+      fromRow = pos.row
+      fromCol = pos.col
     } else if (local === "ext") {
       // <xdr:ext cx="..." cy="..."/>
       widthEmu = Number(c.attrs["cx"]) || 0
@@ -1235,7 +1394,7 @@ function parseOneCellAnchor(
     mediaPath,
     type: imageType,
     anchor: {
-      from,
+      from: { row: fromRow, col: fromCol },
     },
   }
 
@@ -1252,14 +1411,15 @@ function parseOneCellAnchor(
 }
 
 /**
- * Walk a `<xdr:pic>` or `<xdr:sp>` element and extract `descr=`/`title=`
- * from its `xdr:cNvPr`. The cNvPr element lives inside an `nv*Pr`
- * wrapper named `nvPicPr` (pictures) or `nvSpPr` (shapes). Returns
- * empty fields when neither attribute is present.
+ * Walk a `<xdr:pic>`, `<xdr:sp>` or `<xdr:graphicFrame>` element and
+ * extract `descr=`/`title=` from its `xdr:cNvPr`. The cNvPr element lives
+ * inside an `nv*Pr` wrapper named `nvPicPr` (pictures), `nvSpPr` (shapes)
+ * or `nvGraphicFramePr` (charts). Returns empty fields when neither
+ * attribute is present.
  */
 function findCNvPrMeta(
   parentEl: { children: Array<unknown> },
-  wrapperName: "nvPicPr" | "nvSpPr",
+  wrapperName: "nvPicPr" | "nvSpPr" | "nvGraphicFramePr",
 ): { altText?: string; title?: string } {
   const wrapper = findChildEl(parentEl, wrapperName)
   if (!wrapper) return {}
@@ -1272,16 +1432,9 @@ function findCNvPrMeta(
 }
 
 /** Parse row/col from an anchor position element (from or to) */
-function parseAnchorPosition(el: { children: Array<unknown> }): {
-  row: number
-  col: number
-  rowOff?: number
-  colOff?: number
-} {
+function parseAnchorPosition(el: { children: Array<unknown> }): { row: number; col: number } {
   let row = 0
   let col = 0
-  let rowOff: number | undefined
-  let colOff: number | undefined
 
   for (const child of el.children) {
     if (typeof child === "string") continue
@@ -1293,21 +1446,10 @@ function parseAnchorPosition(el: { children: Array<unknown> }): {
       row = Number(text) || 0
     } else if (local === "col") {
       col = Number(text) || 0
-    } else if (local === "rowOff") {
-      const n = Number(text)
-      if (Number.isFinite(n)) rowOff = n
-    } else if (local === "colOff") {
-      const n = Number(text)
-      if (Number.isFinite(n)) colOff = n
     }
   }
 
-  return {
-    row,
-    col,
-    ...(rowOff ? { rowOff } : {}),
-    ...(colOff ? { colOff } : {}),
-  }
+  return { row, col }
 }
 
 /** Find the r:embed attribute on the blip element inside a pic element */
@@ -1347,6 +1489,75 @@ function findEmbedAttr(attrs: Record<string, string>): string | undefined {
   return undefined
 }
 
+// ── Print Defined Names ──────────────────────────────────────────────
+
+/**
+ * Fold the reserved `_xlnm.Print_Area` / `_xlnm.Print_Titles` defined
+ * names back into the owning sheet's {@link PageSetup} and return the
+ * defined names that remain.
+ *
+ * The writer only ever *derives* these two names from `pageSetup`
+ * (`buildNamedRanges`), so `pageSetup` is the single authoring surface.
+ * Leaving them in `namedRanges` as well would give the same setting two
+ * unconnected representations depending on the direction of travel
+ * (#407) — and would make `openXlsx` → `saveXlsx` emit each name twice,
+ * once from the carried-over `namedRanges` entry and once re-derived
+ * from `pageSetup`. So they are consumed, not copied.
+ *
+ * A name we cannot attribute to a sheet we actually read — no
+ * `localSheetId`, or a sheet skipped by `ReadOptions.sheets` — is left
+ * alone; dropping it would lose information with nowhere else to go.
+ */
+function applyPrintDefinedNames(sheets: Sheet[], namedRanges: NamedRange[]): NamedRange[] {
+  if (namedRanges.length === 0) return namedRanges
+
+  const byName = new Map<string, Sheet>()
+  for (const sheet of sheets) byName.set(sheet.name, sheet)
+
+  const remaining: NamedRange[] = []
+  for (const nr of namedRanges) {
+    const isPrintArea = nr.name === "_xlnm.Print_Area"
+    const isPrintTitles = nr.name === "_xlnm.Print_Titles"
+    const sheet = nr.scope !== undefined ? byName.get(nr.scope) : undefined
+    if ((!isPrintArea && !isPrintTitles) || !sheet) {
+      remaining.push(nr)
+      continue
+    }
+
+    const pageSetup = sheet.pageSetup ?? (sheet.pageSetup = {})
+    if (isPrintArea) {
+      const area = nr.range
+        .split(",")
+        .map(stripSheetQualifier)
+        .filter((part) => part.length > 0)
+        .join(",")
+      if (area) pageSetup.printArea = area
+    } else {
+      // Print_Titles packs the repeat-rows and repeat-columns ranges into
+      // one comma-separated value, in either order. A row range is all
+      // digits ("$1:$1"), a column range all letters ("$A:$A").
+      for (const raw of nr.range.split(",")) {
+        const part = stripSheetQualifier(raw)
+        if (!part) continue
+        if (/\d/.test(part)) pageSetup.printTitlesRow = part
+        else pageSetup.printTitlesColumn = part
+      }
+    }
+  }
+
+  return remaining
+}
+
+/**
+ * Drop the `Sheet1!` / `'My Sheet'!` prefix from one range of a defined
+ * name, leaving the bare A1 reference that {@link PageSetup} stores.
+ */
+function stripSheetQualifier(range: string): string {
+  const trimmed = range.trim()
+  const bang = trimmed.lastIndexOf("!")
+  return bang === -1 ? trimmed : trimmed.slice(bang + 1)
+}
+
 // ── Workbook XML Parsing ─────────────────────────────────────────────
 
 interface SheetInfo {
@@ -1364,6 +1575,13 @@ function parseWorkbookXml(
   dateSystem: "1900" | "1904"
   namedRanges: NamedRange[]
   workbookProtection?: { lockStructure?: boolean; lockWindows?: boolean }
+  /**
+   * `<bookViews><workbookView activeTab>` — the tab Excel opens on.
+   * Omitted when the file declares tab 0, which is the OOXML default and
+   * therefore indistinguishable from "the file said nothing"; the same
+   * collapse the chart reader applies to `<c:overlay val="0"/>`.
+   */
+  activeSheet?: number
   /**
    * Pivot cache wiring read off the workbook's `<pivotCaches>` block.
    * Each entry maps a cacheId (Excel's stable handle) to an rId in
@@ -1386,6 +1604,7 @@ function parseWorkbookXml(
   }
 
   let wbProtection: { lockStructure?: boolean; lockWindows?: boolean } | undefined
+  let activeSheet: number | undefined
 
   // First pass: collect sheets (needed for resolving localSheetId)
   for (const child of doc.children) {
@@ -1411,6 +1630,18 @@ function parseWorkbookXml(
         wbProtection = {}
         if (lockStructure) wbProtection.lockStructure = true
         if (lockWindows) wbProtection.lockWindows = true
+      }
+    }
+
+    if (local === "bookViews") {
+      for (const viewChild of child.children) {
+        if (typeof viewChild === "string") continue
+        const viewLocal = viewChild.local || viewChild.tag
+        if (viewLocal !== "workbookView") continue
+        const tab = Number(viewChild.attrs["activeTab"])
+        // Excel writes one workbookView per window; the first is the one
+        // that decides the opening tab.
+        if (Number.isInteger(tab) && tab > 0 && activeSheet === undefined) activeSheet = tab
       }
     }
 
@@ -1498,19 +1729,9 @@ function parseWorkbookXml(
     dateSystem,
     namedRanges,
     workbookProtection: wbProtection,
+    activeSheet,
     pivotCacheRefs,
   }
-}
-
-/** Find an r:id attribute regardless of namespace prefix */
-function findRIdAttr(attrs: Record<string, string>): string | undefined {
-  for (const key of Object.keys(attrs)) {
-    // Match any prefix:id where the value looks like an rId
-    if (key.endsWith(":id") && attrs[key].startsWith("rId")) {
-      return attrs[key]
-    }
-  }
-  return undefined
 }
 
 /** Filter sheet infos based on user-specified sheets option */
@@ -1575,7 +1796,10 @@ function parseTableXml(xml: string): TableDefinition | null {
   let style: string | undefined
   let showRowStripes: boolean | undefined
   let showColumnStripes: boolean | undefined
-  let showAutoFilter = true
+  // The filter dropdowns exist only if <autoFilter> does — a table part
+  // with no such child renders none. Starting from `true` made a table
+  // written with `showAutoFilter: false` read back as `true` (#407).
+  let showAutoFilter = false
 
   for (const child of doc.children) {
     if (typeof child === "string") continue
@@ -1640,9 +1864,7 @@ function parseTableXml(xml: string): TableDefinition | null {
   if (showColumnStripes !== undefined) {
     tableDef.showColumnStripes = showColumnStripes
   }
-  if (showAutoFilter !== undefined) {
-    tableDef.showAutoFilter = showAutoFilter
-  }
+  tableDef.showAutoFilter = showAutoFilter
   if (showTotalRow) {
     tableDef.showTotalRow = true
   }

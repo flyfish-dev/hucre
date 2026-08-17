@@ -1,0 +1,97 @@
+# Third-party fixtures
+
+Not one of these was written by hucre.
+
+That is the whole point. Before they existed, the suite parsed nothing
+but hucre's own output, so a writer bug the reader mirrored was
+invisible — and three of the defects fixed in the #439 round were exactly
+that shape. See #464.
+
+Three producers, four formats:
+
+|            | `*.xlsx`                       | `sheetjs-*.ods`                                            | `libreoffice-basic.ods`   | `sheetjs-*.{xlsb,xls}`             |
+| ---------- | ------------------------------ | ---------------------------------------------------------- | ------------------------- | ---------------------------------- |
+| Written by | ExcelJS (MIT)                  | SheetJS Community Edition, the `xlsx` package (Apache-2.0) | LibreOfficeDev 26.8       | SheetJS                            |
+| Generator  | `make-exceljs-fixtures.mjs`    | `make-sheetjs-ods-fixtures.mjs`                            | LibreOffice CLI           | `make-sheetjs-binary-fixtures.mjs` |
+| Read by    | `third-party-fixtures.test.ts` | `ods-third-party.test.ts`                                  | `ods-third-party.test.ts` | `xlsb-short-records.test.ts`       |
+
+(Generators live in `scripts/fixtures/`, tests in `test/`.)
+
+The XLSX corpus came first, and left the ODS reader as the one that had
+still never parsed a byte it did not write. The SheetJS ODS half closed
+that, and the binary half closed the last of it — `PROVENANCE.md` had
+named the XLS and XLSB readers "the sharp end", and openpyxl writes
+`.xlsx` only, so they had exactly one source until these.
+
+## What they are, and what they are not
+
+All three are independent of hucre, with their own element ordering,
+defaults, and idea of what a minimal document contains. ExcelJS and
+SheetJS are independent implementations; LibreOffice is the application
+#464 specifically asked for. Together they give a golden-model test the
+class of divergence it needs — bytes hucre did not write.
+
+Two things SheetJS specifically will **not** emit, both now covered by
+the LibreOffice fixture:
+
+- `table:number-columns-repeated`, which LibreOffice uses for every run
+  of like cells and is the sharpest trap in the format.
+- error cells. SheetJS writes an error as an empty
+  `<table:table-cell/>`, so there is no error in the file to read.
+
+### They found three
+
+`libreoffice-basic.ods` is LibreOffice's conversion of the project-owned
+`../excel-basic.xlsx`. It found that a default-styled empty cell repeated
+to the edge of every row made `readOds` return 16,384 columns from five
+values. It also carries LibreOffice's error-cell spelling.
+
+The ODS corpus earned itself on the first run. A multi-line cell has two
+spellings in ODF: `<text:line-break/>` inside one paragraph, which is
+what hucre writes, or two `<text:p>` elements, which is what SheetJS and
+LibreOffice write. `streamOdsRows` handled the first and ran the second
+together — `"linebreak"` for a cell `readOds` read as `"line\nbreak"`.
+
+A suite that only ever parsed hucre's own output could not see it,
+because hucre never writes the spelling that breaks.
+
+The binary half earned itself on its first file too, and more sharply.
+The XLSB reader handled the full-form cell records and none of the
+`BrtShort*` forms — the same records with the column omitted, which is
+the previous cell's plus one. Excel writes the full form every time;
+SheetJS writes the short form for every cell after the first in a row.
+A twelve-column sheet read back **one column wide**, with no error. See
+`test/xlsb-short-records.test.ts`.
+
+Regenerating the binary fixtures: SheetJS converts a `Date` to a serial
+through _local_ time, so `sheetjs-dates.*` carries the offset of the
+machine that wrote it. The tests compare the two readers against each
+other rather than against an absolute instant, so regenerating elsewhere
+changes the bytes without breaking anything.
+
+## Licensing
+
+ExcelJS is MIT; SheetJS Community Edition is Apache-2.0. The LibreOffice
+fixture is a conversion of the project-owned `excel-basic.xlsx`; every
+value in all of these files was authored in this repository. Nothing is
+scraped and no third-party document is redistributed.
+
+## Regenerating
+
+None of the producers is a devDependency — these are committed bytes, so
+CI does not need them installed:
+
+```bash
+mkdir -p /tmp/gen && cd /tmp/gen && npm init -y && npm i exceljs xlsx
+node /path/to/hucre/scripts/fixtures/make-exceljs-fixtures.mjs /tmp/gen/node_modules
+node /path/to/hucre/scripts/fixtures/make-sheetjs-ods-fixtures.mjs /tmp/gen/node_modules
+node /path/to/hucre/scripts/fixtures/make-sheetjs-binary-fixtures.mjs /tmp/gen/node_modules
+
+soffice --headless --convert-to ods --outdir test/fixtures/third-party test/fixtures/excel-basic.xlsx
+mv test/fixtures/third-party/excel-basic.ods test/fixtures/third-party/libreoffice-basic.ods
+```
+
+Regenerating changes the bytes (timestamps, producer version). The tests
+assert on _content_, not on bytes, so that is fine — but do not
+regenerate casually, because the value of a fixture is that it stopped
+moving.

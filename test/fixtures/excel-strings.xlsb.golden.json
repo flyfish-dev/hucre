@@ -1,0 +1,39 @@
+{
+  "sheets": [
+    {
+      "name": "Strings",
+      "rows": [
+        ["  leading", "halfbold"],
+        ["trailing  ", null],
+        [" both ", null],
+        ["  leading", null],
+        ["plain", null],
+        [
+          "na\u00efve \u00fcn\u00efcode \u65e5\u672c\u8a9e \u03a9\u03bc\u03ad\u03b3\u03b1 \ud83d\ude00",
+          null
+        ],
+        ["a & b < c > d \"quoted\" 'apos'", null],
+        ["line one\nline two", null],
+        ["tab\tsep\u00a0nbsp", null],
+        ["  ", null]
+      ],
+      "merges": [],
+      "freeze": null,
+      "hiddenRows": [],
+      "hiddenColumns": [],
+      "styles": {},
+      "columnStyles": {},
+      "conditional": [],
+      "pageSetup": null,
+      "formulas": {},
+      "autoFilter": null,
+      "validations": [],
+      "protection": [],
+      "comments": []
+    }
+  ],
+  "dateSystem": null,
+  "namedRanges": [],
+  "hasAuthor": false,
+  "warnings": []
+}

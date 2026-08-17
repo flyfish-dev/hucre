@@ -2,9 +2,11 @@
 // Parses xl/worksheets/sheetN.xml into a Sheet object.
 
 import type {
+  ReadWarning,
   Sheet,
   Cell,
   CellValue,
+  CellStyle,
   MergeRange,
   RichTextRun,
   FontStyle,
@@ -21,7 +23,6 @@ import type {
   PageSetup,
   PageMargins,
   HeaderFooter,
-  PaperSize,
   FreezePane,
   SplitPane,
   Sparkline,
@@ -30,10 +31,78 @@ import type { SharedString } from "./shared-strings"
 import type { ParsedStyles } from "./styles"
 import type { Relationship } from "./relationships"
 import { resolveStyle, isDateStyle } from "./styles"
+import { cloneCellStyle } from "../_style"
+import { PAPER_SIZE_REVERSE } from "./worksheet-writer"
 import { serialToDate } from "../_date"
-import { parseSax, decodeOoxmlEscapes } from "../xml/parser"
-import { MAX_COL_INDEX, MAX_ROW_INDEX } from "../limits"
+import { parseSax, parseSaxStream, decodeOoxmlEscapes, type SaxHandlers } from "../xml/parser"
+import { MAX_CELL_MAP_ENTRIES, MAX_COL_INDEX, MAX_ROW_INDEX, MAX_TOTAL_CELLS } from "../limits"
 import { ParseError } from "../errors"
+
+/**
+ * The message for a sheet whose bounding box is over the limit.
+ *
+ * Pure, and exported, because the branch that matters cannot be reached
+ * from a test workbook: telling a caller *not* to try `sparse` needs a
+ * sheet with more than 16.7 million filled cells, which is a couple of
+ * gigabytes to build for one string.
+ *
+ * The advice is the point. A sparse sheet — 82k values over a 305M-slot
+ * box, 0.03% filled — wants `sparse: true`, and a dense one cannot use
+ * it: the cell count that blew the box limit is the same count that
+ * blows the `Map` behind `cells`. The message used to offer it either
+ * way. See #501, #527.
+ */
+export function oversizeSheetMessage(
+  name: string,
+  rowCount: number,
+  colCount: number,
+  totalCells: number,
+  cellCount: number,
+  cellLimit: number,
+): string {
+  const density = totalCells > 0 ? (100 * cellCount) / totalCells : 100
+  const sparseWouldFit = cellCount <= MAX_CELL_MAP_ENTRIES
+
+  return (
+    `Sheet "${name}" spans ${rowCount} rows x ${colCount} columns ` +
+    `(${totalCells} cells, ${density.toFixed(2)}% of them filled), ` +
+    `over the ${cellLimit} limit.\n` +
+    `  - streamXlsxRows(input) reads it a row at a time, whatever the box.\n` +
+    (sparseWouldFit
+      ? `  - readXlsx(input, { sparse: true }) returns the cells and no grid.\n`
+      : `  - \`sparse: true\` cannot help here: ${cellCount} filled cells is past ` +
+        `the ${MAX_CELL_MAP_ENTRIES} a Map can hold.\n`) +
+    `  - \`range\` or \`maxRows\` bound the area, if you know where the data is.\n` +
+    `  - \`maxTotalCells\` raises the bound, if the sheet really is this large.`
+  )
+}
+
+/**
+ * Refuse the cell that would overflow `Sheet.cells`.
+ *
+ * V8 caps a `Map` at 2^24 entries and answers the next `set` with a raw
+ * `RangeError: Map maximum size exceeded` — not a `HucreError`, naming
+ * no sheet, saying nothing about spreadsheets. Checking the size first
+ * costs one comparison per cell and turns that into a `ParseError` that
+ * names where to go instead.
+ *
+ * `has` is only consulted at the boundary, so the common path is the
+ * comparison alone.
+ */
+export function assertCellMapCapacity(
+  cells: Map<string, Cell>,
+  key: string,
+  sheetName: string | undefined,
+): void {
+  if (cells.size < MAX_CELL_MAP_ENTRIES || cells.has(key)) return
+
+  throw new ParseError(
+    `Sheet "${sheetName ?? "?"}" has more than ${MAX_CELL_MAP_ENTRIES} filled cells, ` +
+      `which is the most \`Sheet.cells\` can hold — a Map caps at 2^24 entries.\n` +
+      `  - streamXlsxRows(input) reads it a row at a time and has no such bound.\n` +
+      `The file is not damaged; it is larger than this model.`,
+  )
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -48,6 +117,35 @@ export interface WorksheetContext {
   maxRows?: number
   /** Cell range filter (e.g. "A1:D10"). Only cells within this range are returned. */
   range?: string
+  /** Bounding-box ceiling; see ReadOptions.maxTotalCells. Default {@link MAX_TOTAL_CELLS}. */
+  maxTotalCells?: number
+  /** Skip the dense grid and return cells only; see ReadOptions.sparse. */
+  sparse?: boolean
+  /** Name of the sheet being parsed, so a warning can say where it was. */
+  sheetName?: string
+  /** Where a dropped reference is reported; see ReadOptions.onWarning. */
+  onWarning?: (warning: ReadWarning) => void
+  /**
+   * One-based `cm` indexes that xl/metadata.xml resolves to a
+   * dynamic-array (XLDAPR) record. Undefined when the package ships no
+   * metadata part — see {@link isDynamicArrayCm}.
+   */
+  dynamicArrayCm?: Set<number>
+}
+
+/**
+ * Decide whether a cell's `cm` index marks a dynamic array.
+ *
+ * With a metadata part present the index is resolved properly. Without
+ * one there is nothing to resolve against, and the only producer known
+ * to emit a bare `cm` is hucre itself before #423 — which always meant
+ * "dynamic array" — so any non-zero index is taken at its word.
+ */
+function isDynamicArrayCm(raw: string | undefined, ctx: WorksheetContext): boolean {
+  if (raw === undefined) return false
+  const index = Number(raw)
+  if (!Number.isFinite(index) || index <= 0) return false
+  return ctx.dynamicArrayCm ? ctx.dynamicArrayCm.has(index) : true
 }
 
 // ── Cell Reference Parsing ───────────────────────────────────────────
@@ -85,6 +183,28 @@ export function parseCellRef(ref: string): { row: number; col: number } {
 }
 
 /**
+ * Bound a 1-based `<col min>` / `<col max>` attribute so it can safely
+ * drive a loop.
+ *
+ * Without this a single `max="1e999"` makes the expansion loop run
+ * forever (#355). An overflowing magnitude and outright garbage are
+ * treated differently on purpose: `1e999` parses to `Infinity`, which
+ * says "wider than representable", so it clamps to the last column the
+ * same way an absurd-but-finite `99999999` does. A value that is not a
+ * number at all carries no such intent and collapses to `fallback`,
+ * dropping the malformed element.
+ */
+function clampColumnBound(raw: string | undefined, fallback: number): number {
+  const value = Number(raw ?? "")
+  if (Number.isNaN(value)) return fallback
+  // Math.trunc leaves ±Infinity intact, so -Infinity fails the `< 1`
+  // guard below and +Infinity is capped by the Math.min.
+  const truncated = Math.trunc(value)
+  if (truncated < 1) return fallback
+  return Math.min(truncated, MAX_COL_INDEX + 1)
+}
+
+/**
  * Parse a range reference like "A1:B2" into start and end positions.
  */
 function parseRangeRef(ref: string): MergeRange {
@@ -103,15 +223,29 @@ function parseRangeRef(ref: string): MergeRange {
 // ── SAX-based Worksheet Parser ───────────────────────────────────────
 
 /**
- * Parse a worksheet XML into a Sheet using SAX parsing for performance.
- * This avoids building a full DOM tree for large worksheets.
+ * The SAX handlers for one worksheet, and the finalisation that turns
+ * what they collected into a {@link Sheet}.
+ *
+ * Split out so the buffered and the streaming reader drive the *same*
+ * handler set rather than two copies of it. A worksheet part over the
+ * string ceiling has to be parsed a chunk at a time (#503), and a second
+ * implementation of these 850 lines would be a second set of answers for
+ * every field of the model — the two would drift on the first field
+ * added to one and forgotten in the other, which is the failure mode
+ * `CONTRIBUTING.md` calls the registers. There is exactly one
+ * implementation; only the driver differs.
  */
-export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext): Sheet {
+function worksheetParser(
+  name: string,
+  ctx: WorksheetContext,
+): { handlers: SaxHandlers; finish: () => Sheet } {
   const rows: CellValue[][] = []
   const cells = new Map<string, Cell>()
   const merges: MergeRange[] = []
   let maxCol = -1
   let maxRow = -1
+  /** Cells that carried something — the numerator of the fill factor. */
+  let cellCount = 0
   let hasCells = false
 
   // Range filter — parse once, use in cell processing
@@ -148,6 +282,8 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
   // Sheet view settings (gridlines, zoom, RTL, tab color)
   let sheetView: SheetView | undefined
   let inSheetPr = false
+  let fitToPageFlag = false
+  let outlineProperties: import("../_types").OutlineProperties | undefined
 
   // Freeze/Split pane parsed from <pane> element
   let freezePane: FreezePane | undefined
@@ -193,10 +329,11 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
 
   // Row definitions (height, hidden, outlineLevel, collapsed)
   const rowDefs = new Map<number, import("../_types").RowDef>()
-  let sheetFormat: import("../_types").SheetFormat | undefined
 
   // Column definitions (width, hidden, outlineLevel, collapsed) parsed from <col> elements
   const columnDefs: import("../_types").ColumnDef[] = []
+  let defaultRowHeight: number | undefined
+  let defaultColWidth: number | undefined
   let inCols = false
 
   // SAX parsing state
@@ -267,44 +404,35 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
   let currentRunFont: FontStyle | undefined
   let _fontPropTag = ""
 
-  parseSax(xml, {
+  const handlers: SaxHandlers = {
     onOpenTag(tag, attrs) {
       const local = tag.includes(":") ? tag.slice(tag.indexOf(":") + 1) : tag
 
       switch (local) {
-        case "sheetFormatPr": {
-          const parsed: import("../_types").SheetFormat = {}
-          const defaultRowHeight = numberAttr(attrs, "defaultRowHeight")
-          const defaultColWidth = numberAttr(attrs, "defaultColWidth")
-          const baseColWidth = numberAttr(attrs, "baseColWidth")
-          const outlineLevelRow = numberAttr(attrs, "outlineLevelRow")
-          const outlineLevelCol = numberAttr(attrs, "outlineLevelCol")
-          const dyDescent = numberAttr(attrs, "dyDescent")
-          if (defaultRowHeight !== undefined) parsed.defaultRowHeight = defaultRowHeight
-          if (defaultColWidth !== undefined) parsed.defaultColWidth = defaultColWidth
-          if (baseColWidth !== undefined) parsed.baseColWidth = baseColWidth
-          if (outlineLevelRow !== undefined) parsed.outlineLevelRow = outlineLevelRow
-          if (outlineLevelCol !== undefined) parsed.outlineLevelCol = outlineLevelCol
-          if (dyDescent !== undefined) parsed.dyDescent = dyDescent
-          if (attrs["zeroHeight"] === "1" || attrs["zeroHeight"] === "true")
-            parsed.zeroHeight = true
-          if (Object.keys(parsed).length > 0) sheetFormat = parsed
-          break
-        }
         case "cols":
           inCols = true
           break
         case "col":
           if (inCols) {
-            const minCol = Number(attrs["min"] || "0")
-            const maxCol2 = Number(attrs["max"] || "0")
+            // `min`/`max` are 1-based and drive the loop below, so they are
+            // bounded before use: `max="1e999"` parses to Infinity and would
+            // spin forever, and any finite value past Excel's column count
+            // would allocate until the heap gives out. A range wider than the
+            // sheet can hold is malformed, so it is clamped rather than
+            // honoured. See #355.
+            const minCol = clampColumnBound(attrs["min"], 1)
+            const maxCol2 = clampColumnBound(attrs["max"], 0)
             const width = attrs["width"] ? Number(attrs["width"]) : undefined
-            const styleIndex = attrs["style"] !== undefined ? Number(attrs["style"]) : undefined
             const hidden = attrs["hidden"] === "1" || attrs["hidden"] === "true"
             const outlineLevel = attrs["outlineLevel"] ? Number(attrs["outlineLevel"]) : undefined
             const collapsed = attrs["collapsed"] === "1" || attrs["collapsed"] === "true"
-            const style =
-              ctx.readStyles && ctx.styles && styleIndex !== undefined && !Number.isNaN(styleIndex)
+            const bestFit = attrs["bestFit"] === "1" || attrs["bestFit"] === "true"
+            // `style` is the column's default cell format — the thing that
+            // makes a whole column currency, including the cells nobody has
+            // typed in. It was read by neither side; see #439 §W.
+            const styleIndex = attrs["style"] !== undefined ? Number(attrs["style"]) : undefined
+            const columnStyle =
+              ctx.readStyles && ctx.styles && styleIndex !== undefined && styleIndex >= 0
                 ? resolveStyle(ctx.styles, styleIndex)
                 : undefined
 
@@ -317,18 +445,42 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               }
               const def: import("../_types").ColumnDef = {}
               if (width !== undefined && !Number.isNaN(width)) def.width = width
-              if (style && Object.keys(style).length > 0) def.style = style
               if (hidden) def.hidden = true
               if (outlineLevel !== undefined && !Number.isNaN(outlineLevel) && outlineLevel > 0) {
                 def.outlineLevel = outlineLevel
               }
               if (collapsed) def.collapsed = true
+              if (bestFit) def.autoWidth = true
+              if (columnStyle && Object.keys(columnStyle).length > 0) {
+                // Each column gets its own copy: `columnDefs` is the caller's
+                // to edit, and `resolveStyle` hands out shared records.
+                def.style = cloneCellStyle(columnStyle)
+              }
               if (Object.keys(def).length > 0) {
                 columnDefs[idx] = def
               }
             }
           }
           break
+        case "sheetFormatPr": {
+          const dh = attrs["defaultRowHeight"]
+          const dw = attrs["defaultColWidth"]
+          // Excel writes 15 whether or not the sheet means anything by it,
+          // so only a value that differs is a statement worth surfacing —
+          // otherwise every sheet would come back carrying a default it
+          // never set.
+          if (dh !== undefined) {
+            const height = Number(dh)
+            if (Number.isFinite(height) && height > 0 && height !== 15) {
+              defaultRowHeight = height
+            }
+          }
+          if (dw !== undefined) {
+            const widthValue = Number(dw)
+            if (Number.isFinite(widthValue) && widthValue > 0) defaultColWidth = widthValue
+          }
+          break
+        }
         case "sheetData":
           inSheetData = true
           break
@@ -339,48 +491,21 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               break
             }
             inRow = true
-            // Track the row number and reset implicit-column state so cells
-            // without an `r` attribute remain sequential within each row.
+            // Track the row number and reset implicit-column counter so cells
+            // lacking an `r` attribute get sequential columns within this row.
             currentRowNum = Number(attrs["r"]) || currentRowNum + 1
             implicitCol = 0
-            // Parse row-level attributes. Excel stores row height in points
-            // on row/@ht; customHeight only marks user-customized height.
-            if (attrs["ht"]) {
+            // Parse row-level attributes: ht, customHeight, hidden
+            if (
+              attrs["ht"] &&
+              (attrs["customHeight"] === "1" || attrs["customHeight"] === "true")
+            ) {
               const rowNum = Number(attrs["r"]) - 1 // 0-based
               const height = Number(attrs["ht"])
               if (!Number.isNaN(rowNum) && !Number.isNaN(height)) {
                 const existing = rowDefs.get(rowNum) ?? {}
                 existing.height = height
-                if (attrs["customHeight"] === "1" || attrs["customHeight"] === "true") {
-                  existing.customHeight = true
-                } else {
-                  existing.customHeight = false
-                }
                 rowDefs.set(rowNum, existing)
-              }
-            } else if (attrs["customHeight"] === "1" || attrs["customHeight"] === "true") {
-              const rowNum = Number(attrs["r"]) - 1
-              if (!Number.isNaN(rowNum)) {
-                const existing = rowDefs.get(rowNum) ?? {}
-                existing.customHeight = true
-                rowDefs.set(rowNum, existing)
-              }
-            }
-            if (attrs["s"] !== undefined) {
-              const rowNum = Number(attrs["r"]) - 1
-              const styleIndex = Number(attrs["s"])
-              if (
-                ctx.readStyles &&
-                ctx.styles &&
-                !Number.isNaN(rowNum) &&
-                !Number.isNaN(styleIndex)
-              ) {
-                const style = resolveStyle(ctx.styles, styleIndex)
-                if (Object.keys(style).length > 0) {
-                  const existing = rowDefs.get(rowNum) ?? {}
-                  existing.style = style
-                  rowDefs.set(rowNum, existing)
-                }
               }
             }
             if (attrs["hidden"] === "1" || attrs["hidden"] === "true") {
@@ -421,7 +546,12 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
             cellFormulaType = ""
             cellFormulaSi = -1
             cellFormulaRef = ""
-            cellFormulaCm = false
+            // `cm` lives on `<c>` (§18.3.1.4) and is a one-based index
+            // into xl/metadata.xml's cellMetadata collection, not a
+            // boolean. hucre used to both write and read it on `<f>`,
+            // which round-tripped with itself and with nothing else
+            // (#423).
+            cellFormulaCm = isDynamicArrayCm(attrs["cm"], ctx)
             inlineText = ""
             inlineRichText = []
           }
@@ -442,7 +572,10 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
             if (attrs["ref"]) {
               cellFormulaRef = attrs["ref"]
             }
-            if (attrs["cm"] === "1") {
+            // Every hucre release up to 0.6 wrote the marker here, so
+            // keep honouring it — those files are in the wild and the
+            // attribute is meaningless on `<f>` for any other reason.
+            if (attrs["cm"] !== undefined && isDynamicArrayCm(attrs["cm"], ctx)) {
               cellFormulaCm = true
             }
           }
@@ -472,6 +605,32 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
           break
         case "sheetPr":
           inSheetPr = true
+          break
+        case "outlinePr":
+          // Write-only until now: the type and the writer existed, but
+          // nothing parsed it, so Sheet.outlineProperties was always
+          // undefined and open -> save could not preserve it. See #359.
+          if (inSheetPr) {
+            const outline: import("../_types").OutlineProperties = {}
+            if (attrs["summaryBelow"] !== undefined) {
+              outline.summaryBelow =
+                attrs["summaryBelow"] === "1" || attrs["summaryBelow"] === "true"
+            }
+            if (attrs["summaryRight"] !== undefined) {
+              outline.summaryRight =
+                attrs["summaryRight"] === "1" || attrs["summaryRight"] === "true"
+            }
+            if (Object.keys(outline).length > 0) outlineProperties = outline
+          }
+          break
+        case "pageSetUpPr":
+          // The real home of the fit-to-page toggle: <pageSetup> only
+          // carries the page counts. Recorded separately from the
+          // <pageSetup> attributes because the two elements are far apart
+          // in the document and either may be absent. See #407.
+          if (inSheetPr) {
+            fitToPageFlag = attrs["fitToPage"] === "1" || attrs["fitToPage"] === "true"
+          }
           break
         case "tabColor":
           if (inSheetPr) {
@@ -634,7 +793,17 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
           pageMargins = parsePageMarginsAttrs(attrs)
           break
         case "pageSetup":
-          pageSetup = parsePageSetupAttrs(attrs)
+          // Merge, don't replace: <printOptions> is written before
+          // <pageSetup> in a worksheet, so assigning here dropped
+          // whatever it had already contributed. See #360.
+          pageSetup = { ...pageSetup, ...parsePageSetupAttrs(attrs, ctx) }
+          break
+        case "printOptions":
+          // <printOptions> was never parsed, so showGridLines and
+          // showRowColHeaders were write-only fields that always read back
+          // as undefined. It can appear before or after <pageSetup>, so
+          // merge rather than assign. See #360.
+          pageSetup = applyPrintOptionsAttrs(pageSetup, attrs)
           break
         case "headerFooter":
           inHeaderFooter = true
@@ -826,7 +995,40 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               }
             }
 
-            if (!skipCell) {
+            // A cell that will contribute nothing to the model must not
+            // extend the sheet — nor allocate the row it sits in.
+            //
+            // Excel writes a self-closing `<c r="WVF45" s="3"/>` for every
+            // position formatting was ever applied to, and a real
+            // packing-list workbook had 145,315 of them against 197
+            // values: `rows` came back 45 x 16,126 and `writeCsv` of it
+            // was 727 KB, 99.75% bare commas, from 1.8 KB of data.
+            //
+            // Under `readStyles: true` those cells do carry information
+            // and still count. See #492.
+            const carriesData =
+              cellValueText !== "" ||
+              inlineText !== "" ||
+              inlineRichText.length > 0 ||
+              cellFormulaText !== "" ||
+              cellType === "e" ||
+              // An empty *inline* string is still a string. The producer
+              // wrote `t="inlineStr"` and an `<is>` to say so, which is
+              // not the contentless `<c r="WVF45" s="3"/>` this guard is
+              // for. Deciding from the collected text alone made the two
+              // spellings of one value disagree: a shared string carries
+              // its index here, non-empty even when the string is empty,
+              // so `""` survived that way and vanished the other.
+              //
+              // It reached hucre's own writers, because
+              // `writeXlsxStream` defaults to inline strings.
+              cellType === "inlineStr" ||
+              (ctx.readStyles && cellStyleIndex >= 0) ||
+              (ctx.styles && cellStyleIndex >= 0
+                ? (ctx.styles.cellXfs[cellStyleIndex]?.hasCheckboxFeature ?? false)
+                : false)
+
+            if (!skipCell && carriesData) {
               processCell(
                 cellRef,
                 cellType,
@@ -850,6 +1052,7 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
                 if (effCol > maxCol) maxCol = effCol
                 if (effRow > maxRow) maxRow = effRow
                 hasCells = true
+                cellCount++
               }
             }
             inCell = false
@@ -932,7 +1135,8 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
               dbColor,
               isCfvos,
               isAttrs,
-              ctx.styles,
+              ctx.styles?.dxfs,
+              ctx,
             )
             if (cfRule) {
               conditionalRules.push(cfRule)
@@ -1057,140 +1261,227 @@ export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext)
           break
       }
     },
-  })
+  }
 
-  // Ensure all rows have consistent length
-  if (hasCells) {
-    const colCount = maxCol + 1
-    for (let r = 0; r <= maxRow; r++) {
-      if (!rows[r]) {
-        rows[r] = Array.from({ length: colCount }, () => null) as CellValue[]
-      } else {
-        while (rows[r].length < colCount) {
-          rows[r].push(null)
+  function finish(): Sheet {
+    // Ensure all rows have consistent length. Not in sparse mode: there is
+    // no grid, which is the whole point, and the bounding-box limit below
+    // has nothing to guard.
+    if (hasCells && !ctx.sparse) {
+      const colCount = maxCol + 1
+      // The cost of a sheet is its bounding box, not its cell count — the
+      // loop below fills every slot in it. Two in-bounds cells at opposite
+      // corners describe 1.7e10 slots, which V8 answers with an OOM the
+      // caller cannot catch, so the product is checked before allocating.
+      const totalCells = (maxRow + 1) * colCount
+      const cellLimit = ctx.maxTotalCells ?? MAX_TOTAL_CELLS
+      if (totalCells > cellLimit) {
+        // The options this used to name were the wrong three for the case
+        // that actually hits it. A *sparse* sheet — 82k values scattered
+        // over a 305M-slot box, 0.03% fill — is not large, so raising
+        // `maxTotalCells` trades a clean error for a multi-gigabyte
+        // allocation; `range` needs the caller to already know where the
+        // data is; and `maxRows` bounds rows when the problem is columns.
+        //
+        // `streamXlsxRows` reads exactly this file today, one row at a
+        // time, and the message never mentioned it. See #501.
+        throw new ParseError(
+          oversizeSheetMessage(name, maxRow + 1, colCount, totalCells, cellCount, cellLimit),
+        )
+      }
+      for (let r = 0; r <= maxRow; r++) {
+        if (!rows[r]) {
+          rows[r] = Array.from({ length: colCount }, () => null) as CellValue[]
+        } else {
+          while (rows[r].length < colCount) {
+            rows[r].push(null)
+          }
         }
       }
     }
-  }
 
-  // ── Resolve hyperlinks ──
-  // Build a map of rId → target URL from worksheet relationships
-  const relMap = new Map<string, string>()
-  if (ctx.worksheetRels) {
-    for (const rel of ctx.worksheetRels) {
-      relMap.set(rel.id, rel.target)
-    }
-  }
-
-  for (const hl of rawHyperlinks) {
-    const pos = parseCellRef(hl.ref)
-    const key = `${pos.row},${pos.col}`
-
-    // Get or create cell in the cells map
-    let cell = cells.get(key)
-    if (!cell) {
-      cell = {
-        value: (rows[pos.row] && rows[pos.row][pos.col]) ?? null,
-        type: "string",
-      }
-      cells.set(key, cell)
-    }
-
-    const hyperlink: Hyperlink = { target: "" }
-
-    if (hl.location) {
-      // Internal hyperlink
-      hyperlink.location = hl.location
-      hyperlink.target = hl.location
-    } else if (hl.rId) {
-      // External hyperlink — resolve from relationships
-      const target = relMap.get(hl.rId)
-      if (target) {
-        hyperlink.target = target
+    // ── Resolve hyperlinks ──
+    // Build a map of rId → target URL from worksheet relationships
+    const relMap = new Map<string, string>()
+    if (ctx.worksheetRels) {
+      for (const rel of ctx.worksheetRels) {
+        relMap.set(rel.id, rel.target)
       }
     }
 
-    if (hl.tooltip) hyperlink.tooltip = hl.tooltip
-    if (hl.display) hyperlink.display = hl.display
+    for (const hl of rawHyperlinks) {
+      const pos = parseCellRef(hl.ref)
+      const key = `${pos.row},${pos.col}`
 
-    cell.hyperlink = hyperlink
-  }
+      // Get or create cell in the cells map
+      let cell = cells.get(key)
+      if (!cell) {
+        cell = {
+          value: (rows[pos.row] && rows[pos.row][pos.col]) ?? null,
+          type: "string",
+        }
+        // Far fewer hyperlinks than cells in any real file, but this is
+        // the other place `cells` grows and the check is one comparison.
+        assertCellMapCapacity(cells, key, name)
+        cells.set(key, cell)
+      }
 
-  const sheet: Sheet = {
-    name,
-    rows,
-  }
+      const hyperlink: Hyperlink = { target: "" }
 
-  if (cells.size > 0) {
-    sheet.cells = cells
-  }
-  // Attach column definitions (width, hidden, outlineLevel, collapsed)
-  if (columnDefs.some((c) => Object.keys(c).length > 0)) {
-    sheet.columns = columnDefs
-  }
-  if (merges.length > 0) {
-    sheet.merges = merges
-  }
-  if (dataValidations.length > 0) {
-    sheet.dataValidations = dataValidations
-  }
-  if (conditionalRules.length > 0) {
-    sheet.conditionalRules = conditionalRules
-  }
-  if (autoFilter) {
-    sheet.autoFilter = autoFilter
-  }
-  if (freezePane) {
-    sheet.freezePane = freezePane
-  }
-  if (splitPane) {
-    sheet.splitPane = splitPane
-  }
-  if (sheetProtection) {
-    sheet.protection = sheetProtection
-  }
+      if (hl.location) {
+        // Internal hyperlink
+        hyperlink.location = hl.location
+        hyperlink.target = hl.location
+      } else if (hl.rId) {
+        // External hyperlink — resolve from relationships
+        const target = relMap.get(hl.rId)
+        if (target) {
+          hyperlink.target = target
+        } else {
+          // The cell keeps a hyperlink with an empty target, which reads as
+          // a link that goes nowhere rather than as a missing relationship.
+          // See #474.
+          ctx.onWarning?.({
+            code: "unresolved-hyperlink",
+            message:
+              `Cell ${hl.ref} links through ${hl.rId}, which the sheet's ` +
+              "relationships do not define. Read with an empty target.",
+            sheet: ctx.sheetName,
+            row: pos.row,
+            col: pos.col,
+          })
+        }
+      }
 
-  // Attach sheet view settings
-  if (sheetView && Object.keys(sheetView).length > 0) {
-    sheet.view = sheetView
-  }
+      if (hl.tooltip) hyperlink.tooltip = hl.tooltip
+      if (hl.display) hyperlink.display = hl.display
 
-  // Attach page setup (merge margins into pageSetup if present)
-  if (pageSetup || pageMargins) {
-    const ps: PageSetup = pageSetup ?? {}
-    if (pageMargins) {
-      ps.margins = pageMargins
+      cell.hyperlink = hyperlink
     }
-    sheet.pageSetup = ps
+
+    const sheet: Sheet = {
+      name,
+      rows,
+    }
+
+    if (cells.size > 0) {
+      sheet.cells = cells
+    }
+    // Attach column definitions (width, hidden, outlineLevel, collapsed)
+    if (defaultRowHeight !== undefined) sheet.defaultRowHeight = defaultRowHeight
+    if (defaultColWidth !== undefined) sheet.defaultColWidth = defaultColWidth
+
+    if (columnDefs.some((c) => Object.keys(c).length > 0)) {
+      sheet.columns = columnDefs
+    }
+    if (merges.length > 0) {
+      sheet.merges = merges
+    }
+    if (dataValidations.length > 0) {
+      sheet.dataValidations = dataValidations
+    }
+    if (conditionalRules.length > 0) {
+      sheet.conditionalRules = conditionalRules
+    }
+    if (autoFilter) {
+      sheet.autoFilter = autoFilter
+    }
+    if (freezePane) {
+      sheet.freezePane = freezePane
+    }
+    if (splitPane) {
+      sheet.splitPane = splitPane
+    }
+    if (sheetProtection) {
+      sheet.protection = sheetProtection
+    }
+
+    // Attach sheet view settings
+    if (sheetView && Object.keys(sheetView).length > 0) {
+      sheet.view = sheetView
+    }
+
+    // Attach page setup (merge margins into pageSetup if present)
+    if (pageSetup || pageMargins || fitToPageFlag) {
+      const ps: PageSetup = pageSetup ?? {}
+      if (pageMargins) {
+        ps.margins = pageMargins
+      }
+      if (fitToPageFlag) {
+        ps.fitToPage = true
+      }
+      sheet.pageSetup = ps
+    }
+
+    // Attach header/footer
+    if (headerFooter && Object.keys(headerFooter).length > 0) {
+      sheet.headerFooter = headerFooter
+    }
+
+    // Attach page breaks
+    if (rowBreaks.length > 0) {
+      sheet.rowBreaks = rowBreaks.sort((a, b) => a - b)
+    }
+    if (colBreaks.length > 0) {
+      sheet.colBreaks = colBreaks.sort((a, b) => a - b)
+    }
+
+    // Attach row definitions (height, hidden, outlineLevel)
+    if (rowDefs.size > 0) {
+      sheet.rowDefs = rowDefs
+    }
+
+    // Attach sparklines
+    if (sparklines.length > 0) {
+      sheet.sparklines = sparklines
+    }
+
+    // Attach outline properties
+    if (outlineProperties) {
+      sheet.outlineProperties = outlineProperties
+    }
+
+    return sheet
   }
 
-  // Attach header/footer
-  if (headerFooter && Object.keys(headerFooter).length > 0) {
-    sheet.headerFooter = headerFooter
-  }
+  return { handlers, finish }
+}
 
-  // Attach page breaks
-  if (rowBreaks.length > 0) {
-    sheet.rowBreaks = rowBreaks.sort((a, b) => a - b)
-  }
-  if (colBreaks.length > 0) {
-    sheet.colBreaks = colBreaks.sort((a, b) => a - b)
-  }
+/**
+ * Parse a worksheet XML into a Sheet using SAX parsing for performance.
+ * This avoids building a full DOM tree for large worksheets.
+ */
+export function parseWorksheet(xml: string, name: string, ctx: WorksheetContext): Sheet {
+  const { handlers, finish } = worksheetParser(name, ctx)
+  parseSax(xml, handlers)
+  return finish()
+}
 
-  // Attach row definitions (height, hidden, outlineLevel)
-  if (sheetFormat && Object.keys(sheetFormat).length > 0) {
-    sheet.sheetFormat = sheetFormat
-  }
-  if (rowDefs.size > 0) {
-    sheet.rowDefs = rowDefs
-  }
-
-  // Attach sparklines
-  if (sparklines.length > 0) {
-    sheet.sparklines = sparklines
-  }
-
-  return sheet
+/**
+ * Parse a worksheet from a stream of its bytes, for a part that cannot
+ * become a string at all.
+ *
+ * V8 stops at 0x1fffffe8 characters, so `xl/worksheets/sheet2.xml` at
+ * 589 MB is unrepresentable however much memory the machine has — the
+ * buffered reader could decompress it and still not parse it. See #503.
+ *
+ * The result is the same `Sheet` {@link parseWorksheet} builds, because
+ * it is the same handlers and the same finalisation; only the driver
+ * differs. `parseSaxStream` holds back a tag or an entity split across a
+ * chunk boundary, and every text handler accumulates with `+=`, so a run
+ * arriving in pieces is assembled exactly as one arriving whole.
+ */
+export async function parseWorksheetStream(
+  stream: ReadableStream<Uint8Array>,
+  name: string,
+  ctx: WorksheetContext,
+): Promise<Sheet> {
+  const { handlers, finish } = worksheetParser(name, ctx)
+  // `strict` so a truncated part is an error here, as it is for the
+  // buffered driver. See `endOfInput` in the parser for why it is not
+  // the default.
+  await parseSaxStream(stream, handlers, { strict: true })
+  return finish()
 }
 
 // ── Sheet Protection Parser ─────────────────────────────────────────
@@ -1374,7 +1665,8 @@ function buildConditionalRule(
   dbColor: string,
   isCfvos: Array<{ type: string; value?: string }>,
   isAttrsObj: Record<string, string>,
-  styles: ParsedStyles | null,
+  dxfs: CellStyle[] | undefined,
+  ctx?: WorksheetContext,
 ): ConditionalRule | null {
   const typeStr = attrs["type"]
   if (!typeStr || !VALID_CF_TYPES.has(typeStr)) return null
@@ -1392,9 +1684,31 @@ function buildConditionalRule(
     rule.operator = operatorStr as ValidationOperator
   }
 
-  const dxfId = attrs["dxfId"] !== undefined ? Number(attrs["dxfId"]) : Number.NaN
-  if (Number.isInteger(dxfId) && styles?.dxfs[dxfId]) {
-    rule.style = styles.dxfs[dxfId]
+  // dxfId indexes the workbook's <dxfs> block, so the rule's formatting
+  // only exists once styles.xml has been parsed. A file can legitimately
+  // reference a dxfId we have no entry for (styles.xml missing, or the
+  // index out of range); leave `style` absent rather than invent one.
+  const dxfId = Number(attrs["dxfId"])
+  if (dxfs && !Number.isNaN(dxfId)) {
+    const dxf = dxfs[dxfId]
+    // An empty <dxf/> carries no formatting — surfacing `{}` would claim
+    // a style the rule does not have. Shared with any other rule pointing
+    // at the same dxfId, following the same contract as a resolved cell
+    // style; see resolveStyle in ./styles.ts.
+    if (dxf && Object.keys(dxf).length > 0) rule.style = dxf
+    // A rule whose formatting silently vanished still applies — it just
+    // paints nothing, which looks like the rule not working rather than
+    // like a damaged file. See #474.
+    else if (!dxf) {
+      ctx?.onWarning?.({
+        code: "unresolved-dxf",
+        message:
+          `Conditional rule on ${sqref} asks for differential format ${dxfId}, ` +
+          `which the file does not have (${dxfs.length} present). The rule keeps ` +
+          "its condition and loses its formatting.",
+        sheet: ctx.sheetName,
+      })
+    }
   }
 
   // stopIfTrue
@@ -1487,29 +1801,47 @@ function processCell(
   if (!pos) return
   const { row, col } = pos
 
-  // Guard against malicious / corrupt cell references that would
-  // otherwise allocate billions of null slots and OOM the process.
-  if (
-    !Number.isInteger(row) ||
-    !Number.isInteger(col) ||
-    row < 0 ||
-    col < 0 ||
-    row > MAX_ROW_INDEX ||
-    col > MAX_COL_INDEX
-  ) {
+  // Two different failures, treated differently on purpose — the same
+  // distinction `clampColumnBound` draws a few lines down.
+  //
+  // A reference *past the grid* (`AAAAAA1`, row 2,000,000) is a resource
+  // claim: honouring it would allocate billions of null slots and OOM
+  // the process, and there is no partial answer that is not a fabricated
+  // one. That throws, and always has.
+  //
+  // A reference that is *not a reference* (`B` with no row, `A0`) claims
+  // nothing. It used to throw too, so one malformed `r` attribute cost
+  // the whole sheet where every other content damage costs one cell.
+  // It now drops the cell and says so. See #473.
+  if (row > MAX_ROW_INDEX || col > MAX_COL_INDEX) {
     throw new ParseError(
       `Cell reference "${ref}" is outside the supported sheet bounds (max row ${
         MAX_ROW_INDEX + 1
       }, max col ${MAX_COL_INDEX + 1})`,
     )
   }
-
-  // Ensure row array exists
-  while (rows.length <= row) {
-    rows.push([])
+  if (!Number.isInteger(row) || !Number.isInteger(col) || row < 0 || col < 0) {
+    ctx.onWarning?.({
+      code: "malformed-cell-ref",
+      message:
+        `Cell reference "${ref}" is not a cell reference — a column needs a ` +
+        "row number and rows are 1-based. The cell is dropped; the rest of " +
+        "the sheet is read.",
+      sheet: ctx.sheetName,
+    })
+    return
   }
-  while (rows[row].length <= col) {
-    rows[row].push(null)
+
+  // Ensure row array exists. Skipped in sparse mode — allocating the row
+  // out to the cell's column is the cost being avoided, and it is paid
+  // here rather than in the densify pass at the end. See #501.
+  if (!ctx.sparse) {
+    while (rows.length <= row) {
+      rows.push([])
+    }
+    while (rows[row].length <= col) {
+      rows[row].push(null)
+    }
   }
 
   let value: CellValue = null
@@ -1542,16 +1874,31 @@ function processCell(
         }
       } else {
         // Out-of-bounds SST index — return null (consistent with the
-        // streaming reader), not the raw index string.
+        // streaming reader), not the raw index string. Reported, because
+        // `null` here is otherwise indistinguishable from an empty cell.
+        ctx.onWarning?.({
+          code: "unresolved-shared-string",
+          message:
+            `Cell ${ref || `${row},${col}`} points at shared string ${valueText}, ` +
+            `which the file does not have (${ctx.sharedStrings.length} present). Read as empty.`,
+          sheet: ctx.sheetName,
+          row,
+          col,
+        })
         value = null
         cellType = "empty"
       }
       break
     }
     case "str": {
-      // Inline formula string result
+      // Inline formula string result. `formulaResult` used to be set in
+      // the numeric arm alone, so a cached result survived only when it
+      // happened to be a number — and `readXlsx` → `writeXlsx` dropped
+      // the rest, emitting `<f>` with no `<v>`. The writer has always
+      // been able to write them back. See #497.
       value = decodeOoxmlEscapes(valueText)
       cellType = formula ? "formula" : "string"
+      if (formula) formulaResult = value
       break
     }
     case "inlineStr": {
@@ -1569,13 +1916,54 @@ function processCell(
     case "b": {
       // Boolean
       value = valueText === "1" || valueText.toLowerCase() === "true"
-      cellType = "boolean"
+      cellType = formula ? "formula" : "boolean"
+      if (formula) formulaResult = value
       break
     }
     case "e": {
-      // Error
+      // Error.
+      //
+      // A cell carrying a formula reports `type: "formula"` here, as the
+      // numeric and string arms do. It used to report `"error"` on the
+      // way in and `"formula"` on the way back out, which cannot both be
+      // right — and the round trip is the side with a second opinion.
+      // `value` still holds the error token either way, so spotting an
+      // error by its value is unaffected; a *hard-coded* error cell,
+      // which carries no formula, still reports `"error"`. See #497.
       value = valueText
-      cellType = "error"
+      cellType = formula ? "formula" : "error"
+      if (formula) formulaResult = value
+      break
+    }
+    case "d": {
+      // ISO 8601 date (ECMA-376 Part 1, §18.18.11 ST_CellType). Every
+      // other member of that enumeration had a case; this one fell
+      // through to `n`, where `Number("2024-03-17")` is NaN and the
+      // value landed in the "shouldn't happen, but be safe" arm as a
+      // *string*. It does happen: openpyxl writes it whenever
+      // `iso_dates=True`. See #496.
+      //
+      // The value is an instant, not an offset from an epoch, so
+      // `date1904` must NOT be applied — unlike the serial path below,
+      // where the same day is 1,462 days apart between the two systems.
+      const parsed = parseIsoCellDate(valueText)
+      if (parsed) {
+        value = parsed
+        cellType = "date"
+      } else if (valueText !== "") {
+        // A bare time (`13:45:30`, which openpyxl emits for a
+        // `datetime.time`) is not an ISO 8601 date-time and has no day
+        // to anchor it. Left as text rather than guessed onto an epoch.
+        value = valueText
+        cellType = "string"
+      } else {
+        value = null
+        cellType = "empty"
+      }
+      if (formula) {
+        formulaResult = value
+        cellType = "formula"
+      }
       break
     }
     case "n":
@@ -1612,8 +2000,10 @@ function processCell(
     }
   }
 
-  // Set the value in the rows array
-  rows[row][col] = value
+  // Set the value in the rows array. In sparse mode there is no grid to
+  // set it in: the whole point is that the bounding box is not paid for.
+  // See #501.
+  if (!ctx.sparse) rows[row][col] = value
 
   // Detect Excel 2024 checkbox feature on this cell's xf — independent of
   // readStyles so the flag round-trips even without full style hydration.
@@ -1622,8 +2012,10 @@ function processCell(
       ? (ctx.styles.cellXfs[styleIndex]?.hasCheckboxFeature ?? false)
       : false
 
-  // Build Cell object if there's detail beyond the raw value
+  // Build Cell object if there's detail beyond the raw value — or always,
+  // in sparse mode, where `cells` is the only place a value can live.
   const hasDetails =
+    ctx.sparse ||
     formula !== undefined ||
     richText !== undefined ||
     (ctx.readStyles && ctx.styles && styleIndex >= 0) ||
@@ -1659,9 +2051,12 @@ function processCell(
         if (formulaRef) {
           cell.formulaRef = formulaRef
         }
-        if (formulaCm) {
-          cell.formulaDynamic = true
-        }
+      }
+      // The dynamic-array flag is independent of the formula type — the
+      // reader used to surface it only for `t="array"`, mirroring the
+      // writer's matching restriction (#407).
+      if (formulaCm) {
+        cell.formulaDynamic = true
       }
     }
     if (richText) {
@@ -1671,9 +2066,23 @@ function processCell(
       const style = resolveStyle(ctx.styles, styleIndex)
       if (Object.keys(style).length > 0) {
         cell.style = style
+      } else if (styleIndex >= ctx.styles.cellXfs.length) {
+        // The xf the cell names is not in the file, so the cell comes back
+        // unstyled — indistinguishable from one that never had a format.
+        ctx.onWarning?.({
+          code: "unresolved-style",
+          message:
+            `Cell ${ref || `${row},${col}`} points at cell format ${styleIndex}, ` +
+            `which the file does not have (${ctx.styles.cellXfs.length} present). Read unstyled.`,
+          sheet: ctx.sheetName,
+          row,
+          col,
+        })
       }
     }
-    cells.set(`${row},${col}`, cell)
+    const cellKey = `${row},${col}`
+    assertCellMapCapacity(cells, cellKey, ctx.sheetName)
+    cells.set(cellKey, cell)
   }
 }
 
@@ -1747,25 +2156,51 @@ function parsePageMarginsAttrs(attrs: Record<string, string>): PageMargins {
 // ── Page Setup Parser ──────────────────────────────────────────────────
 
 /** Reverse map: XLSX paper size number → PaperSize string */
-const PAPER_SIZE_REVERSE: Record<number, PaperSize> = {
-  1: "letter",
-  3: "tabloid",
-  5: "legal",
-  7: "executive",
-  8: "a3",
-  9: "a4",
-  11: "a5",
-  12: "b4",
-  13: "b5",
+// The name↔code table lives with the writer, so the two cannot disagree —
+// there used to be a second copy here, and keeping two tables in step is
+// exactly the kind of thing nobody checks. See #439 §Q.
+
+/**
+ * Merge `<printOptions>` attributes into the sheet's page setup.
+ *
+ * The element can appear either side of `<pageSetup>` in a worksheet, so
+ * this merges into whatever exists rather than replacing it — and creates
+ * the object when `<printOptions>` comes first.
+ */
+function applyPrintOptionsAttrs(
+  existing: PageSetup | undefined,
+  attrs: Record<string, string>,
+): PageSetup {
+  const ps: PageSetup = existing ?? {}
+  const isTrue = (value: string | undefined): boolean => value === "1" || value === "true"
+
+  if (isTrue(attrs["gridLines"])) ps.showGridLines = true
+  if (isTrue(attrs["headings"])) ps.showRowColHeaders = true
+  if (isTrue(attrs["horizontalCentered"])) ps.horizontalCentered = true
+  if (isTrue(attrs["verticalCentered"])) ps.verticalCentered = true
+
+  return ps
 }
 
-function parsePageSetupAttrs(attrs: Record<string, string>): PageSetup {
+function parsePageSetupAttrs(attrs: Record<string, string>, ctx?: WorksheetContext): PageSetup {
   const ps: PageSetup = {}
 
   if (attrs["paperSize"]) {
     const num = Number(attrs["paperSize"])
-    const name = PAPER_SIZE_REVERSE[num]
-    if (name) ps.paperSize = name
+    // A code with no name round-trips as the number rather than vanishing.
+    if (Number.isInteger(num) && num > 0) ps.paperSize = PAPER_SIZE_REVERSE[num] ?? num
+    else {
+      // Anything else is not a paper size, so the sheet comes back
+      // claiming the default one. Reported, because the printed output
+      // then differs from the file and nothing else says why. See #474.
+      ctx?.onWarning?.({
+        code: "unusable-paper-size",
+        message:
+          `Page setup names paper size "${attrs["paperSize"]}", which is not a ` +
+          "positive integer code. Dropped; the sheet reads with no paper size set.",
+        sheet: ctx.sheetName,
+      })
+    }
   }
 
   if (attrs["orientation"] === "landscape" || attrs["orientation"] === "portrait") {
@@ -1782,6 +2217,9 @@ function parsePageSetupAttrs(attrs: Record<string, string>): PageSetup {
     if (attrs["fitToHeight"]) ps.fitToHeight = Number(attrs["fitToHeight"])
   }
 
+  // Excel writes the centering flags on <printOptions>; hucre used to
+  // write them here. Keep accepting them from <pageSetup> so files from
+  // older versions still round-trip. See #360.
   if (attrs["horizontalCentered"] === "1" || attrs["horizontalCentered"] === "true") {
     ps.horizontalCentered = true
   }
@@ -1790,7 +2228,63 @@ function parsePageSetupAttrs(attrs: Record<string, string>): PageSetup {
     ps.verticalCentered = true
   }
 
+  // ── The rest of CT_PageSetup (#470) ──────────────────────────────
+  // Read unconditionally, defaults included: this is the roundtrip path
+  // as well as the read path, and dropping an attribute because it
+  // happened to equal its default would rewrite a file the caller only
+  // opened. The writer is the side that elides defaults.
+  if (attrs["paperWidth"]) ps.paperWidth = attrs["paperWidth"]
+  if (attrs["paperHeight"]) ps.paperHeight = attrs["paperHeight"]
+
+  const firstPageNumber = intAttr(attrs["firstPageNumber"])
+  if (firstPageNumber !== undefined) ps.firstPageNumber = firstPageNumber
+  if (attrs["useFirstPageNumber"] !== undefined) {
+    ps.useFirstPageNumber = isTruthyAttr(attrs["useFirstPageNumber"])
+  }
+
+  if (attrs["pageOrder"] === "overThenDown" || attrs["pageOrder"] === "downThenOver") {
+    ps.pageOrder = attrs["pageOrder"]
+  }
+  if (isTruthyAttr(attrs["blackAndWhite"])) ps.blackAndWhite = true
+  if (isTruthyAttr(attrs["draft"])) ps.draft = true
+
+  const comments = attrs["cellComments"]
+  if (comments === "none" || comments === "asDisplayed" || comments === "atEnd") {
+    ps.cellComments = comments
+  }
+
+  const errors = attrs["errors"]
+  if (errors === "displayed" || errors === "blank" || errors === "dash" || errors === "NA") {
+    ps.errors = errors
+  }
+
+  const copies = intAttr(attrs["copies"])
+  if (copies !== undefined) ps.copies = copies
+  const hDpi = intAttr(attrs["horizontalDpi"])
+  if (hDpi !== undefined) ps.horizontalDpi = hDpi
+  const vDpi = intAttr(attrs["verticalDpi"])
+  if (vDpi !== undefined) ps.verticalDpi = vDpi
+  if (attrs["usePrinterDefaults"] !== undefined) {
+    ps.usePrinterDefaults = isTruthyAttr(attrs["usePrinterDefaults"])
+  }
+
   return ps
+}
+
+/** `"1"` / `"true"` — the two spellings ECMA-376 allows for xsd:boolean. */
+function isTruthyAttr(value: string | undefined): boolean {
+  return value === "1" || value === "true"
+}
+
+/**
+ * A non-negative integer attribute, or `undefined` when it is absent or
+ * not one. A hostile `copies="NaN"` becoming `NaN` on the model would
+ * serialize back out as the literal string `NaN`.
+ */
+function intAttr(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 0 ? n : undefined
 }
 
 // ── Color Attribute Parser ──────────────────────────────────────────────
@@ -1815,18 +2309,36 @@ function parseColorAttrs(attrs: Record<string, string>): Color {
   return color
 }
 
-function numberAttr(attrs: Record<string, string>, name: string): number | undefined {
-  const value = attrValue(attrs, name)
-  if (value === undefined || value === "") return undefined
-  const numeric = Number(value)
-  return Number.isFinite(numeric) ? numeric : undefined
-}
-
-function attrValue(attrs: Record<string, string>, name: string): string | undefined {
-  if (attrs[name] !== undefined) return attrs[name]
-  for (const [key, value] of Object.entries(attrs)) {
-    const local = key.includes(":") ? key.slice(key.indexOf(":") + 1) : key
-    if (local === name) return value
+/**
+ * Parse the value of a `t="d"` cell — an ISO 8601 date or date-time.
+ *
+ * Deliberately strict. `new Date(text)` accepts a great deal that is not
+ * ISO 8601 and answers `Invalid Date` for the rest, so a loose parse here
+ * would turn arbitrary cell text into dates. The shapes accepted are the
+ * ones ECMA-376 §18.18.11 describes and that producers actually write:
+ * `YYYY-MM-DD`, optionally with a time, optionally with a zone.
+ *
+ * An unqualified time is read as UTC, for the same reason the ODS and
+ * docProps readers do it: every format hucre reads records an absolute
+ * moment, and local time would make the same file mean different things
+ * on different machines. See #415, #474.
+ *
+ * Exported for `stream-reader.ts`, which needs the same answer. #496
+ * added the `t="d"` case here and not there, so the streaming reader
+ * returned the raw text where this returned a `Date` — one fix, two
+ * implementations, and only one of them got it. Sharing the parser is
+ * what stops the two drifting on the next shape someone accepts.
+ */
+export function parseIsoCellDate(text: string): Date | undefined {
+  const trimmed = text.trim()
+  if (
+    !/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(trimmed)
+  ) {
+    return undefined
   }
-  return undefined
+  const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/.test(trimmed)
+  const hasTime = /[T ]\d{2}:/.test(trimmed)
+  const normalized = trimmed.replace(" ", "T")
+  const date = new Date(hasTime && !zoned ? `${normalized}Z` : normalized)
+  return Number.isNaN(date.getTime()) ? undefined : date
 }

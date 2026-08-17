@@ -132,7 +132,7 @@ describe("ODS Writer", () => {
     const manifest = await parseXmlFromZip(data, "META-INF/manifest.xml")
     const entries = findChildren(manifest, "file-entry")
     const rootEntry = entries.find((e: any) => e.attrs["manifest:full-path"] === "/")
-    expect(rootEntry.attrs["manifest:version"]).toBe("1.2")
+    expect(rootEntry.attrs["manifest:version"]).toBe("1.3")
   })
 
   it("writes string cells correctly", async () => {
@@ -272,7 +272,7 @@ describe("ODS Writer", () => {
     expect(cells[1].attrs["office:value-type"]).toBeUndefined()
   })
 
-  it("writes Application: defter in meta.xml", async () => {
+  it("names itself as the generator in meta.xml", async () => {
     const data = await writeOds({
       sheets: [{ name: "Sheet1", rows: [["test"]] }],
     })
@@ -280,7 +280,7 @@ describe("ODS Writer", () => {
     const metaDoc = await parseXmlFromZip(data, "meta.xml")
     const metaEl = findChild(metaDoc, "meta")
     const generator = findChild(metaEl, "generator")
-    expect(getElementText(generator)).toBe("defter")
+    expect(getElementText(generator)).toBe("hucre")
   })
 
   it("writes document properties in meta.xml", async () => {
@@ -339,7 +339,7 @@ describe("ODS Writer", () => {
     })
 
     const contentDoc = await parseXmlFromZip(data, "content.xml")
-    expect(contentDoc.attrs["office:version"]).toBe("1.2")
+    expect(contentDoc.attrs["office:version"]).toBe("1.3")
   })
 
   it("content.xml has required namespace declarations", async () => {
@@ -470,7 +470,7 @@ describe("ODS Writer", () => {
     })
 
     const stylesDoc = await parseXmlFromZip(data, "styles.xml")
-    expect(stylesDoc.attrs["office:version"]).toBe("1.2")
+    expect(stylesDoc.attrs["office:version"]).toBe("1.3")
   })
 
   it("styles.xml has required namespace declarations", async () => {
@@ -781,15 +781,14 @@ describe("ODS Reader", () => {
     })
 
     const workbook = await readOds(written)
-    expect(workbook.sheets[0].rows.length).toBe(2) // middle empty row trimmed from end? no, row 3 exists
-    // Actually: row 0 has data, row 1 is empty (trimmed because all null), row 2 has data
-    // The reader trims trailing null cells and skips fully-empty rows...
-    // But with the new reader, fully empty rows between data rows are still skipped
-    // Row 0: ["A1", null x 8, "J1"] -> ["A1", null, null, null, null, null, null, null, null, "J1"]
-    // Row 1: all null -> skipped
-    // Row 2: ["A3"] -> ["A3"]
+    // Row 0: ["A1", null x 8, "J1"] -> trailing nulls trimmed, "J1" keeps col 9
+    // Row 1: all null -> [], an interior empty row keeps its position (#394)
+    // Row 2: ["A3"] -> ["A3"], still at index 2
+    expect(workbook.sheets[0].rows.length).toBe(3)
     expect(workbook.sheets[0].rows[0][0]).toBe("A1")
     expect(workbook.sheets[0].rows[0][9]).toBe("J1")
+    expect(workbook.sheets[0].rows[1]).toEqual([])
+    expect(workbook.sheets[0].rows[2][0]).toBe("A3")
   })
 
   it("reads cells with number-columns-repeated correctly", async () => {

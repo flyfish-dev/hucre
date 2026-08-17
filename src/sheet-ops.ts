@@ -1,26 +1,15 @@
 // ── Sheet Operations ────────────────────────────────────────────────
 // In-memory row/column manipulation utilities for Sheet objects.
 
-import type { Sheet, MergeRange, RowDef, Workbook, Cell, CellStyle, CellValue } from "./_types"
+import type { Sheet, MergeRange, RowDef, Workbook, Cell, CellValue } from "./_types"
 import { parseCellRef } from "./xlsx/worksheet"
+import { parseRange, toRange, type RangeLike } from "./cell-utils"
 import { rangeRef } from "./xlsx/worksheet-writer"
+import { cloneCellStyle } from "./_style"
+import { InvalidArgumentError } from "./errors"
+import { shiftFormula, shiftRangeRef, type RefShift } from "./_refs"
 
 // ── Range Helpers ────────────────────────────────────────────────────
-
-/**
- * Parse a range string like "A1:D10" into 0-based coordinates.
- */
-function parseRange(range: string): MergeRange {
-  const parts = range.split(":")
-  const start = parseCellRef(parts[0])
-  const end = parts.length > 1 ? parseCellRef(parts[1]) : start
-  return {
-    startRow: start.row,
-    startCol: start.col,
-    endRow: end.row,
-    endCol: end.col,
-  }
-}
 
 /**
  * Build a range string from 0-based coordinates.
@@ -49,6 +38,102 @@ function shiftRangeCols(range: string, threshold: number, delta: number): string
   if (r.startCol >= threshold) r.startCol += delta
   if (r.endCol >= threshold) r.endCol += delta
   return buildRange(r)
+}
+
+// ── Reference maintenance ────────────────────────────────────────────
+
+/**
+ * Move everything on a sheet that *names* a position rather than
+ * occupying one: formula text, the formulas inside data validations and
+ * conditional rules, sparkline ranges, page breaks and text-box anchors.
+ *
+ * The cells themselves are moved by the caller; this is the other half,
+ * and it was missing entirely. A formula below an insertion still pointed
+ * where its arguments used to be, which is the one thing "insert a row"
+ * is supposed to take care of. See #439 §D.
+ *
+ * Not covered, and not coverable from here: `Workbook.namedRanges`,
+ * defined names, external-link caches and pivot caches all live on the
+ * workbook, and these operations are handed a `Sheet`.
+ */
+function shiftReferences(sheet: Sheet, shift: RefShift): void {
+  if (sheet.cells) {
+    for (const cell of sheet.cells.values()) {
+      if (cell.formula) cell.formula = shiftFormula(cell.formula, shift)
+      if (cell.formulaRef) cell.formulaRef = shiftFormula(cell.formulaRef, shift)
+    }
+  }
+
+  if (sheet.dataValidations) {
+    for (const dv of sheet.dataValidations) {
+      if (dv.formula1) dv.formula1 = shiftFormula(dv.formula1, shift)
+      if (dv.formula2) dv.formula2 = shiftFormula(dv.formula2, shift)
+    }
+  }
+
+  if (sheet.conditionalRules) {
+    for (const rule of sheet.conditionalRules) {
+      if (Array.isArray(rule.formula)) {
+        rule.formula = rule.formula.map((f) => shiftFormula(f, shift))
+      } else if (typeof rule.formula === "string") {
+        rule.formula = shiftFormula(rule.formula, shift)
+      }
+    }
+  }
+
+  if (sheet.sparklines) {
+    // A sparkline whose whole source was deleted has nothing left to draw.
+    sheet.sparklines = sheet.sparklines.filter((sparkline) => {
+      const dataRange = shiftRangeRef(sparkline.dataRange, shift)
+      if (dataRange === undefined) return false
+      sparkline.dataRange = dataRange
+      const location = shiftRangeRef(sparkline.location, shift)
+      if (location === undefined) return false
+      sparkline.location = location
+      return true
+    })
+  }
+
+  const breaks = shift.axis === "row" ? sheet.rowBreaks : sheet.colBreaks
+  if (breaks) {
+    const moved: number[] = []
+    for (const at of breaks) {
+      const next = shiftIndex(at, shift)
+      if (next !== null && !moved.includes(next)) moved.push(next)
+    }
+    moved.sort((a, b) => a - b)
+    if (shift.axis === "row") sheet.rowBreaks = moved
+    else sheet.colBreaks = moved
+  }
+
+  if (sheet.textBoxes) {
+    for (const box of sheet.textBoxes) {
+      shiftAnchor(box.anchor, shift)
+    }
+  }
+}
+
+/** One index, or `null` when the row or column it names was deleted. */
+function shiftIndex(value: number, shift: RefShift): number | null {
+  if (shift.delta > 0) return value >= shift.at ? value + shift.delta : value
+  const removed = -shift.delta
+  if (value >= shift.at + removed) return value - removed
+  if (value >= shift.at) return null
+  return value
+}
+
+/** Move a drawing anchor's corners, clamping one that lands in the gap. */
+function shiftAnchor(
+  anchor: { from: { row: number; col: number }; to?: { row: number; col: number } },
+  shift: RefShift,
+): void {
+  const key = shift.axis === "row" ? "row" : "col"
+  const from = shiftIndex(anchor.from[key], shift)
+  anchor.from[key] = from ?? shift.at
+  if (anchor.to) {
+    const to = shiftIndex(anchor.to[key], shift)
+    anchor.to[key] = to ?? shift.at
+  }
 }
 
 // ── Row Width Helper ─────────────────────────────────────────────────
@@ -170,6 +255,8 @@ export function insertRows(sheet: Sheet, rowIndex: number, count: number): void 
       }
     }
   }
+
+  shiftReferences(sheet, { axis: "row", at: rowIndex, delta: count })
 }
 
 // ── Delete Rows ──────────────────────────────────────────────────────
@@ -236,8 +323,17 @@ export function deleteRows(sheet: Sheet, rowIndex: number, count: number): void 
       }
     }
 
-    // Remove degenerate merges (start > end)
-    sheet.merges = sheet.merges.filter((m) => m.startRow <= m.endRow && m.startCol <= m.endCol)
+    // Drop merges that no longer merge anything. `start > end` is
+    // incoherent; `start === end` on both axes is a one-cell merge, which
+    // is not what any spreadsheet means by the word — Excel writes
+    // `<mergeCell ref="B3:B3"/>` for nothing, and a shrunk range should
+    // disappear the way a fully-deleted one already does.
+    sheet.merges = sheet.merges.filter(
+      (m) =>
+        m.startRow <= m.endRow &&
+        m.startCol <= m.endCol &&
+        !(m.startRow === m.endRow && m.startCol === m.endCol),
+    )
   }
 
   // Update data validations
@@ -319,6 +415,8 @@ export function deleteRows(sheet: Sheet, rowIndex: number, count: number): void 
       }
     }
   }
+
+  shiftReferences(sheet, { axis: "row", at: rowIndex, delta: -count })
 }
 
 /**
@@ -440,6 +538,8 @@ export function insertColumns(sheet: Sheet, colIndex: number, count: number): vo
       }
     }
   }
+
+  shiftReferences(sheet, { axis: "col", at: colIndex, delta: count })
 }
 
 // ── Delete Columns ───────────────────────────────────────────────────
@@ -510,7 +610,14 @@ export function deleteColumns(sheet: Sheet, colIndex: number, count: number): vo
       }
     }
 
-    sheet.merges = sheet.merges.filter((m) => m.startRow <= m.endRow && m.startCol <= m.endCol)
+    // Same rule as deleteRows: a range shrunk to one cell is no longer a
+    // merge.
+    sheet.merges = sheet.merges.filter(
+      (m) =>
+        m.startRow <= m.endRow &&
+        m.startCol <= m.endCol &&
+        !(m.startRow === m.endRow && m.startCol === m.endCol),
+    )
   }
 
   // Update data validations
@@ -575,6 +682,8 @@ export function deleteColumns(sheet: Sheet, colIndex: number, count: number): vo
       }
     }
   }
+
+  shiftReferences(sheet, { axis: "col", at: colIndex, delta: -count })
 }
 
 /**
@@ -775,72 +884,21 @@ export function groupRows(sheet: Sheet, startRow: number, endRow: number, level:
 
 // ── Deep Clone Helpers ────────────────────────────────────────────────
 
-function cloneStyle(style: CellStyle): CellStyle {
-  const result: CellStyle = {}
-  if (style.font)
-    result.font = { ...style.font, color: style.font.color ? { ...style.font.color } : undefined }
-  if (style.fill) {
-    if (style.fill.type === "pattern") {
-      result.fill = {
-        type: "pattern",
-        pattern: style.fill.pattern,
-        fgColor: style.fill.fgColor ? { ...style.fill.fgColor } : undefined,
-        bgColor: style.fill.bgColor ? { ...style.fill.bgColor } : undefined,
-      }
-    } else {
-      result.fill = {
-        type: "gradient",
-        degree: style.fill.degree,
-        stops: style.fill.stops.map((s) => ({ position: s.position, color: { ...s.color } })),
-      }
-    }
-  }
-  if (style.border) {
-    result.border = {
-      ...style.border,
-      top: style.border.top
-        ? {
-            ...style.border.top,
-            color: style.border.top.color ? { ...style.border.top.color } : undefined,
-          }
-        : undefined,
-      right: style.border.right
-        ? {
-            ...style.border.right,
-            color: style.border.right.color ? { ...style.border.right.color } : undefined,
-          }
-        : undefined,
-      bottom: style.border.bottom
-        ? {
-            ...style.border.bottom,
-            color: style.border.bottom.color ? { ...style.border.bottom.color } : undefined,
-          }
-        : undefined,
-      left: style.border.left
-        ? {
-            ...style.border.left,
-            color: style.border.left.color ? { ...style.border.left.color } : undefined,
-          }
-        : undefined,
-      diagonal: style.border.diagonal
-        ? {
-            ...style.border.diagonal,
-            color: style.border.diagonal.color ? { ...style.border.diagonal.color } : undefined,
-          }
-        : undefined,
-    }
-  }
-  if (style.alignment) result.alignment = { ...style.alignment }
-  if (style.numFmt !== undefined) result.numFmt = style.numFmt
-  if (style.protection) result.protection = { ...style.protection }
-  return result
-}
-
 function cloneCell(cell: Cell): Cell {
   const result: Cell = { value: cell.value, type: cell.type }
-  if (cell.style) result.style = cloneStyle(cell.style)
+  if (cell.style) result.style = cloneCellStyle(cell.style)
+  if (cell.checkbox !== undefined) result.checkbox = cell.checkbox
   if (cell.formula !== undefined) result.formula = cell.formula
   if (cell.formulaResult !== undefined) result.formulaResult = cell.formulaResult
+  // The formula's *shape*, not just its text. Dropping these turned a
+  // shared-formula slave cell — `{ formula: "", formulaType: "shared",
+  // formulaSharedIndex: 3 }` — into a plain `{ formula: "" }`, which the
+  // writer then emitted as an empty `<f/>`. An array formula lost its
+  // spill range, and a dynamic array lost its metadata link (#423).
+  if (cell.formulaType !== undefined) result.formulaType = cell.formulaType
+  if (cell.formulaSharedIndex !== undefined) result.formulaSharedIndex = cell.formulaSharedIndex
+  if (cell.formulaRef !== undefined) result.formulaRef = cell.formulaRef
+  if (cell.formulaDynamic !== undefined) result.formulaDynamic = cell.formulaDynamic
   if (cell.richText)
     result.richText = cell.richText.map((r) => ({
       text: r.text,
@@ -874,6 +932,7 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
   const rows = sheet.rows.map((row) => [...row])
 
   const cloned: Sheet = { name: newName, rows }
+  if (sheet.kind !== undefined) cloned.kind = sheet.kind
 
   // Deep copy cells Map
   if (sheet.cells && sheet.cells.size > 0) {
@@ -888,7 +947,7 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
   if (sheet.columns) {
     cloned.columns = sheet.columns.map((col) => ({
       ...col,
-      style: col.style ? cloneStyle(col.style) : undefined,
+      style: col.style ? cloneCellStyle(col.style) : undefined,
     }))
   }
 
@@ -918,7 +977,7 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
   if (sheet.conditionalRules) {
     cloned.conditionalRules = sheet.conditionalRules.map((rule) => {
       const clonedRule = { ...rule }
-      if (rule.style) clonedRule.style = cloneStyle(rule.style)
+      if (rule.style) clonedRule.style = cloneCellStyle(rule.style)
       if (rule.formula && Array.isArray(rule.formula)) clonedRule.formula = [...rule.formula]
       if (rule.colorScale) {
         clonedRule.colorScale = {
@@ -954,16 +1013,15 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
 
   // Deep copy images
   if (sheet.images) {
-    cloned.images = sheet.images.map((img) => ({
-      data: new Uint8Array(img.data),
-      type: img.type,
-      anchor: {
-        from: { ...img.anchor.from },
-        to: img.anchor.to ? { ...img.anchor.to } : undefined,
-      },
-      width: img.width,
-      height: img.height,
-    }))
+    // Spread rather than enumerate: listing the fields by hand is how
+    // `altText` and `title` came to be dropped. Only the two nested
+    // members need their own copy.
+    cloned.images = sheet.images.map((img) => {
+      const copy = { ...img, data: new Uint8Array(img.data) }
+      copy.anchor = { ...img.anchor, from: { ...img.anchor.from } }
+      if (img.anchor.to) copy.anchor.to = { ...img.anchor.to }
+      return copy
+    })
   }
 
   // Copy protection
@@ -1013,6 +1071,31 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
     cloned.charts = structuredClone(sheet.charts)
   }
 
+  // ── The rest of the sheet ──
+  //
+  // These used to be dropped silently — a "deep clone" that returned a
+  // sheet with no sparklines, no text boxes, no page breaks and no
+  // background image. `copySheetToWorkbook` is built on this, so copying
+  // a sheet between workbooks lost them too. See #439 §N.
+  //
+  // Everything here is plain JSON-serialisable data except the background
+  // image, which is bytes, so `structuredClone` is the faithful copy for
+  // the trees and a `slice()` for the buffer.
+  if (sheet.splitPane) cloned.splitPane = { ...sheet.splitPane }
+  if (sheet.rowBreaks) cloned.rowBreaks = [...sheet.rowBreaks]
+  if (sheet.colBreaks) cloned.colBreaks = [...sheet.colBreaks]
+  if (sheet.outlineProperties) cloned.outlineProperties = { ...sheet.outlineProperties }
+  if (sheet.backgroundImage) cloned.backgroundImage = sheet.backgroundImage.slice()
+  if (sheet.sparklines) cloned.sparklines = structuredClone(sheet.sparklines)
+  if (sheet.textBoxes) cloned.textBoxes = structuredClone(sheet.textBoxes)
+  if (sheet.threadedComments) cloned.threadedComments = structuredClone(sheet.threadedComments)
+  if (sheet.pivotTables) cloned.pivotTables = structuredClone(sheet.pivotTables)
+  if (sheet.slicers) cloned.slicers = structuredClone(sheet.slicers)
+  if (sheet.timelines) cloned.timelines = structuredClone(sheet.timelines)
+  if (sheet.a11y) cloned.a11y = { ...sheet.a11y }
+  if (sheet.defaultRowHeight !== undefined) cloned.defaultRowHeight = sheet.defaultRowHeight
+  if (sheet.defaultColWidth !== undefined) cloned.defaultColWidth = sheet.defaultColWidth
+
   return cloned
 }
 
@@ -1039,9 +1122,17 @@ export function copySheetToWorkbook(
  */
 export function copyRange(
   sheet: Sheet,
-  source: { startRow: number; startCol: number; endRow: number; endCol: number },
-  target: { startRow: number; startCol: number },
+  sourceRange: RangeLike,
+  targetStart: { startRow: number; startCol: number } | string,
 ): void {
+  // Either form of either argument — `copyRange(s, "A1:C3", "E1")` and the
+  // coordinate spelling describe the same move. See #474.
+  const source = toRange(sourceRange)
+  const target =
+    typeof targetStart === "string"
+      ? (({ row, col }) => ({ startRow: row, startCol: col }))(parseCellRef(targetStart))
+      : targetStart
+
   const rowCount = source.endRow - source.startRow + 1
   const colCount = source.endCol - source.startCol + 1
 
@@ -1177,18 +1268,31 @@ export function removeSheet(workbook: Workbook, index: number): void {
  */
 export function findCells(
   sheet: Sheet,
-  predicate: CellValue | ((value: CellValue, row: number, col: number) => boolean),
+  predicate: CellValue | RegExp | ((value: CellValue, row: number, col: number) => boolean),
 ): Array<{ row: number; col: number; value: CellValue }> {
   const results: Array<{ row: number; col: number; value: CellValue }> = []
   const isFn = typeof predicate === "function"
+  // `replaceCells` has always taken a RegExp; this one took a predicate
+  // instead, so "find the cells I am about to replace" could not be
+  // written with the same argument. Both take all three forms now.
+  const isRegExp = predicate instanceof RegExp
 
   for (let r = 0; r < sheet.rows.length; r++) {
     const row = sheet.rows[r]!
     for (let c = 0; c < row.length; c++) {
       const value = row[c] ?? null
-      const match = isFn
-        ? (predicate as (value: CellValue, row: number, col: number) => boolean)(value, r, c)
-        : value === predicate
+      let match: boolean
+      if (isFn) {
+        match = (predicate as (value: CellValue, row: number, col: number) => boolean)(value, r, c)
+      } else if (isRegExp) {
+        // Same rule as replaceCells: a RegExp tests strings only. `lastIndex`
+        // on a /g pattern would make the result depend on call order, so it
+        // is reset before each test.
+        predicate.lastIndex = 0
+        match = typeof value === "string" && predicate.test(value)
+      } else {
+        match = value === predicate
+      }
       if (match) {
         results.push({ row: r, col: c, value })
       }
@@ -1257,24 +1361,38 @@ export function replaceCells(sheet: Sheet, find: CellValue | RegExp, replace: Ce
 export function sortRows(sheet: Sheet, colIndex: number, order?: "asc" | "desc"): void {
   const desc = order === "desc"
 
-  // When the sheet carries a per-cell override Map (styles/formulas/
-  // hyperlinks keyed by "row,col"), the row reordering has to be mirrored
-  // there or every override lands on the wrong row. Tag each row with its
-  // original index, sort, then rebuild the Map from old→new index.
+  // A merged range pins cells to positions, and a sort moves rows past
+  // those positions — there is no arrangement that keeps both. Excel
+  // refuses the operation outright for the same reason; sorting anyway
+  // left the merge covering whatever happened to land there. A merge
+  // wholly inside one row is unaffected, since that row moves as a unit.
+  const spansRows = sheet.merges?.some((m) => m.endRow > m.startRow)
+  if (spansRows) {
+    throw new InvalidArgumentError(
+      "Cannot sort rows: the sheet has a merged range spanning more than one row, " +
+        "and no ordering can keep both the sort and the merge. Remove the merge first.",
+    )
+  }
+
+  // Everything keyed by row index has to move with its row: the per-cell
+  // override Map (styles, formulas, hyperlinks), the row definitions
+  // (heights, hidden, outline levels), and single-row merges. Tag each row
+  // with its original index, sort, then remap through old→new.
+  const tagged = sheet.rows.map((row, i) => ({ row, i }))
+  tagged.sort((a, b) => {
+    const va = colIndex < a.row.length ? (a.row[colIndex] ?? null) : null
+    const vb = colIndex < b.row.length ? (b.row[colIndex] ?? null) : null
+    return compareCellValues(va, vb, desc)
+  })
+
+  const oldToNew = new Map<number, number>()
+  for (let newIdx = 0; newIdx < tagged.length; newIdx++) {
+    oldToNew.set(tagged[newIdx]!.i, newIdx)
+  }
+
+  sheet.rows = tagged.map((t) => t.row)
+
   if (sheet.cells && sheet.cells.size > 0) {
-    const tagged = sheet.rows.map((row, i) => ({ row, i }))
-    tagged.sort((a, b) => {
-      const va = colIndex < a.row.length ? (a.row[colIndex] ?? null) : null
-      const vb = colIndex < b.row.length ? (b.row[colIndex] ?? null) : null
-      const cmp = compareCellValues(va, vb)
-      return desc ? -cmp : cmp
-    })
-
-    const oldToNew = new Map<number, number>()
-    for (let newIdx = 0; newIdx < tagged.length; newIdx++) {
-      oldToNew.set(tagged[newIdx]!.i, newIdx)
-    }
-
     const remapped = new Map<string, Cell>()
     for (const [key, cell] of sheet.cells) {
       const comma = key.indexOf(",")
@@ -1284,18 +1402,26 @@ export function sortRows(sheet: Sheet, colIndex: number, order?: "asc" | "desc")
       // Keep non-positional keys untouched if any slipped in.
       remapped.set(newRow === undefined ? key : `${newRow},${col}`, cell)
     }
-
-    sheet.rows = tagged.map((t) => t.row)
     sheet.cells = remapped
-    return
   }
 
-  sheet.rows.sort((a, b) => {
-    const va = colIndex < a.length ? (a[colIndex] ?? null) : null
-    const vb = colIndex < b.length ? (b[colIndex] ?? null) : null
-    const cmp = compareCellValues(va, vb)
-    return desc ? -cmp : cmp
-  })
+  if (sheet.rowDefs && sheet.rowDefs.size > 0) {
+    const remapped = new Map<number, RowDef>()
+    for (const [row, def] of sheet.rowDefs) {
+      remapped.set(oldToNew.get(row) ?? row, def)
+    }
+    sheet.rowDefs = remapped
+  }
+
+  if (sheet.merges) {
+    for (const merge of sheet.merges) {
+      const moved = oldToNew.get(merge.startRow)
+      if (moved !== undefined) {
+        merge.startRow = moved
+        merge.endRow = moved
+      }
+    }
+  }
 }
 
 /**
@@ -1310,12 +1436,24 @@ function syncCellOverride(sheet: Sheet, row: number, col: number, value: CellVal
 }
 
 /** Compare two cell values for sorting: nulls last, numbers < strings < booleans. */
-function compareCellValues(a: CellValue, b: CellValue): number {
-  // Nulls last
+/**
+ * Compare two cell values for {@link sortRows}.
+ *
+ * `desc` is applied to the *value* comparison only. Negating the whole
+ * result flipped the null rule with it, so descending floated blanks to
+ * the top — against this function's own contract and against Excel,
+ * which sinks blanks in both directions. See #392.
+ */
+function compareCellValues(a: CellValue, b: CellValue, desc = false): number {
+  // Nulls last, regardless of direction
   if (a === null && b === null) return 0
   if (a === null) return 1
   if (b === null) return -1
 
+  return desc ? -compareNonNull(a, b) : compareNonNull(a, b)
+}
+
+function compareNonNull(a: CellValue, b: CellValue): number {
   const ta = typeRank(a)
   const tb = typeRank(b)
   if (ta !== tb) return ta - tb

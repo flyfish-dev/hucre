@@ -24,7 +24,31 @@ export interface XmlWriteOptions {
   indent?: string
 }
 
-const VALID_NAME_RE = /^[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?$/
+// ── What may be an element or attribute name ────────────────────────
+//
+// XML 1.0 §2.3, the `NameStartChar` and `NameChar` productions, minus
+// the colon — which is spelled separately below so a name may carry one
+// prefix and not a colon anywhere it likes. That is `QName` from
+// Namespaces in XML §4, and it is what an XML consumer will accept.
+//
+// This used to be `/^[A-Za-z_][\w.-]*…/` — ASCII only. `NameStartChar`
+// runs from #xC0, so **every** accented or non-Latin heading was
+// refused: `Şehir`, `Größe`, `café`, `名前`. A spreadsheet whose column
+// names are not English could not be written to XML at all; it threw.
+// The rejected names were valid XML, and the ones the production really
+// does forbid — a leading digit, a space, `<` — are still rejected.
+//
+// The `u` flag is required: #x10000–#xEFFFF is above the BMP, and
+// without it the surrogate halves are matched separately and a name made
+// of astral characters slips through as two non-matching units.
+const NAME_START = "A-Z_a-z\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF"
+const NAME_START_2 = "\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF"
+const NAME_START_3 = "\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD\\u{10000}-\\u{EFFFF}"
+const START = `[${NAME_START}${NAME_START_2}${NAME_START_3}]`
+const REST = `[${NAME_START}${NAME_START_2}${NAME_START_3}\\-.0-9\\u00B7\\u0300-\\u036F\\u203F-\\u2040]`
+
+/** One `NCName`, optionally prefixed by another — i.e. a `QName`. */
+const VALID_NAME_RE = new RegExp(`^${START}${REST}*(?::${START}${REST}*)?$`, "u")
 
 function escapeText(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -36,7 +60,8 @@ function escapeAttr(s: string): string {
 
 function valueToString(value: CellValue): string {
   if (value === null || value === undefined) return ""
-  if (value instanceof Date) return value.toISOString()
+  // See #364 — an unparseable Date threw a raw RangeError mid-write.
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? "" : value.toISOString()
   return String(value)
 }
 
@@ -115,6 +140,8 @@ function buildTree(row: Record<string, CellValue>, attrPrefix: string, textKey: 
   return root
 }
 
+// `json/unflatten.ts` reconstructs a tree from dot-paths too. The two are
+// intentionally separate — see the note at the top of that file for why.
 function insert(
   node: TreeNode,
   key: string,
@@ -203,4 +230,110 @@ function renderElement(
   }
 
   return `<${tag}${attrStr}>${sep}${inner.join("")}${pad(depth)}</${tag}>`
+}
+
+// ── True Streaming XML Writer ────────────────────────────────────────
+
+const TEXT_ENCODER = /* @__PURE__ */ new TextEncoder()
+
+/**
+ * Write an XML document as a byte stream, pulling rows from `rows` only
+ * as the consumer reads.
+ *
+ * XML was the one format with no streaming on either side, which made it
+ * the odd one out of five. See #467.
+ *
+ * ```ts
+ * return new Response(writeXmlStream(rowCursor, { rowTag: "record" }), {
+ *   headers: { "content-type": "application/xml; charset=utf-8" },
+ * })
+ * ```
+ *
+ * Peak memory is independent of the row count: each row is rendered,
+ * encoded and enqueued on its own, and nothing is retained. The
+ * declaration and the root element are written around them, so the
+ * result is the same document {@link writeXml} produces from the same
+ * rows — there is a test asserting exactly that.
+ *
+ * The *reader* is still not streaming: `src/xml/parser.ts` is push-based,
+ * so a streaming reader needs a pull-based row scanner rather than a
+ * wrapper around what is there. That is its own change.
+ */
+export function writeXmlStream(
+  rows: AsyncIterable<Record<string, CellValue>> | Iterable<Record<string, CellValue>>,
+  options?: XmlWriteOptions,
+): ReadableStream<Uint8Array> {
+  const chunks = xmlStreamChunks(rows, options)
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await chunks.next()
+        if (done) {
+          controller.close()
+          return
+        }
+        controller.enqueue(value)
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+    async cancel(reason) {
+      await chunks.return?.(reason)
+    },
+  })
+}
+
+/** Render rows into ~64 KB encoded chunks, pulling lazily. */
+async function* xmlStreamChunks(
+  rows: AsyncIterable<Record<string, CellValue>> | Iterable<Record<string, CellValue>>,
+  options?: XmlWriteOptions,
+): AsyncGenerator<Uint8Array> {
+  const rootTag = options?.rootTag ?? "root"
+  const rowTag = options?.rowTag ?? "row"
+  const attrPrefix = options?.attrPrefix ?? "@"
+  const textKey = options?.textKey ?? "#text"
+  const declaration = options?.declaration ?? true
+  const pretty = options?.pretty ?? false
+  const indent = options?.indent ?? "  "
+
+  // Validated up front, so a bad tag fails before any bytes go out
+  // rather than half way through a response.
+  validateName(rootTag, "rootTag")
+  validateName(rowTag, "rowTag")
+
+  const sep = pretty ? "\n" : ""
+  const pad = pretty ? indent : ""
+
+  const CHUNK_BYTES = 64 * 1024
+  let pending: string[] = []
+  let pendingBytes = 0
+
+  const push = function* (text: string): Generator<Uint8Array> {
+    pending.push(text)
+    pendingBytes += text.length
+    if (pendingBytes >= CHUNK_BYTES) {
+      yield TEXT_ENCODER.encode(pending.join(""))
+      pending = []
+      pendingBytes = 0
+    }
+  }
+
+  if (declaration) {
+    yield* push('<?xml version="1.0" encoding="UTF-8"?>')
+    if (pretty) yield* push("\n")
+  }
+  yield* push(`<${rootTag}>`)
+  yield* push(sep)
+
+  for await (const row of rows) {
+    yield* push(pad)
+    yield* push(renderElement(rowTag, buildTree(row, attrPrefix, textKey), pretty, indent, 1))
+    yield* push(sep)
+  }
+
+  yield* push(`</${rootTag}>`)
+  if (pretty) yield* push("\n")
+
+  if (pending.length > 0) yield TEXT_ENCODER.encode(pending.join(""))
 }

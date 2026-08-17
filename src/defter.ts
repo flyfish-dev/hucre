@@ -1,7 +1,8 @@
 // ── Ergonomic API ───────────────────────────────────────────────────
-// Unified high-level functions that wrap format-specific readers/writers.
-// Auto-detects format from content (magic bytes / package metadata) for
-// reading, and dispatches to the correct writer based on the format option.
+// Unified high-level functions that wrap the format-specific readers/writers.
+// Auto-detects format from content (magic bytes) for reading, and dispatches
+// to the correct writer based on the `format` option for writing.
+// ─────────────────────────────────────────────────────────────────────
 
 import type {
   Workbook,
@@ -12,219 +13,395 @@ import type {
   ReadInput,
   TableDefinition,
   TableColumn,
+  CsvWriteOptions,
 } from "./_types"
-import { readXls } from "./xls/reader"
+import type { JsonWriteOptions } from "./json/writer"
+import type { XmlWriteOptions } from "./xml/data-writer"
+import type { HtmlExportOptions } from "./export/html"
+import type { MarkdownExportOptions } from "./export/markdown"
+import { collectHeaders, rowsToObjects, selectSheet } from "./_objects"
 import { readXlsx } from "./xlsx/reader"
-import { readXlsb } from "./xlsb/reader"
+import { readXlsb, looksLikeXlsb } from "./xlsx/xlsb/reader"
+import { readXls, looksLikeXls } from "./xls/reader"
+import { readCfb } from "./xlsx/crypto/cfb"
+import { ZipReader } from "./zip/reader"
+import { decryptAgile } from "./xlsx/crypto/agile"
 import { writeXlsx } from "./xlsx/writer"
 import { readOds } from "./ods/reader"
 import { writeOds } from "./ods/writer"
 import { EncryptedFileError, UnsupportedFormatError } from "./errors"
 import { isOle2Container, readInputToUint8Array } from "./_input"
-import { decryptOfficeEncryptedPackage, isOfficeEncryptedPackage } from "./crypto/office-crypto"
-import { ZipReader } from "./zip/reader"
-import { parseXml } from "./xml/parser"
-import type { XmlElement } from "./xml/parser"
-import { decryptAgile } from "./xlsx/crypto/agile"
+import { detectTextFormat, type TextFormat } from "./_sniff"
+import { parseCsv } from "./csv/reader"
+import { writeCsv } from "./csv/writer"
+import { writeTsv } from "./export/tsv"
+import { jsonToWorkbook, parseNdjson } from "./json/reader"
+import { writeJson, writeNdjson } from "./json/writer"
+import { readXml } from "./xml/data-reader"
+import { writeXml } from "./xml/data-writer"
+import { fromHtml } from "./export/html-import"
+import { toHtml } from "./export/html"
+import { toMarkdown } from "./export/markdown"
+import { toCellValues } from "./_inline-cells"
 
 // ── Format Detection ────────────────────────────────────────────────
 
-function isZip(data: Uint8Array): boolean {
-  return data.length >= 4 && data[0] === 0x50 && data[1] === 0x4b
-}
-
-function u16(data: Uint8Array, offset: number): number {
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(offset, true)
-}
-
-function isRawBiff(data: Uint8Array): boolean {
-  if (data.length < 4) return false
-  const sid = u16(data, 0)
-  return sid === 0x0809 || sid === 0x0009 || sid === 0x0209 || sid === 0x0409
-}
-
 /**
- * Detect whether a ZIP archive is XLSX, XLSB, or ODS by inspecting the
- * package metadata rather than the extension.
+ * Detect whether a ZIP archive is XLSX or ODS by inspecting the first
+ * local file entry. ODS archives store "mimetype" as the first file
+ * with content "application/vnd.oasis.opendocument.spreadsheet".
+ * XLSX archives are also ZIP but never have "mimetype" as the first entry.
  */
-async function detectZipFormat(data: Uint8Array): Promise<"xlsx" | "xlsb" | "ods"> {
-  if (!isZip(data)) {
+function detectFormat(data: Uint8Array): "xlsx" | "ods" {
+  // Both XLSX and ODS start with PK (ZIP magic: 0x504B0304)
+  if (data.length < 4 || data[0] !== 0x50 || data[1] !== 0x4b) {
     throw new UnsupportedFormatError("unknown (not a ZIP archive)")
   }
 
+  // Read the first local file header to get the filename
+  // Local file header: offset 26 = filename length (2 bytes LE), offset 30+ = filename
   if (data.length < 30) {
     throw new UnsupportedFormatError("unknown (ZIP too short)")
   }
 
-  const decoder = new TextDecoder("utf-8")
   const filenameLen = data[26]! | (data[27]! << 8)
-  if (data.length >= 30 + filenameLen) {
-    const firstName = decoder.decode(data.subarray(30, 30 + filenameLen))
-    if (firstName === "mimetype") {
-      const extraLen = data[28]! | (data[29]! << 8)
-      const dataOffset = 30 + filenameLen + extraLen
-      const uncompSize = data[22]! | (data[23]! << 8) | (data[24]! << 16) | (data[25]! << 24)
-      if (uncompSize > 0 && data.length >= dataOffset + uncompSize) {
-        const mimeContent = decoder.decode(data.subarray(dataOffset, dataOffset + uncompSize))
-        if (mimeContent.trim() === "application/vnd.oasis.opendocument.spreadsheet") return "ods"
+  if (data.length < 30 + filenameLen) {
+    throw new UnsupportedFormatError("unknown (ZIP truncated)")
+  }
+
+  const decoder = new TextDecoder("utf-8")
+  const firstName = decoder.decode(data.subarray(30, 30 + filenameLen))
+
+  if (firstName === "mimetype") {
+    // Read the extra field length to find where file data starts
+    const extraLen = data[28]! | (data[29]! << 8)
+    const dataOffset = 30 + filenameLen + extraLen
+
+    // Read the uncompressed size from the local header (offset 22, 4 bytes LE)
+    const uncompSize = data[22]! | (data[23]! << 8) | (data[24]! << 16) | (data[25]! << 24)
+
+    if (uncompSize > 0 && data.length >= dataOffset + uncompSize) {
+      const mimeContent = decoder.decode(data.subarray(dataOffset, dataOffset + uncompSize))
+      if (mimeContent.trim() === "application/vnd.oasis.opendocument.spreadsheet") {
+        return "ods"
       }
-      return "ods"
     }
+
+    // Even if we couldn't read the content, "mimetype" as first entry is ODS convention
+    return "ods"
   }
 
-  const zip = new ZipReader(data)
-  if (zip.has("[Content_Types].xml")) {
-    const contentTypes = decoder.decode(await zip.extract("[Content_Types].xml"))
-    const workbookFormat = detectWorkbookFormatFromContentTypes(contentTypes)
-    if (workbookFormat) return workbookFormat
-  }
-
-  if (zip.has("xl/workbook.xml")) return "xlsx"
-  if (zip.has("xl/workbook.bin")) return "xlsb"
-  if (zip.entries().some((entry) => /(^|\/)workbook\.bin$/i.test(entry))) return "xlsb"
-
+  // Default: assume XLSX for any other ZIP
   return "xlsx"
-}
-
-function detectWorkbookFormatFromContentTypes(xml: string): "xlsx" | "xlsb" | undefined {
-  let root: XmlElement
-  try {
-    root = parseXml(xml)
-  } catch {
-    return undefined
-  }
-
-  const stack: XmlElement[] = [root]
-  while (stack.length) {
-    const el = stack.pop()!
-    if (el.local === "Override") {
-      const partName = normalizePackagePartName(el.attrs["PartName"])
-      if (/(^|\/)workbook\.xml$/i.test(partName)) return "xlsx"
-      if (/(^|\/)workbook\.bin$/i.test(partName)) return "xlsb"
-    }
-    for (const child of el.children) {
-      if (typeof child !== "string") stack.push(child)
-    }
-  }
-
-  return undefined
-}
-
-function normalizePackagePartName(partName = ""): string {
-  return partName.replace(/^\/+/, "")
-}
-
-async function decryptDetectedOfficePackage(
-  data: Uint8Array,
-  password?: string,
-): Promise<Uint8Array> {
-  if (!password) {
-    return decryptOfficeEncryptedPackage(data, password)
-  }
-
-  try {
-    return await decryptAgile(data, password)
-  } catch (agileError) {
-    try {
-      return await decryptOfficeEncryptedPackage(data, password)
-    } catch {
-      throw agileError
-    }
-  }
 }
 
 // ── Public API ──────────────────────────────────────────────────────
 
 /**
- * Read any supported spreadsheet file. Auto-detects XLS, XLSX, XLSB, and ODS.
- * CSV uses parseCsv separately since it is string input.
+ * Read any supported spreadsheet file. Auto-detects format from content.
+ * Supports: XLSX, ODS (CSV uses parseCsv separately since it's string input).
+ *
+ * Input can be Uint8Array, ArrayBuffer, or ReadableStream&lt;Uint8Array&gt;.
+ * ReadableStream input is buffered fully before format detection runs.
  */
-export async function read(
-  input: ReadInput,
-  options?: ReadOptions & { password?: string },
-): Promise<Workbook> {
-  let data = await readInputToUint8Array(input)
+export async function read(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
+  let data = await readInputToUint8Array(input, options?.maxInputBytes)
 
+  // Password-protected workbooks arrive as an OLE2/CFB envelope. With a
+  // password we decrypt the inner package (then `detectFormat` works on
+  // the plaintext ZIP); without one we surface a typed error. The
+  // container alone doesn't reveal XLSX vs ODS, so the no-password error
+  // leaves `format` unset. (ODS uses a different in-ZIP scheme, so only
+  // XLSX decryption is wired up — an ODS password yields a ZIP that
+  // detectFormat routes to readOds, which handles its own encryption.)
   if (isOle2Container(data)) {
-    if (isOfficeEncryptedPackage(data)) {
-      data = await decryptDetectedOfficePackage(data, options?.password)
-    } else {
-      // Preserve the historical byte-sniff behavior for short synthetic
-      // encrypted-container probes, while allowing malformed real XLS files
-      // to surface the parser's typed error instead of being mislabeled.
-      if (data.length < 512) throw new EncryptedFileError()
+    // An OLE2 container is either a legacy .xls (BIFF "Workbook" stream)
+    // or an encrypted OOXML/ODS package (an "EncryptionInfo" stream).
+    let cfbStreams: Map<string, Uint8Array> | null = null
+    try {
+      cfbStreams = readCfb(data)
+    } catch {
+      cfbStreams = null // not a parseable CFB — treat as encrypted/unknown
+    }
+    if (cfbStreams && looksLikeXls(cfbStreams)) {
       return readXls(data, options)
+    }
+    if (options?.password) {
+      data = await decryptAgile(data, options.password, options.maxSpinCount)
+    } else {
+      throw new EncryptedFileError()
     }
   }
 
-  if (isRawBiff(data)) {
-    return readXls(data, options)
+  // Not a container. Every text format the library reads announces
+  // itself in its first non-whitespace character or two, so `read()` no
+  // longer stops at the ZIP boundary. See #469.
+  if (data.length < 4 || data[0] !== 0x50 || data[1] !== 0x4b) {
+    const text = detectTextFormat(data)
+    if (text !== null) return readTextFormat(data, text)
   }
 
-  const format = await detectZipFormat(data)
-  if (format === "ods") return readOds(data, options)
-  if (format === "xlsb") return readXlsb(data, options)
+  const format = detectFormat(data)
+
+  if (format === "ods") {
+    return readOds(data, options)
+  }
+  // XLSX and XLSB share the ZIP shape; tell them apart by the binary
+  // workbook part before dispatching.
+  try {
+    if (looksLikeXlsb(new ZipReader(data))) return readXlsb(data, options)
+  } catch {
+    // Not a readable ZIP here — fall through to readXlsx for a typed error.
+  }
   return readXlsx(data, options)
 }
 
-/** Write a workbook to the specified format. */
+/**
+ * Turn a detected text format into a workbook.
+ *
+ * Each of these readers already exists and is exported; what was missing
+ * was `read()` knowing to call one. The tabular readers hand back
+ * `{ data, headers }`, so the header row is put back at the top — a
+ * workbook is a grid, and dropping the names would lose them.
+ */
+function readTextFormat(data: Uint8Array, format: TextFormat): Workbook {
+  switch (format) {
+    case "csv":
+      return { sheets: [{ name: "Sheet1", rows: parseCsv(data) }] }
+    case "json":
+      return jsonToWorkbook(data)
+    case "ndjson": {
+      const { data: rows, headers } = parseNdjson(data)
+      return { sheets: [{ name: "Sheet1", rows: withHeaderRow(rows, headers) }] }
+    }
+    case "xml": {
+      const { data: rows, headers } = readXml(data)
+      return { sheets: [{ name: "Sheet1", rows: withHeaderRow(rows, headers) }] }
+    }
+    case "html":
+      return { sheets: [fromHtml(new TextDecoder("utf-8").decode(data))] }
+  }
+}
+
+/** Put the header names back at row 0, the way a grid holds them. */
+function withHeaderRow(rows: Array<Record<string, CellValue>>, headers: string[]): CellValue[][] {
+  return [headers, ...rows.map((row) => headers.map((h) => row[h] ?? null))]
+}
+
+/** Every format {@link write} can produce. */
+export type WriteFormat =
+  | "xlsx"
+  | "ods"
+  | "csv"
+  | "tsv"
+  | "json"
+  | "ndjson"
+  | "xml"
+  | "html"
+  | "markdown"
+
+/**
+ * Write a workbook to the specified format.
+ *
+ * The union used to be `"xlsx" | "ods"` while the library could write
+ * nine things, so the one function meant to be format-agnostic covered
+ * two of them. See #469.
+ *
+ * The text formats are single-sheet by nature and take the first sheet;
+ * they also carry values and not formatting, which is the same trade
+ * `hucre convert` documents. The return is always bytes, so a caller can
+ * hand the result to `Response` or `writeFile` without branching.
+ */
+export interface TextFormatOptions {
+  /** Options for `format: "csv"`. */
+  csv?: CsvWriteOptions
+  /** Options for `format: "tsv"`. The delimiter is the tab and not yours. */
+  tsv?: Omit<CsvWriteOptions, "delimiter">
+  /** Options for `format: "json"`. */
+  json?: JsonWriteOptions
+  /** Options for `format: "ndjson"`. */
+  ndjson?: Pick<JsonWriteOptions, "unflatten">
+  /** Options for `format: "xml"`. */
+  xml?: XmlWriteOptions
+  /** Options for `format: "html"`. */
+  html?: HtmlExportOptions
+  /** Options for `format: "markdown"`. */
+  markdown?: MarkdownExportOptions
+}
+
 export async function write(
-  options: WriteOptions & { format?: "xlsx" | "ods" },
+  options: WriteOptions & { format?: WriteFormat } & TextFormatOptions,
 ): Promise<WriteOutput> {
   const format = options.format ?? "xlsx"
+  if (format === "xlsx") return writeXlsx(options)
   if (format === "ods") return writeOds(options)
-  return writeXlsx(options)
+
+  const sheet = options.sheets[0]
+  if (!sheet) {
+    throw new UnsupportedFormatError(`${format} needs a sheet to write, and the workbook has none.`)
+  }
+  // These formats carry values and nothing else, so an inline cell object
+  // reduces to its value here rather than going through the `cells` split
+  // the two spreadsheet writers do. See #433.
+  const rows = toCellValues(sheet.rows ?? [])
+
+  // Each text writer already takes an options bag; this function used to
+  // call every one of them with none, so `write` — the entry #469 added
+  // precisely so one call could reach all nine formats — was the only way
+  // to reach seven of them that could not configure any. `bom: true` was
+  // the one that mattered: it is what makes Excel open a UTF-8 CSV on a
+  // non-UTF-8 locale, and #475 documents it as the answer while `write`
+  // gave no way to ask for it.
+  const encoder = new TextEncoder()
+  switch (format) {
+    case "csv":
+      return encoder.encode(writeCsv(rows, options.csv))
+    case "tsv":
+      return encoder.encode(writeTsv(rows, options.tsv))
+    case "json":
+      return encoder.encode(writeJson(rowsToRecords(rows), options.json))
+    case "ndjson":
+      return encoder.encode(writeNdjson(rowsToRecords(rows), options.ndjson))
+    case "xml":
+      return encoder.encode(writeXml(rowsToRecords(rows), options.xml))
+    case "html":
+      return encoder.encode(toHtml({ name: sheet.name, rows }, options.html))
+    case "markdown":
+      return encoder.encode(toMarkdown({ name: sheet.name, rows }, options.markdown))
+  }
 }
 
-/** Quick helper: read a file and get the first sheet as array of objects. */
+/**
+ * Read the first row as field names and project the rest against it.
+ *
+ * The record-shaped writers need names; a `WriteSheet` is a grid. This is
+ * the same convention `writeCsvObjects` and the CLI use, and the same one
+ * {@link withHeaderRow} inverts on the way in.
+ */
+function rowsToRecords(rows: CellValue[][]): Array<Record<string, CellValue>> {
+  const [header, ...body] = rows
+  if (!header) return []
+  const names = header.map((h, i) => (h === null || h === undefined ? `column${i + 1}` : String(h)))
+  return body.map((row) => {
+    const out: Record<string, CellValue> = {}
+    names.forEach((name, i) => {
+      out[name] = row[i] ?? null
+    })
+    return out
+  })
+}
+
+/**
+ * Options for {@link readObjects}.
+ *
+ * The projection knobs are the same set — and the same defaults — as
+ * `XlsxObjectsReadOptions` and `OdsObjectsReadOptions`. They are applied
+ * to the workbook `read()` returns, so every one of them is honoured for
+ * every format `read()` can detect (XLSX, XLSB, XLS, ODS).
+ *
+ * The inherited {@link ReadOptions} fields are a different story: they are
+ * handed to the format reader and are honoured as unevenly as ever (see
+ * #365 item 4). `sheets` is omitted because {@link sheet} supersedes it.
+ */
+export interface ReadObjectsOptions extends Omit<ReadOptions, "sheets"> {
+  /** Sheet to read from. Index (0-based) or sheet name. Default: 0. */
+  sheet?: number | string
+  /** 0-based row index to use as headers. Default: 0. */
+  headerRow?: number
+  /** Skip rows where every cell is null/empty. Default: true. */
+  skipEmptyRows?: boolean
+  /** Transform header values (after String/trim normalization). */
+  transformHeader?: (header: string, index: number) => string
+  /** Transform each cell value. */
+  transformValue?: (
+    value: CellValue,
+    header: string,
+    rowIndex: number,
+    colIndex: number,
+  ) => CellValue
+  /**
+   * Maximum number of data rows to return (after the header row).
+   *
+   * Shadows `ReadOptions.maxRows` — this one is applied to the projected
+   * rows for every format, rather than to the XLSX parse only. The
+   * format reader is never handed a `maxRows`.
+   */
+  maxRows?: number
+}
+
+/**
+ * Result shape for {@link readObjects} — the same `{ data, headers }`
+ * every other `*Objects` reader returns.
+ */
+export interface ReadObjectsResult<
+  T extends Record<string, CellValue> = Record<string, CellValue>,
+> {
+  data: T[]
+  headers: string[]
+}
+
+/**
+ * Quick helper: read a file and get a sheet as objects keyed by a header
+ * row, plus the detected headers.
+ *
+ * Format-agnostic counterpart to `readXlsxObjects` / `readOdsObjects` —
+ * same options, same defaults, same `{ data, headers }` result.
+ */
 export async function readObjects<T extends Record<string, CellValue> = Record<string, CellValue>>(
   input: ReadInput,
-  options?: ReadOptions & { password?: string },
-): Promise<T[]> {
-  const workbook = await read(input, options)
-  if (workbook.sheets.length === 0) return []
+  options?: ReadObjectsOptions,
+): Promise<ReadObjectsResult<T>> {
+  const {
+    sheet: sheetSelector = 0,
+    headerRow = 0,
+    skipEmptyRows = true,
+    transformHeader,
+    transformValue,
+    maxRows,
+    ...readOpts
+  } = options ?? {}
 
-  const sheet = workbook.sheets[0]!
-  const rows = sheet.rows
-  if (rows.length === 0) return []
+  const workbook = await read(input, readOpts)
+  const sheet = selectSheet(workbook, sheetSelector)
 
-  const headers = rows[0]!.map((h) => (h === null || h === undefined ? "" : String(h).trim()))
-  if (headers.length === 0) return []
-
-  const data: T[] = []
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i]!
-    const obj: Record<string, CellValue> = {}
-    for (let j = 0; j < headers.length; j++) {
-      const key = headers[j]!
-      if (key === "") continue
-      obj[key] = j < row.length ? (row[j] ?? null) : null
-    }
-    data.push(obj as T)
-  }
-
-  return data
+  return rowsToObjects<T>(sheet.rows, {
+    headerRow,
+    skipEmptyRows,
+    transformHeader,
+    transformValue,
+    maxRows,
+  })
 }
 
-/** Options for writeObjects table generation. */
+/** Options for writeObjects table generation */
 export interface WriteObjectsTableOption {
+  /** Table name (must be unique in workbook) */
   name: string
+  /** Table style (e.g. "TableStyleMedium2") */
   style?: string
+  /** Show totals row */
   showTotalRow?: boolean
+  /** Show auto-filter. Default: true */
   showAutoFilter?: boolean
+  /** Show banded rows. Default: true */
   showRowStripes?: boolean
+  /** Totals per column key: { revenue: "sum", margin: "average" } */
   totals?: Record<
     string,
     "sum" | "average" | "count" | "min" | "max" | "countNums" | "stdDev" | "var"
   >
 }
 
-/** Write an array of objects to a spreadsheet format. */
+/**
+ * Quick helper: write an array of objects to a spreadsheet format.
+ * Infers column headers from the keys of the first object.
+ */
 export async function writeObjects(
   data: Array<Record<string, CellValue>>,
   options?: {
     sheetName?: string
     format?: "xlsx" | "ods"
+    /** Wrap output in a native Excel table (ListObject) */
     table?: WriteObjectsTableOption
   },
 ): Promise<WriteOutput> {
@@ -232,26 +409,47 @@ export async function writeObjects(
   const format = options?.format ?? "xlsx"
 
   if (data.length === 0) {
-    return write({ sheets: [{ name: sheetName, rows: [] }], format })
+    return write({
+      sheets: [{ name: sheetName, rows: [] }],
+      format,
+    })
   }
 
-  const keys = Object.keys(data[0]!)
-  const rows: CellValue[][] = [keys]
+  // Column set is the union of every record's keys, not just the first's.
+  const keys = collectHeaders(data)
+
+  // Build rows: header row + data rows
+  const rows: CellValue[][] = []
+
+  // Header row
+  rows.push(keys)
+
+  // Data rows
   for (const item of data) {
-    rows.push(keys.map((key) => (item[key] === undefined ? null : item[key]!)))
+    const row: CellValue[] = keys.map((key) => {
+      const val = item[key]
+      return val === undefined ? null : val
+    })
+    rows.push(row)
   }
 
+  // Build Excel table if requested
   let tables: TableDefinition[] | undefined
   if (options?.table) {
     const t = options.table
     const colCount = keys.length
-    const rowCount = data.length + 1
+    const rowCount = data.length + 1 // +1 for header
     const endCol = colToLetterSimple(colCount - 1)
     const range = `A1:${endCol}${rowCount + (t.showTotalRow ? 1 : 0)}`
-    const tableColumns: TableColumn[] = keys.map((key) => ({
-      name: key,
-      ...(t.totals?.[key] ? { totalFunction: t.totals[key] } : {}),
-    }))
+
+    const tableColumns: TableColumn[] = keys.map((key) => {
+      const totalFn = t.totals?.[key]
+      return {
+        name: key,
+        ...(totalFn ? { totalFunction: totalFn } : {}),
+      }
+    })
+
     tables = [
       {
         name: t.name,
@@ -266,9 +464,13 @@ export async function writeObjects(
     ]
   }
 
-  return write({ sheets: [{ name: sheetName, rows, tables }], format })
+  return write({
+    sheets: [{ name: sheetName, rows, tables }],
+    format,
+  })
 }
 
+/** Simple column index to letter (0-based) */
 function colToLetterSimple(col: number): string {
   let result = ""
   let n = col

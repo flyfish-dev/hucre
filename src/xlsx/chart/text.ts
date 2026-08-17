@@ -30,13 +30,60 @@
 // remain meaningful at the call site.
 
 import type { XmlElement } from "../../xml/parser"
+import { findChild } from "./util"
 
-/** See `chart/shape.ts` for the equivalent helper. */
-function findChild(el: XmlElement, localName: string): XmlElement | undefined {
-  for (const c of el.children) {
-    if (typeof c !== "string" && c.local === localName) return c
-  }
-  return undefined
+// ── The walk ──────────────────────────────────────────────────────
+//
+// Both hosts end at the same `<a:defRPr>`; they differ only in how you
+// get there. Written out at each call site, that walk appeared 43 times
+// across five files — axis.ts alone had 14 — so reading one axis
+// re-walked the same subtree once per attribute, and adding a property
+// meant another copy of it. See #466.
+
+/**
+ * `host` → `<c:txPr>` → `<a:p>` → `<a:pPr>` → `<a:defRPr>`.
+ *
+ * The text-properties body: what the legend, axis tick labels,
+ * data-labels and data-table hosts use. Scoped to the host's *own*
+ * `<c:txPr>`, so a `<a:defRPr>` inside a sibling `<c:title><c:tx>
+ * <c:rich>` cannot leak in — which is why this is a walk and not a
+ * recursive search.
+ *
+ * Returns `undefined` at the first missing link, so a malformed chain
+ * surfaces as absence rather than a fabricated value.
+ */
+export function resolveTxPrDefRPr(host: XmlElement): XmlElement | undefined {
+  const txPr = findChild(host, "txPr")
+  if (!txPr) return undefined
+  return resolveParagraphDefRPr(txPr)
+}
+
+/**
+ * `host` → `<c:title>` → `<c:tx>` → `<c:rich>` → `<a:p>` → `<a:pPr>` →
+ * `<a:defRPr>`.
+ *
+ * The rich-text body: what the chart title and axis titles use. Takes
+ * the element that *owns* the title — `<c:chart>` for the chart title,
+ * the axis element for an axis title — because that is where both
+ * callers start.
+ */
+export function resolveTitleDefRPr(host: XmlElement): XmlElement | undefined {
+  const title = findChild(host, "title")
+  if (!title) return undefined
+  const tx = findChild(title, "tx")
+  if (!tx) return undefined
+  const rich = findChild(tx, "rich")
+  if (!rich) return undefined
+  return resolveParagraphDefRPr(rich)
+}
+
+/** The shared tail: `<a:p>` → `<a:pPr>` → `<a:defRPr>`. */
+function resolveParagraphDefRPr(body: XmlElement): XmlElement | undefined {
+  const p = findChild(body, "p")
+  if (!p) return undefined
+  const pPr = findChild(p, "pPr")
+  if (!pPr) return undefined
+  return findChild(pPr, "defRPr")
 }
 
 // ── Rotation constants ────────────────────────────────────────────
@@ -164,23 +211,6 @@ export function normalizeFontFamily(value: string | undefined): string | undefin
 }
 
 // ── Bold / italic ─────────────────────────────────────────────────
-
-/**
- * Read a boolean-style OOXML attribute (`"1"` / `"0"` / `"true"` /
- * `"false"`). Returns `true` for the truthy tokens, `false` for
- * `"0"` / `"false"`, and `undefined` for any other string and for
- * missing / non-string values.
- *
- * Used to parse the `b` / `i` flags on `<a:defRPr>` and the canonical
- * `val` attribute on numeric / scale child elements (`<c:smooth>`,
- * `<c:overlay>`, `<c:auto>`, etc.).
- */
-export function readBoolAttrValue(raw: string | undefined): boolean | undefined {
-  if (raw === undefined) return undefined
-  if (raw === "1" || raw === "true") return true
-  if (raw === "0" || raw === "false") return false
-  return undefined
-}
 
 /**
  * Normalize a literal boolean for a writer's flag attribute. Returns

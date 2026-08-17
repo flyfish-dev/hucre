@@ -1,10 +1,13 @@
 // ── Worksheet XML Writer ─────────────────────────────────────────────
 // Generates xl/worksheets/sheetN.xml for an XLSX package.
 
+import { toRanges } from "../cell-utils"
 import type {
+  RowDef,
   WriteSheet,
   CellValue,
   CellStyle,
+  ColumnDef,
   ConditionalRule,
   DataValidation,
   SheetProtection,
@@ -12,6 +15,7 @@ import type {
   PageMargins,
   HeaderFooter,
   PaperSize,
+  PaperSizeName,
   RichTextRun,
   FontStyle,
   Color,
@@ -22,9 +26,12 @@ import type {
 import type { StylesCollector } from "./styles-writer"
 import { dateToSerial } from "../_date"
 import { isHyperlinkValue } from "./hyperlink"
-import { xmlDocument, xmlElement, xmlSelfClose, xmlEscape } from "../xml/writer"
+import { xmlDocument, xmlElement, xmlSelfClose, xmlEscape, xmlTextElement } from "../xml/writer"
 import { calculateColumnWidth } from "./auto-width"
+import { DYNAMIC_ARRAY_CM } from "./metadata"
 import { hashSheetPassword } from "./password"
+import { validateColumnIndex } from "../_validate"
+import { toCellValue } from "../_inline-cells"
 
 // ── Hyperlink Relationship ────────────────────────────────────────
 
@@ -35,6 +42,16 @@ export interface HyperlinkRelationship {
 
 export interface WorksheetResult {
   xml: string
+  /**
+   * Character offset in {@link xml} where a `<drawing>` element belongs.
+   *
+   * The roundtrip has to insert one for a drawing it preserves rather
+   * than generates, and the worksheet body is serialized before the rId
+   * is known. This is the writer saying where, exactly, instead of the
+   * caller searching the finished string for a tag to sit in front of.
+   * See #474.
+   */
+  drawingInsertOffset: number
   hyperlinkRelationships: HyperlinkRelationship[]
   /** The rId used for the drawing reference (if sheet has images) */
   drawingRId: string | null
@@ -54,16 +71,28 @@ export interface WorksheetResult {
    * `xl/pivotTables/pivotTableN.xml` path.
    */
   pivotTables: Array<{ rId: string; globalPivotIndex: number }>
+  /**
+   * Whether any cell was written with `cm`. The package must then ship
+   * xl/metadata.xml, or the index points at nothing — see ./metadata.ts.
+   */
+  hasDynamicArray: boolean
 }
 
 const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-const NS_X14AC = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
 
 // ── Column Letter Conversion ───────────────────────────────────────
 
 /** Convert a 0-based column index to an Excel column letter (A, B, ... Z, AA, AB, ...) */
 export function colToLetter(col: number): string {
+  // Memoising this was tried and measured: it is 10 ms of a 2,814 ms
+  // write, 0.36%, and the change did not show above run-to-run noise. A
+  // cache that cannot be measured is complexity for nothing. See #472.
+  //
+  // Pure arithmetic on an unchecked number produced references no reader
+  // can parse — "@" for -1, a NUL character for NaN, "XFE" one past the
+  // last column. See #364.
+  validateColumnIndex(col)
   let result = ""
   let c = col
   do {
@@ -74,6 +103,36 @@ export function colToLetter(col: number): string {
 }
 
 /** Build a cell reference like "A1" from 0-based row and col */
+/**
+ * The `<row>` attributes a row definition asks for. Shared with the streaming
+ * writers so a `RowDef` means the same thing whichever writer serialises it.
+ */
+export function rowAttributes(
+  rowIndex: number,
+  rowDef?: RowDef,
+): Record<string, string | number | boolean> {
+  const attrs: Record<string, string | number | boolean> = { r: rowIndex + 1 }
+  if (rowDef?.height !== undefined) {
+    attrs["ht"] = rowDef.height
+    attrs["customHeight"] = 1
+  }
+  if (rowDef?.hidden) attrs["hidden"] = 1
+  if (rowDef?.outlineLevel) attrs["outlineLevel"] = rowDef.outlineLevel
+  if (rowDef?.collapsed) attrs["collapsed"] = 1
+  return attrs
+}
+
+/** True when a row definition asks for anything at all. */
+export function hasRowAttributes(rowDef?: RowDef): boolean {
+  return (
+    rowDef !== undefined &&
+    (rowDef.height !== undefined ||
+      Boolean(rowDef.hidden) ||
+      Boolean(rowDef.outlineLevel) ||
+      Boolean(rowDef.collapsed))
+  )
+}
+
 export function cellRef(row: number, col: number): string {
   return colToLetter(col) + (row + 1)
 }
@@ -135,14 +194,7 @@ export function writeSharedStringsXml(sharedStrings: SharedStringsCollector): st
 
   const children: string[] = []
   for (const str of strings) {
-    const escaped = xmlEscape(str)
-    const needsPreserve =
-      str.length > 0 &&
-      (str[0] === " " || str[str.length - 1] === " " || str.includes("\n") || str.includes("\t"))
-    const tElement = needsPreserve
-      ? `<t xml:space="preserve">${escaped}</t>`
-      : xmlElement("t", undefined, escaped)
-    children.push(xmlElement("si", undefined, [tElement]))
+    children.push(xmlElement("si", undefined, [xmlTextElement(str)]))
   }
 
   return xmlDocument("sst", { xmlns: NS_SPREADSHEET, count, uniqueCount: count }, children)
@@ -150,7 +202,13 @@ export function writeSharedStringsXml(sharedStrings: SharedStringsCollector): st
 
 // ── Resolved Cell Data ─────────────────────────────────────────────
 
-interface ResolvedCell {
+/**
+ * One cell, with everything the serializer needs already worked out.
+ *
+ * Exported because the streaming writers build these too — see
+ * {@link serializeCell}.
+ */
+export interface ResolvedCell {
   value: CellValue
   style?: CellStyle
   checkbox?: boolean
@@ -180,7 +238,38 @@ function toHyperlink(hv: HyperlinkValue): Hyperlink {
 
 const DEFAULT_DATE_FORMAT = "yyyy-mm-dd"
 
-/** Known Excel error value strings */
+/**
+ * The style a bare `Date` gets, as one object rather than one per cell.
+ *
+ * `serializeCell` used to build `{ ...style, numFmt: DEFAULT_DATE_FORMAT }`
+ * fresh for every date cell, which defeated the xf identity cache #435
+ * added: measured on the 100,000 x 12 benchmark, `registerXf` was called
+ * 400,000 times — exactly the date-cell count — with **zero** identity
+ * hits, to produce one xf. Every one of those paid for an object, a
+ * seven-element key array, a join and a Map lookup.
+ *
+ * Sharing one frozen object makes the cache hit on the second date cell
+ * and every one after it. See #472.
+ */
+const BARE_DATE_STYLE: CellStyle = Object.freeze({ numFmt: DEFAULT_DATE_FORMAT })
+
+/**
+ * Derived date styles for cells that *do* carry a style, keyed by that
+ * style's identity — same reasoning, one step further out. A `WeakMap`
+ * so a style object the caller drops does not keep an entry alive.
+ */
+const DATE_STYLE_CACHE = /* @__PURE__ */ new WeakMap<CellStyle, CellStyle>()
+
+/**
+ * Known Excel error value strings.
+ *
+ * The first eight are the ST_CellType `e` values ECMA-376 enumerates.
+ * `#SPILL!` and `#CALC!` are the two errors dynamic arrays introduced —
+ * they are not in the standard's list, but Excel stores them the same
+ * way (`t="e"` with the literal text in `<v>`), and without them a
+ * `#SPILL!` read out of a real workbook came back as a *shared string*
+ * on the way in again, losing its error type entirely (#423).
+ */
 const EXCEL_ERRORS = new Set([
   "#VALUE!",
   "#REF!",
@@ -190,6 +279,8 @@ const EXCEL_ERRORS = new Set([
   "#DIV/0!",
   "#NUM!",
   "#GETTING_DATA",
+  "#SPILL!",
+  "#CALC!",
 ])
 
 // ── Worksheet Writer ───────────────────────────────────────────────
@@ -236,6 +327,13 @@ export function writeWorksheetXml(
         outlineAttrs["summaryRight"] = sheet.outlineProperties.summaryRight ? 1 : 0
       }
       sheetPrChildren.push(xmlSelfClose("outlinePr", outlineAttrs))
+    }
+    // `<pageSetup fitToWidth>` alone does nothing in Excel — the scaling
+    // mode is switched by this flag, and the fit counts are read only
+    // once it is on. It also carries `fitToPage: true` on its own, which
+    // previously emitted no XML whatsoever. See #407.
+    if (sheet.pageSetup?.fitToPage) {
+      sheetPrChildren.push(xmlSelfClose("pageSetUpPr", { fitToPage: 1 }))
     }
     if (sheetPrChildren.length > 0) {
       parts.push(xmlElement("sheetPr", undefined, sheetPrChildren))
@@ -326,17 +424,16 @@ export function writeWorksheetXml(
   )
 
   // ── SheetFormatPr ──
-  parts.push(
-    xmlSelfClose("sheetFormatPr", {
-      baseColWidth: sheet.sheetFormat?.baseColWidth,
-      defaultColWidth: sheet.sheetFormat?.defaultColWidth,
-      defaultRowHeight: sheet.sheetFormat?.defaultRowHeight ?? 15,
-      zeroHeight: sheet.sheetFormat?.zeroHeight ? 1 : undefined,
-      outlineLevelRow: sheet.sheetFormat?.outlineLevelRow,
-      outlineLevelCol: sheet.sheetFormat?.outlineLevelCol,
-      "x14ac:dyDescent": sheet.sheetFormat?.dyDescent,
-    }),
-  )
+  // `defaultRowHeight` is required by the schema, so 15 — Excel's own
+  // default — stands in when the sheet does not say. It used to be
+  // hard-coded, which meant a file whose default was 24 lost it on the way
+  // through. See #439 §X.
+  const formatPrAttrs: Record<string, string | number> = {
+    defaultRowHeight: sheet.defaultRowHeight ?? 15,
+  }
+  if (sheet.defaultRowHeight !== undefined) formatPrAttrs["customHeight"] = 1
+  if (sheet.defaultColWidth !== undefined) formatPrAttrs["defaultColWidth"] = sheet.defaultColWidth
+  parts.push(xmlSelfClose("sheetFormatPr", formatPrAttrs))
 
   // ── Columns ──
   if (sheet.columns && sheet.columns.length > 0) {
@@ -359,29 +456,36 @@ export function writeWorksheetXml(
         })
       }
 
-      const colStyle =
-        col.style || col.numFmt
-          ? { ...(col.style ?? {}), numFmt: col.numFmt ?? col.style?.numFmt }
-          : undefined
-      const colStyleIndex = colStyle ? styles.addStyle(colStyle) : 0
+      // A column format has to land on `<col style="N">` as well as on the
+      // cells. Stamping the cells alone made it look right for the rows
+      // hucre wrote and nowhere else: in Excel a column format applies to
+      // every cell in the column including ones nobody has typed in yet,
+      // so a "currency" column stopped being one the moment the user
+      // added a row. It also meant the format vanished on read, since the
+      // reader has only `<col>` to look at. See #439 §W.
+      const columnStyle: CellStyle | undefined =
+        col.numFmt && !col.style?.numFmt
+          ? { ...col.style, numFmt: col.numFmt }
+          : (col.style ?? undefined)
+      const columnStyleId = columnStyle ? styles.addStyle(columnStyle) : 0
 
       if (
         effectiveWidth !== undefined ||
         col.hidden ||
         col.outlineLevel ||
         col.collapsed ||
-        colStyleIndex !== 0
+        columnStyleId !== 0
       ) {
         const colAttrs: Record<string, string | number | boolean> = {
           min: i + 1,
           max: i + 1,
         }
-        if (colStyleIndex !== 0) {
-          colAttrs["style"] = colStyleIndex
-        }
         if (effectiveWidth !== undefined) {
           colAttrs["width"] = effectiveWidth
           colAttrs["customWidth"] = true
+        }
+        if (columnStyleId !== 0) {
+          colAttrs["style"] = columnStyleId
         }
         if (col.hidden) {
           colAttrs["hidden"] = true
@@ -402,17 +506,14 @@ export function writeWorksheetXml(
 
   // ── Sheet Data ──
   const rowElements: string[] = []
+  let hasDynamicArray = false
 
   for (let r = 0; r < rowCount; r++) {
     const row = resolvedRows[r]
     const rowDef = sheet.rowDefs?.get(r)
     const hasRowDef =
       rowDef &&
-      (rowDef.height !== undefined ||
-        rowDef.style ||
-        rowDef.hidden ||
-        rowDef.outlineLevel ||
-        rowDef.collapsed)
+      (rowDef.height !== undefined || rowDef.hidden || rowDef.outlineLevel || rowDef.collapsed)
 
     if ((!row || row.length === 0) && !hasRowDef) continue
 
@@ -424,6 +525,16 @@ export function writeWorksheetXml(
         const resolved = row[c]
         if (!resolved) continue
 
+        // Mirrors the condition serializeCell applies below: `cm` only
+        // goes out on a cell that actually carries a formula.
+        if (
+          resolved.formulaDynamic &&
+          resolved.formula !== undefined &&
+          resolved.formula !== null
+        ) {
+          hasDynamicArray = true
+        }
+
         const cellXml = serializeCell(r, c, resolved, styles, sharedStrings, is1904, inlineStrings)
         if (cellXml) {
           cellElements.push(cellXml)
@@ -433,29 +544,13 @@ export function writeWorksheetXml(
     }
 
     if (hasAnyCells || hasRowDef) {
-      const rowAttrs: Record<string, string | number | boolean> = { r: r + 1 }
-      if (rowDef?.height !== undefined) {
-        rowAttrs["ht"] = rowDef.height
-        if (rowDef.customHeight !== false) {
-          rowAttrs["customHeight"] = 1
-        }
-      }
-      if (rowDef?.style) {
-        const rowStyleIndex = styles.addStyle(rowDef.style)
-        if (rowStyleIndex !== 0) {
-          rowAttrs["s"] = rowStyleIndex
-          rowAttrs["customFormat"] = 1
-        }
-      }
-      if (rowDef?.hidden) {
-        rowAttrs["hidden"] = 1
-      }
-      if (rowDef?.outlineLevel) {
-        rowAttrs["outlineLevel"] = rowDef.outlineLevel
-      }
-      if (rowDef?.collapsed) {
-        rowAttrs["collapsed"] = 1
-      }
+      // Emitting `<row r="N">` directly for the common no-rowDef case was
+      // tried and measured: over ten alternating benchmark pairs it won
+      // six and moved the mean 1.8%, which is inside this machine's noise
+      // floor. The cell fast path below it pays because there are 1.2M
+      // cells to a sheet's 100k rows — a twelfth of the allocations is a
+      // twelfth of the prize. See #472.
+      const rowAttrs = rowAttributes(r, rowDef)
       if (hasAnyCells) {
         rowElements.push(xmlElement("row", rowAttrs, cellElements))
       } else {
@@ -492,13 +587,16 @@ export function writeWorksheetXml(
   }
 
   // ── Merge Cells ──
-  if (sheet.merges && sheet.merges.length > 0) {
-    const mergeElements = sheet.merges.map((m) =>
+  // A merge may be given as an A1 string; both forms mean the same
+  // rectangle and the file only knows one of them. See #474.
+  const merges = toRanges(sheet.merges)
+  if (merges && merges.length > 0) {
+    const mergeElements = merges.map((m) =>
       xmlSelfClose("mergeCell", {
         ref: rangeRef(m.startRow, m.startCol, m.endRow, m.endCol),
       }),
     )
-    parts.push(xmlElement("mergeCells", { count: sheet.merges.length }, mergeElements))
+    parts.push(xmlElement("mergeCells", { count: merges.length }, mergeElements))
   }
 
   // ── Conditional Formatting ──
@@ -512,14 +610,24 @@ export function writeWorksheetXml(
   }
 
   // ── Hyperlinks ──
-  const { xml: hyperlinksXml, relationships: hyperlinkRelationships } = collectHyperlinks(sheet)
+  const { xml: hyperlinksXml, relationships: hyperlinkRelationships } = collectHyperlinks(
+    sheet,
+    resolvedRows,
+  )
   if (hyperlinksXml) {
     parts.push(hyperlinksXml)
   }
 
-  // ── Print Options (only when pageSetup exists) ──
-  if (sheet.pageSetup) {
-    parts.push(xmlSelfClose("printOptions", { headings: 0, gridLines: 0 }))
+  // ── Print Options ──
+  // Per ECMA-376 these four live on <printOptions>, not <pageSetup>, and
+  // every attribute defaults to false — so the element is emitted only
+  // when something is actually non-default. It used to be written
+  // unconditionally with hardcoded zeros whenever any pageSetup existed,
+  // which meant setting a page margin silently turned off printed
+  // gridlines and headings. See #360.
+  const printOptionsXml = serializePrintOptions(sheet.pageSetup)
+  if (printOptionsXml) {
+    parts.push(printOptionsXml)
   }
 
   // ── Page Margins ──
@@ -571,6 +679,12 @@ export function writeWorksheetXml(
   const hasImages = sheet.images && sheet.images.length > 0
   const hasTextBoxes = sheet.textBoxes && sheet.textBoxes.length > 0
   const hasCharts = sheet.charts && sheet.charts.length > 0
+  // Where a `<drawing>` element belongs in CT_Worksheet's element order.
+  // Recorded even when this writer emits none, because the roundtrip has
+  // to put one here for a drawing it is *preserving* rather than
+  // generating — and it used to find the spot by searching the finished
+  // string for thirteen candidate successor tags. See #474.
+  const drawingSlot = parts.length
   if (hasImages || hasTextBoxes || hasCharts) {
     // Drawing rId comes after all hyperlink rIds
     drawingRId = `rId${nextRId}`
@@ -641,13 +755,11 @@ export function writeWorksheetXml(
     }
   }
 
-  const worksheetAttrs: Record<string, string> = { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }
-  if (sheet.sheetFormat?.dyDescent !== undefined) {
-    worksheetAttrs["xmlns:x14ac"] = NS_X14AC
-  }
+  const xml = xmlDocument("worksheet", { xmlns: NS_SPREADSHEET, "xmlns:r": NS_R }, parts)
 
   return {
-    xml: xmlDocument("worksheet", worksheetAttrs, parts),
+    xml,
+    drawingInsertOffset: offsetOfPart(xml, parts, drawingSlot),
     hyperlinkRelationships,
     drawingRId,
     legacyDrawingRId,
@@ -656,10 +768,22 @@ export function writeWorksheetXml(
     tables: tableEntries,
     pictureRId,
     pivotTables: pivotEntries,
+    hasDynamicArray,
   }
 }
 
 // ── Row Resolution ─────────────────────────────────────────────────
+
+/**
+ * The default cell style a column contributes to every cell beneath it.
+ * `numFmt` is folded into the style object, but an explicit
+ * `style.numFmt` wins — it is the more specific of the two spellings.
+ */
+function columnCellStyle(col: ColumnDef | undefined): CellStyle | undefined {
+  if (!col) return undefined
+  if (col.numFmt && !col.style?.numFmt) return { ...col.style, numFmt: col.numFmt }
+  return col.style
+}
 
 function resolveRows(sheet: WriteSheet): Array<Array<ResolvedCell | null>> {
   const resolved: Array<Array<ResolvedCell | null>> = []
@@ -687,13 +811,9 @@ function resolveRows(sheet: WriteSheet): Array<Array<ResolvedCell | null>> {
       for (let c = 0; c < keys.length; c++) {
         const key = keys[c]
         const raw = key !== undefined ? (obj[key] ?? null) : null
-        const col = sheet.columns[c]
         const cell: ResolvedCell = {
           value: isHyperlinkValue(raw) ? raw.text : raw,
-          style: col.style,
-          ...(col.numFmt && !col.style?.numFmt
-            ? { style: { ...col.style, numFmt: col.numFmt } }
-            : {}),
+          style: columnCellStyle(sheet.columns[c]),
         }
         if (isHyperlinkValue(raw)) cell.hyperlink = toHyperlink(raw)
         row.push(cell)
@@ -701,12 +821,22 @@ function resolveRows(sheet: WriteSheet): Array<Array<ResolvedCell | null>> {
       resolved.push(row)
     }
   } else if (sheet.rows) {
-    // Array-based rows
+    // Array-based rows. `columns` means the same thing here as on the
+    // `data[]` path: its style and numFmt are the column's default
+    // formatting. They used to apply only to `data[]`, so the same
+    // `columns` array meant two different things depending on which row
+    // source you picked (#407). Unlike `data[]` there is no header row to
+    // exempt — hucre cannot tell which of the caller's rows is one.
     for (const row of sheet.rows) {
       const resolvedRow: Array<ResolvedCell | null> = []
       for (let c = 0; c < row.length; c++) {
-        const value = row[c]
-        resolvedRow.push({ value })
+        // `writeXlsx` lifts an inline cell object into `cells` before this
+        // runs, so the entry is a value by then. Reading it through
+        // `toCellValue` keeps `resolveRows` correct for a caller that
+        // reached it another way, rather than emitting `[object Object]`.
+        const value = toCellValue(row[c]!)
+        const style = sheet.columns ? columnCellStyle(sheet.columns[c]) : undefined
+        resolvedRow.push(style ? { value, style } : { value })
       }
       resolved.push(resolvedRow)
     }
@@ -750,7 +880,47 @@ function resolveRows(sheet: WriteSheet): Array<Array<ResolvedCell | null>> {
 
 // ── Cell Serialization ─────────────────────────────────────────────
 
-function serializeCell(
+/**
+ * Serialize one `<c>`.
+ *
+ * The single implementation. There used to be a second one inside
+ * `stream-writer`'s `RowSerializer`, and the two had drifted in both
+ * directions: the streaming copy could not write an error value, rich
+ * text, a checkbox xf, a shared or array formula, or the dynamic-array
+ * `cm`, while this one was the copy that forgot `xml:space="preserve"`.
+ * Every feature added to one had to be re-derived in the other, and #436
+ * had to do exactly that for formula-result typing and the non-finite
+ * guard. See #439 §B.
+ */
+/**
+ * The cell shapes that make up essentially all of a data sheet, emitted
+ * straight into a string.
+ *
+ * `xmlElement` is the right tool for the document's structure — a hundred
+ * elements built once each — and the wrong one for the two million built
+ * here. Per cell it allocated an attrs object literal, a children array,
+ * a joined string, and then the element; profiling `writeXlsx` at
+ * 100,000 x 12 put `xmlElement` at 16.6% of on-CPU time and the garbage
+ * collector at 20.3%. See #472.
+ *
+ * The attribute order — `r`, then `t`, then `s` — is the order the object
+ * literals produced, and the output is byte-identical. The formula and
+ * rich-text paths still go through `xmlElement`: they are a small
+ * fraction of any real sheet and they are the shapes worth keeping
+ * readable.
+ */
+function simpleCell(ref: string, styleIdx: number, type: string, content: string): string {
+  if (styleIdx === 0) {
+    return type === ""
+      ? `<c r="${ref}"><v>${content}</v></c>`
+      : `<c r="${ref}" t="${type}"><v>${content}</v></c>`
+  }
+  return type === ""
+    ? `<c r="${ref}" s="${styleIdx}"><v>${content}</v></c>`
+    : `<c r="${ref}" t="${type}" s="${styleIdx}"><v>${content}</v></c>`
+}
+
+export function serializeCell(
   row: number,
   col: number,
   resolved: ResolvedCell,
@@ -775,11 +945,22 @@ function serializeCell(
   let styleIdx = 0
   let effectiveStyle = style
 
-  // If value is Date and no numFmt specified, add default date format
+  // If value is Date and no numFmt specified, add default date format.
+  // Both branches reuse one object per distinct input so the xf identity
+  // cache can hit; building a fresh one per cell is what made this the
+  // hottest thing in the writer. See #472.
   if (value instanceof Date && (!effectiveStyle || !effectiveStyle.numFmt)) {
-    effectiveStyle = {
-      ...effectiveStyle,
-      numFmt: DEFAULT_DATE_FORMAT,
+    if (!effectiveStyle) {
+      effectiveStyle = BARE_DATE_STYLE
+    } else {
+      const cached = DATE_STYLE_CACHE.get(effectiveStyle)
+      if (cached) {
+        effectiveStyle = cached
+      } else {
+        const derived: CellStyle = { ...effectiveStyle, numFmt: DEFAULT_DATE_FORMAT }
+        DATE_STYLE_CACHE.set(effectiveStyle, derived)
+        effectiveStyle = derived
+      }
     }
   }
 
@@ -806,6 +987,12 @@ function serializeCell(
   if (formula !== undefined && formula !== null) {
     const cellAttrs: Record<string, string | number> = { r: ref }
     if (styleIdx !== 0) cellAttrs["s"] = styleIdx
+    // `cm` is a CT_Cell attribute (§18.3.1.4) — hucre used to write it on
+    // `<f>`, where the schema has no such attribute, so Excel ignored it
+    // and the flag survived only because hucre also read it back from
+    // there (#423). The index is one-based into xl/metadata.xml's
+    // cellMetadata collection; see ./metadata.ts for the part itself.
+    if (formulaDynamic) cellAttrs["cm"] = DYNAMIC_ARRAY_CM
 
     // Build <f> element with appropriate attributes
     let fElement: string
@@ -822,16 +1009,19 @@ function serializeCell(
     } else if (formulaType === "array") {
       const fAttrs: Record<string, string | number> = { t: "array" }
       if (formulaRef) fAttrs["ref"] = formulaRef
-      if (formulaDynamic) fAttrs["cm"] = 1
       fElement = xmlElement("f", fAttrs, xmlEscape(formula))
     } else {
-      // Normal formula
+      // Normal formula. `formulaDynamic` used to be honoured only inside
+      // the `t="array"` branch above, so a spilling function written
+      // without `formulaType: "array"` silently lost the flag (#407); it
+      // now lands on `<c>` for both shapes.
       fElement = xmlElement("f", undefined, xmlEscape(formula))
     }
 
     const children: string[] = [fElement]
 
-    // Cached formula result
+    // Cached formula result. A bare <v> reads back as a number, so text
+    // and booleans need their `t`.
     if (formulaResult !== undefined && formulaResult !== null) {
       if (typeof formulaResult === "string") {
         cellAttrs["t"] = "str"
@@ -840,7 +1030,16 @@ function serializeCell(
         cellAttrs["t"] = "b"
         children.push(xmlElement("v", undefined, formulaResult ? "1" : "0"))
       } else if (typeof formulaResult === "number") {
-        children.push(xmlElement("v", undefined, String(formulaResult)))
+        // Same guard as the plain numeric branch below: NaN and the
+        // infinities have no OOXML representation, so the cache is
+        // dropped rather than written as something no reader can parse.
+        // #436 added this to the streaming copy of the serializer; this
+        // one never had it, and merging the two is what surfaced that.
+        if (Number.isFinite(formulaResult)) {
+          children.push(xmlElement("v", undefined, String(formulaResult)))
+        }
+      } else if (formulaResult instanceof Date) {
+        children.push(xmlElement("v", undefined, String(dateToSerial(formulaResult, is1904))))
       }
     }
 
@@ -857,25 +1056,22 @@ function serializeCell(
 
   // Error value (e.g. #VALUE!, #REF!, #N/A, #NAME?, #NULL!, #DIV/0!, #NUM!)
   if (typeof value === "string" && EXCEL_ERRORS.has(value)) {
-    const attrs: Record<string, string | number> = { r: ref, t: "e" }
-    if (styleIdx !== 0) attrs["s"] = styleIdx
-    return xmlElement("c", attrs, [xmlElement("v", undefined, value)])
+    return simpleCell(ref, styleIdx, "e", value)
   }
 
   // String value
   if (typeof value === "string") {
     if (inlineStrings) {
       // Inline string: <c t="inlineStr"><is><t>value</t></is></c>
-      const attrs: Record<string, string | number> = { r: ref, t: "inlineStr" }
-      if (styleIdx !== 0) attrs["s"] = styleIdx
-      return xmlElement("c", attrs, [
-        xmlElement("is", undefined, [xmlElement("t", undefined, xmlEscape(value))]),
-      ])
+      // `writeXlsxStream` defaults to this path, so it is as hot as the
+      // shared-string one and gets the same treatment. `xmlTextElement`
+      // still decides `xml:space`; only the wrappers are inlined.
+      const inner = `<is>${xmlTextElement(value)}</is>`
+      return styleIdx === 0
+        ? `<c r="${ref}" t="inlineStr">${inner}</c>`
+        : `<c r="${ref}" t="inlineStr" s="${styleIdx}">${inner}</c>`
     }
-    const ssIdx = sharedStrings.add(value)
-    const attrs: Record<string, string | number> = { r: ref, t: "s" }
-    if (styleIdx !== 0) attrs["s"] = styleIdx
-    return xmlElement("c", attrs, [xmlElement("v", undefined, String(ssIdx))])
+    return simpleCell(ref, styleIdx, "s", String(sharedStrings.add(value)))
   }
 
   // Number value
@@ -887,24 +1083,17 @@ function serializeCell(
       }
       return null
     }
-    const attrs: Record<string, string | number> = { r: ref }
-    if (styleIdx !== 0) attrs["s"] = styleIdx
-    return xmlElement("c", attrs, [xmlElement("v", undefined, String(value))])
+    return simpleCell(ref, styleIdx, "", String(value))
   }
 
   // Boolean value
   if (typeof value === "boolean") {
-    const attrs: Record<string, string | number> = { r: ref, t: "b" }
-    if (styleIdx !== 0) attrs["s"] = styleIdx
-    return xmlElement("c", attrs, [xmlElement("v", undefined, value ? "1" : "0")])
+    return simpleCell(ref, styleIdx, "b", value ? "1" : "0")
   }
 
   // Date value
   if (value instanceof Date) {
-    const serial = dateToSerial(value, is1904)
-    const attrs: Record<string, string | number> = { r: ref }
-    if (styleIdx !== 0) attrs["s"] = styleIdx
-    return xmlElement("c", attrs, [xmlElement("v", undefined, String(serial))])
+    return simpleCell(ref, styleIdx, "", String(dateToSerial(value, is1904)))
   }
 
   return null
@@ -1046,13 +1235,18 @@ function serializeDataValidations(validations: DataValidation[]): string {
  * Collect hyperlinks from the sheet's cell overrides and generate
  * the `<hyperlinks>` XML section plus external relationship entries.
  */
-export function collectHyperlinks(sheet: WriteSheet): {
+export function collectHyperlinks(
+  sheet: WriteSheet,
+  preResolved?: Array<Array<ResolvedCell | null>>,
+): {
   xml: string
   relationships: HyperlinkRelationship[]
 } {
   // Resolve the full grid so links from both inline `data` values and the
   // `cells` override map are collected from a single source, in row-major order.
-  const resolved = resolveRows(sheet)
+  // `writeWorksheetXml` has already paid for that grid, so it hands it over
+  // rather than making us rebuild every cell of the sheet a second time.
+  const resolved = preResolved ?? resolveRows(sheet)
 
   const hyperlinkElements: string[] = []
   const relationships: HyperlinkRelationship[] = []
@@ -1100,22 +1294,70 @@ export function collectHyperlinks(sheet: WriteSheet): {
 
 // ── Paper Size Map ──────────────────────────────────────────────────
 
-const PAPER_SIZE_MAP: Record<PaperSize, number> = {
+/**
+ * Named paper sizes → the OOXML `paperSize` code (ECMA-376 §18.3.1.63).
+ *
+ * A code with no name here is still writable and readable — `PaperSize`
+ * admits a raw number — so the nine names this used to hold are no longer
+ * the whole of what a sheet can say. See #439 §Q.
+ */
+export const PAPER_SIZE_MAP: Record<PaperSizeName, number> = {
   letter: 1,
+  letterSmall: 2,
+  tabloid: 3,
+  ledger: 4,
   legal: 5,
+  statement: 6,
+  executive: 7,
   a3: 8,
   a4: 9,
+  a4Small: 10,
   a5: 11,
   b4: 12,
   b5: 13,
-  executive: 7,
-  tabloid: 3,
+  folio: 14,
+  quarto: 15,
+  note: 18,
+  envelope9: 19,
+  envelope10: 20,
+  envelope11: 21,
+  envelope12: 22,
+  envelope14: 23,
+  cSheet: 24,
+  dSheet: 25,
+  eSheet: 26,
+  envelopeDL: 27,
+  envelopeC5: 28,
+  envelopeC3: 29,
+  envelopeC4: 30,
+  envelopeC6: 31,
+  envelopeC65: 32,
+  envelopeB4: 33,
+  envelopeB5: 34,
+  envelopeB6: 35,
+  envelopeItaly: 36,
+  envelopeMonarch: 37,
+  envelopePersonal: 38,
+  fanfoldUS: 39,
+  fanfoldGermanStd: 40,
+  fanfoldGermanLegal: 41,
+  a6: 70,
+  japanesePostcard: 43,
+  japaneseDoublePostcard: 69,
 }
 
-/** Reverse map: XLSX paper size number → PaperSize string */
-export const PAPER_SIZE_REVERSE: Record<number, PaperSize> = {}
+/** Reverse map: OOXML paper size code → the name, when there is one. */
+export const PAPER_SIZE_REVERSE: Record<number, PaperSizeName> = {}
 for (const [name, num] of Object.entries(PAPER_SIZE_MAP)) {
-  PAPER_SIZE_REVERSE[num] = name as PaperSize
+  PAPER_SIZE_REVERSE[num] = name as PaperSizeName
+}
+
+/** Resolve a `PaperSize` to the code that goes in the file. */
+export function paperSizeCode(size: PaperSize): number | undefined {
+  if (typeof size === "number") {
+    return Number.isInteger(size) && size > 0 ? size : undefined
+  }
+  return PAPER_SIZE_MAP[size as PaperSizeName]
 }
 
 // ── Page Margins Serialization ──────────────────────────────────────
@@ -1143,13 +1385,38 @@ function serializePageMargins(margins?: PageMargins): string {
   })
 }
 
+// ── Print Options Serialization ──────────────────────────────────────
+
+/**
+ * Serialize `<printOptions>`, or return `""` when everything is at its
+ * OOXML default.
+ *
+ * `gridLines` and `headings` control what appears on *paper*, and both
+ * default to false. `horizontalCentered` / `verticalCentered` belong here
+ * too — hucre used to read and write them on `<pageSetup>`, which
+ * round-tripped through hucre only because it was consistently wrong in
+ * both directions; Excel ignored them entirely.
+ */
+function serializePrintOptions(ps: PageSetup | undefined): string {
+  if (!ps) return ""
+
+  const attrs: Record<string, string | number> = {}
+  if (ps.showGridLines) attrs["gridLines"] = 1
+  if (ps.showRowColHeaders) attrs["headings"] = 1
+  if (ps.horizontalCentered) attrs["horizontalCentered"] = 1
+  if (ps.verticalCentered) attrs["verticalCentered"] = 1
+
+  if (Object.keys(attrs).length === 0) return ""
+  return xmlSelfClose("printOptions", attrs)
+}
+
 // ── Page Setup Serialization ─────────────────────────────────────────
 
 function serializePageSetup(ps: PageSetup): string {
   const attrs: Record<string, string | number> = {}
 
-  if (ps.paperSize) {
-    const num = PAPER_SIZE_MAP[ps.paperSize]
+  if (ps.paperSize !== undefined) {
+    const num = paperSizeCode(ps.paperSize)
     if (num !== undefined) {
       attrs["paperSize"] = num
     }
@@ -1172,13 +1439,35 @@ function serializePageSetup(ps: PageSetup): string {
     }
   }
 
-  if (ps.horizontalCentered) {
-    attrs["horizontalCentered"] = 1
-  }
+  // A custom page size, for the sizes that have no code. Excel reads
+  // these in preference to `paperSize` when both are present, which is
+  // why they are emitted alongside rather than instead. See #470.
+  if (ps.paperWidth !== undefined) attrs["paperWidth"] = ps.paperWidth
+  if (ps.paperHeight !== undefined) attrs["paperHeight"] = ps.paperHeight
 
-  if (ps.verticalCentered) {
-    attrs["verticalCentered"] = 1
+  // `firstPageNumber` on its own does nothing in Excel — the flag is what
+  // turns it on. Writing the number without the flag would be a field
+  // that looks set and prints 1, so the flag is implied by the number
+  // unless the caller says otherwise.
+  if (ps.firstPageNumber !== undefined) attrs["firstPageNumber"] = ps.firstPageNumber
+  const useFirst = ps.useFirstPageNumber ?? (ps.firstPageNumber !== undefined ? true : undefined)
+  if (useFirst !== undefined) attrs["useFirstPageNumber"] = useFirst ? 1 : 0
+
+  // Everything below is written only when it differs from the CT_PageSetup
+  // default, so a sheet that sets none of them emits no <pageSetup> at all.
+  if (ps.pageOrder !== undefined && ps.pageOrder !== "downThenOver") {
+    attrs["pageOrder"] = ps.pageOrder
   }
+  if (ps.blackAndWhite) attrs["blackAndWhite"] = 1
+  if (ps.draft) attrs["draft"] = 1
+  if (ps.cellComments !== undefined && ps.cellComments !== "none") {
+    attrs["cellComments"] = ps.cellComments
+  }
+  if (ps.errors !== undefined && ps.errors !== "displayed") attrs["errors"] = ps.errors
+  if (ps.copies !== undefined) attrs["copies"] = ps.copies
+  if (ps.horizontalDpi !== undefined) attrs["horizontalDpi"] = ps.horizontalDpi
+  if (ps.verticalDpi !== undefined) attrs["verticalDpi"] = ps.verticalDpi
+  if (ps.usePrinterDefaults === false) attrs["usePrinterDefaults"] = 0
 
   // Only emit if there are attributes beyond default
   if (Object.keys(attrs).length === 0) {
@@ -1267,20 +1556,8 @@ function serializeRichTextRuns(runs: RichTextRun[]): string[] {
       }
     }
 
-    // Run text (<t>)
-    // Use xml:space="preserve" to preserve whitespace
-    const text = xmlEscape(run.text)
-    const needsPreserve =
-      run.text.length > 0 &&
-      (run.text[0] === " " ||
-        run.text[run.text.length - 1] === " " ||
-        run.text.includes("\n") ||
-        run.text.includes("\t"))
-    if (needsPreserve) {
-      runChildren.push(`<t xml:space="preserve">${text}</t>`)
-    } else {
-      runChildren.push(xmlElement("t", undefined, text))
-    }
+    // Run text (<t>), with xml:space="preserve" when the run needs it.
+    runChildren.push(xmlTextElement(run.text))
 
     elements.push(xmlElement("r", undefined, runChildren))
   }
@@ -1523,4 +1800,23 @@ function serializeSparklines(sparklines: Sparkline[]): string {
   )
 
   return xmlElement("extLst", undefined, [extEl])
+}
+
+/**
+ * Character offset in a rendered document at which `parts[index]` starts.
+ *
+ * `xmlDocument` prepends a declaration and the root open tag, then joins
+ * the parts in order — so the offset is that prefix plus the lengths of
+ * everything before `index`. Derived from the rendered string rather than
+ * assumed, so a change to how the prologue is written cannot silently
+ * move it.
+ */
+function offsetOfPart(xml: string, parts: string[], index: number): number {
+  const body = parts.join("")
+  const bodyStart = body.length === 0 ? xml.lastIndexOf("</worksheet>") : xml.indexOf(body)
+  if (bodyStart < 0) return xml.lastIndexOf("</worksheet>")
+
+  let offset = bodyStart
+  for (let i = 0; i < index; i++) offset += parts[i]!.length
+  return offset
 }

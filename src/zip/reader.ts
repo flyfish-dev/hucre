@@ -4,7 +4,9 @@
 
 import { ZipError } from "../errors"
 import { MAX_DECOMPRESSED_BYTES } from "../limits"
+import { byteLimitStream, chunkedStream } from "./byte-limit"
 import { crc32, inflate } from "./deflate"
+import { canInflateRaw } from "./capability"
 
 // ── ZIP Signatures ──────────────────────────────────────────────────
 
@@ -12,9 +14,23 @@ const SIG_LOCAL_FILE = 0x04034b50
 const SIG_CENTRAL_DIR = 0x02014b50
 const SIG_END_OF_CENTRAL_DIR = 0x06054b50
 const SIG_DATA_DESCRIPTOR = 0x08074b50
+const SIG_ZIP64_EOCD = 0x06064b50
+const SIG_ZIP64_EOCD_LOCATOR = 0x07064b50
 
 /** 0xFFFFFFFF marker that signals a 32-bit ZIP field overflowed into ZIP64. */
 const ZIP64_SENTINEL = 0xffffffff
+/** 0xFFFF marker for the 16-bit entry-count fields. */
+const ZIP64_SENTINEL_16 = 0xffff
+/**
+ * The most DEFLATE can expand a byte by — 1032:1, the format's ceiling
+ * for a maximum-length match emitted from a minimum-length code. Used to
+ * tell a declared uncompressed size that the compressed body could have
+ * produced from one it could not.
+ */
+const MAX_DEFLATE_RATIO = 1032
+
+/** Header id of the ZIP64 extended information extra field. */
+const ZIP64_EXTRA_ID = 0x0001
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -29,43 +45,25 @@ interface CentralDirEntry {
   hasDataDescriptor: boolean
 }
 
-interface LocalEntryData {
-  compressedData: Uint8Array
-  uncompressedSize: number
-  expectedCrc: number
-}
-
 // ── Decompression ───────────────────────────────────────────────────
-
-let hasDecompressionStream: boolean | undefined
-
-function checkDecompressionStream(): boolean {
-  if (hasDecompressionStream === undefined) {
-    try {
-      hasDecompressionStream =
-        typeof DecompressionStream !== "undefined" &&
-        typeof ReadableStream !== "undefined" &&
-        typeof Response !== "undefined"
-    } catch {
-      hasDecompressionStream = false
-    }
-  }
-  return hasDecompressionStream
-}
 
 async function decompressDeflateRaw(
   data: Uint8Array,
   maxBytes = MAX_DECOMPRESSED_BYTES,
 ): Promise<Uint8Array> {
-  if (checkDecompressionStream()) {
+  if (canInflateRaw()) {
     try {
       const ds = new DecompressionStream("deflate-raw")
       const writer = ds.writable.getWriter()
       const reader = ds.readable.getReader()
 
-      // Write data and close
-      writer.write(data as unknown as BufferSource)
-      writer.close()
+      // Write data and close. Both promises are deliberately not awaited
+      // (awaiting the write before reading would deadlock on backpressure),
+      // but they must still be handled: when the size cap below cancels the
+      // reader, they reject with AbortError, and an unhandled rejection
+      // takes the whole process down instead of surfacing the ZipError.
+      void writer.write(data as unknown as BufferSource).catch(() => {})
+      void writer.close().catch(() => {})
 
       // Read all chunks
       const chunks: Uint8Array[] = []
@@ -115,7 +113,19 @@ export class ZipReader {
   private centralDir: CentralDirEntry[] = []
   private entryMap: Map<string, CentralDirEntry> = new Map()
 
-  constructor(private data: Uint8Array) {
+  /**
+   * Absolute ceiling on what any one entry may decompress to — the
+   * zip-bomb bound. Defaults to {@link MAX_DECOMPRESSED_BYTES}; readers
+   * pass `ReadOptions.maxDecompressedBytes` through when the caller has
+   * said the input is trusted. See #471.
+   */
+  private maxDecompressedBytes: number
+
+  constructor(
+    private data: Uint8Array,
+    maxDecompressedBytes: number = MAX_DECOMPRESSED_BYTES,
+  ) {
+    this.maxDecompressedBytes = maxDecompressedBytes
     if (data.length < 22) {
       throw new ZipError("Data too small to be a valid ZIP archive")
     }
@@ -133,6 +143,44 @@ export class ZipReader {
     return this.entryMap.has(path)
   }
 
+  /**
+   * What the central directory says an entry expands to, or `undefined`
+   * when it does not say.
+   *
+   * Lets a reader choose how to parse a part *before* paying to
+   * decompress it — a worksheet past the string ceiling has to be parsed
+   * as a stream, and finding that out by buffering it first costs the
+   * decompression twice and the peak memory of a buffer that gets thrown
+   * away. See #503.
+   *
+   * Zero means "not declared": it is what a producer writing a data
+   * descriptor leaves behind, and it is not a small entry, so it may not
+   * be reported as one — the caller is told nothing and falls back to
+   * finding out the slow way. A ZIP64 size needs no handling here;
+   * `readCentralDir` has already resolved the sentinel from the extra
+   * field, or thrown.
+   *
+   * A size the compressed body could not possibly produce is also not
+   * declared. Nothing verifies this field, and the answer decides whether
+   * a part is read whole — CRC-32 checked — or as a stream, which has no
+   * whole entry to check. Without the plausibility test a 40 KB worksheet
+   * whose central directory claims 600 MB would take the streaming route
+   * and skip the checksum, so a corrupt entry could buy its way out of
+   * verification by lying about its size. DEFLATE cannot exceed 1032:1,
+   * and a stored entry expands not at all, so a claim past that is the
+   * archive contradicting itself and is not trusted.
+   */
+  declaredSize(path: string): number | undefined {
+    const entry = this.entryMap.get(path)
+    if (!entry?.uncompressedSize) return undefined
+    const most =
+      entry.compressionMethod === 0
+        ? entry.compressedSize
+        : entry.compressedSize * MAX_DEFLATE_RATIO
+    if (entry.compressedSize > 0 && entry.uncompressedSize > most) return undefined
+    return entry.uncompressedSize
+  }
+
   /** Extract a single file by path */
   async extract(path: string): Promise<Uint8Array> {
     const entry = this.entryMap.get(path)
@@ -140,15 +188,6 @@ export class ZipReader {
       throw new ZipError(`Entry not found: ${path}`)
     }
     return this.extractEntry(entry)
-  }
-
-  /** Extract a single file synchronously using the pure TypeScript inflater. */
-  extractSync(path: string): Uint8Array {
-    const entry = this.entryMap.get(path)
-    if (!entry) {
-      throw new ZipError(`Entry not found: ${path}`)
-    }
-    return this.extractEntrySync(entry)
   }
 
   /** Extract a single file as a ReadableStream of decompressed bytes */
@@ -191,25 +230,71 @@ export class ZipReader {
       throw new ZipError("End of Central Directory not found — not a valid ZIP file")
     }
 
-    const centralDirSize = this.view.getUint32(eocdOffset + 12, true)
-    const centralDirOffset = this.view.getUint32(eocdOffset + 16, true)
-    const entryCount = this.view.getUint16(eocdOffset + 10, true)
+    let centralDirSize = this.view.getUint32(eocdOffset + 12, true)
+    let centralDirOffset = this.view.getUint32(eocdOffset + 16, true)
+    let entryCount = this.view.getUint16(eocdOffset + 10, true)
 
     // ZIP64: when the entry count or central-directory size/offset overflows
     // the 16-/32-bit EOCD fields they hold a 0xFFFF / 0xFFFFFFFF sentinel and
-    // the real values live in a ZIP64 EOCD record we don't parse. Fail loudly
-    // instead of silently reading a truncated entry list or a garbage offset.
+    // the real values live in a ZIP64 EOCD record. Producers also emit these
+    // records defensively on small archives, so a sentinel is not by itself
+    // evidence that the archive is huge.
     if (
-      entryCount === 0xffff ||
+      entryCount === ZIP64_SENTINEL_16 ||
       centralDirSize === ZIP64_SENTINEL ||
       centralDirOffset === ZIP64_SENTINEL
     ) {
-      throw new ZipError(
-        "ZIP64 archives are not supported (entry count or size exceeds the classic ZIP limits)",
-      )
+      const zip64 = this.readZip64EndOfCentralDir(eocdOffset)
+      entryCount = zip64.entryCount
+      centralDirSize = zip64.centralDirSize
+      centralDirOffset = zip64.centralDirOffset
     }
 
     this.readCentralDirectory(centralDirOffset, centralDirSize, entryCount)
+  }
+
+  /**
+   * Resolve the real directory bounds from the ZIP64 EOCD record.
+   *
+   * The 20-byte ZIP64 locator sits immediately before the classic EOCD and
+   * points at the ZIP64 EOCD record, which repeats the same fields at 64-bit
+   * width.
+   */
+  private readZip64EndOfCentralDir(eocdOffset: number): {
+    entryCount: number
+    centralDirSize: number
+    centralDirOffset: number
+  } {
+    const locatorOffset = eocdOffset - 20
+    if (locatorOffset < 0 || this.view.getUint32(locatorOffset, true) !== SIG_ZIP64_EOCD_LOCATOR) {
+      throw new ZipError("ZIP64 End of Central Directory locator not found")
+    }
+
+    const recordOffset = this.readUint64(locatorOffset + 8, "ZIP64 EOCD offset")
+    if (recordOffset + 56 > this.data.length) {
+      throw new ZipError("ZIP64 End of Central Directory record extends beyond file")
+    }
+    if (this.view.getUint32(recordOffset, true) !== SIG_ZIP64_EOCD) {
+      throw new ZipError("Invalid ZIP64 End of Central Directory signature")
+    }
+
+    return {
+      entryCount: this.readUint64(recordOffset + 32, "ZIP64 entry count"),
+      centralDirSize: this.readUint64(recordOffset + 40, "ZIP64 central directory size"),
+      centralDirOffset: this.readUint64(recordOffset + 48, "ZIP64 central directory offset"),
+    }
+  }
+
+  /** Read a 64-bit little-endian field, refusing values JS can't index with. */
+  private readUint64(offset: number, what: string): number {
+    if (offset + 8 > this.data.length) {
+      throw new ZipError(`${what} extends beyond file`)
+    }
+    const value = this.view.getBigUint64(offset, true)
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new ZipError(`${what} (${value}) exceeds the addressable range`)
+    }
+    return Number(value)
   }
 
   private readCentralDirectory(offset: number, _size: number, expectedCount: number): void {
@@ -230,15 +315,35 @@ export class ZipReader {
       const generalFlag = this.view.getUint16(pos + 8, true)
       const compressionMethod = this.view.getUint16(pos + 10, true)
       const entryCrc32 = this.view.getUint32(pos + 16, true)
-      const compressedSize = this.view.getUint32(pos + 20, true)
-      const uncompressedSize = this.view.getUint32(pos + 24, true)
+      let compressedSize = this.view.getUint32(pos + 20, true)
+      let uncompressedSize = this.view.getUint32(pos + 24, true)
       const fileNameLength = this.view.getUint16(pos + 28, true)
       const extraFieldLength = this.view.getUint16(pos + 30, true)
       const commentLength = this.view.getUint16(pos + 32, true)
-      const localHeaderOffset = this.view.getUint32(pos + 42, true)
+      let localHeaderOffset = this.view.getUint32(pos + 42, true)
 
       const fileNameBytes = this.data.subarray(pos + 46, pos + 46 + fileNameLength)
       const fileName = new TextDecoder().decode(fileNameBytes)
+
+      // Any field left at the sentinel is carried at 64-bit width in the
+      // ZIP64 extra field instead.
+      if (
+        compressedSize === ZIP64_SENTINEL ||
+        uncompressedSize === ZIP64_SENTINEL ||
+        localHeaderOffset === ZIP64_SENTINEL
+      ) {
+        const zip64 = this.readZip64Extra(
+          pos + 46 + fileNameLength,
+          extraFieldLength,
+          uncompressedSize === ZIP64_SENTINEL,
+          compressedSize === ZIP64_SENTINEL,
+          localHeaderOffset === ZIP64_SENTINEL,
+          fileName,
+        )
+        if (zip64.uncompressedSize !== undefined) uncompressedSize = zip64.uncompressedSize
+        if (zip64.compressedSize !== undefined) compressedSize = zip64.compressedSize
+        if (zip64.localHeaderOffset !== undefined) localHeaderOffset = zip64.localHeaderOffset
+      }
 
       const hasDataDescriptor = (generalFlag & 0x08) !== 0
 
@@ -259,7 +364,62 @@ export class ZipReader {
     }
   }
 
-  private readLocalEntryData(entry: CentralDirEntry): LocalEntryData {
+  /**
+   * Pull the overflowed fields out of a central-directory ZIP64 extra field.
+   *
+   * The record is positional: only the fields whose 32-bit counterpart held
+   * the sentinel are present, always in the order size → compressed size →
+   * local header offset → disk number.
+   */
+  private readZip64Extra(
+    offset: number,
+    length: number,
+    wantUncompressed: boolean,
+    wantCompressed: boolean,
+    wantOffset: boolean,
+    fileName: string,
+  ): { uncompressedSize?: number; compressedSize?: number; localHeaderOffset?: number } {
+    const end = Math.min(offset + length, this.data.length)
+    let pos = offset
+
+    while (pos + 4 <= end) {
+      const headerId = this.view.getUint16(pos, true)
+      const dataSize = this.view.getUint16(pos + 2, true)
+      const dataStart = pos + 4
+
+      if (headerId !== ZIP64_EXTRA_ID) {
+        pos = dataStart + dataSize
+        continue
+      }
+
+      const dataEnd = dataStart + dataSize
+      let cursor = dataStart
+      const result: {
+        uncompressedSize?: number
+        compressedSize?: number
+        localHeaderOffset?: number
+      } = {}
+
+      const take = (what: string): number => {
+        if (cursor + 8 > dataEnd) {
+          throw new ZipError(`Truncated ZIP64 extra field for entry: ${fileName}`)
+        }
+        const value = this.readUint64(cursor, what)
+        cursor += 8
+        return value
+      }
+
+      if (wantUncompressed) result.uncompressedSize = take("ZIP64 uncompressed size")
+      if (wantCompressed) result.compressedSize = take("ZIP64 compressed size")
+      if (wantOffset) result.localHeaderOffset = take("ZIP64 local header offset")
+
+      return result
+    }
+
+    throw new ZipError(`Missing ZIP64 extra field for entry: ${fileName}`)
+  }
+
+  private async extractEntry(entry: CentralDirEntry): Promise<Uint8Array> {
     const pos = entry.localHeaderOffset
 
     if (pos + 30 > this.data.length) {
@@ -285,12 +445,14 @@ export class ZipReader {
       // Try to read from data descriptor after compressed data.
       // This is a tricky case; we rely on central dir being authoritative.
       // If central dir also has zeros, we need to find the data descriptor.
+      // A sentinel here means the real value lives in the local ZIP64 extra
+      // field; taking it literally would read 4 GiB past the entry.
       const localCompressedSize = this.view.getUint32(pos + 18, true)
-      if (localCompressedSize > 0) {
+      if (localCompressedSize > 0 && localCompressedSize !== ZIP64_SENTINEL) {
         compressedSize = localCompressedSize
       }
       const localUncompressedSize = this.view.getUint32(pos + 22, true)
-      if (localUncompressedSize > 0) {
+      if (localUncompressedSize > 0 && localUncompressedSize !== ZIP64_SENTINEL) {
         uncompressedSize = localUncompressedSize
       }
 
@@ -311,12 +473,6 @@ export class ZipReader {
 
     const compressedData = this.data.subarray(dataStart, dataStart + compressedSize)
 
-    return { compressedData, uncompressedSize, expectedCrc }
-  }
-
-  private async extractEntry(entry: CentralDirEntry): Promise<Uint8Array> {
-    const { compressedData, uncompressedSize, expectedCrc } = this.readLocalEntryData(entry)
-
     let result: Uint8Array
 
     if (entry.compressionMethod === 0) {
@@ -324,15 +480,15 @@ export class ZipReader {
       result = compressedData
     } else if (entry.compressionMethod === 8) {
       // DEFLATE
-      if (compressedData.length === 0 && uncompressedSize === 0) {
+      if (compressedSize === 0 && uncompressedSize === 0) {
         result = new Uint8Array(0)
       } else {
         // Bound output by the central-directory uncompressedSize (when
         // declared and trustworthy) as well as the absolute hard cap.
         const declaredCap =
           uncompressedSize > 0
-            ? Math.min(uncompressedSize, MAX_DECOMPRESSED_BYTES)
-            : MAX_DECOMPRESSED_BYTES
+            ? Math.min(uncompressedSize, this.maxDecompressedBytes)
+            : this.maxDecompressedBytes
         result = await decompressDeflateRaw(compressedData, declaredCap)
       }
     } else {
@@ -341,55 +497,17 @@ export class ZipReader {
       )
     }
 
-    this.verifyEntry(entry.fileName, result, expectedCrc, uncompressedSize)
-
-    return result
-  }
-
-  private extractEntrySync(entry: CentralDirEntry): Uint8Array {
-    const { compressedData, uncompressedSize, expectedCrc } = this.readLocalEntryData(entry)
-
-    let result: Uint8Array
-
-    if (entry.compressionMethod === 0) {
-      result = compressedData
-    } else if (entry.compressionMethod === 8) {
-      result =
-        compressedData.length === 0 && uncompressedSize === 0
-          ? new Uint8Array(0)
-          : inflate(compressedData)
-    } else {
-      throw new ZipError(
-        `Unsupported compression method ${entry.compressionMethod} for entry: ${entry.fileName}`,
-      )
-    }
-
-    this.verifyEntry(entry.fileName, result, expectedCrc, uncompressedSize)
-
-    return result
-  }
-
-  private verifyEntry(
-    fileName: string,
-    result: Uint8Array,
-    expectedCrc: number,
-    uncompressedSize: number,
-  ): void {
-    if (uncompressedSize !== 0 && result.length !== uncompressedSize) {
-      throw new ZipError(
-        `Uncompressed size mismatch for ${fileName}: expected ${uncompressedSize}, got ${result.length}`,
-      )
-    }
-
     // Verify CRC-32 (skip if CRC is 0 — some generators omit it)
     if (expectedCrc !== 0 && result.length > 0) {
       const actualCrc = crc32(result)
       if (actualCrc !== expectedCrc) {
         throw new ZipError(
-          `CRC-32 mismatch for ${fileName}: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`,
+          `CRC-32 mismatch for ${entry.fileName}: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`,
         )
       }
     }
+
+    return result
   }
 
   private extractEntryStream(entry: CentralDirEntry): ReadableStream<Uint8Array> {
@@ -411,8 +529,13 @@ export class ZipReader {
     let { compressedSize } = entry
 
     if (entry.hasDataDescriptor && compressedSize === 0) {
+      // Same sentinel guard as extractEntry: 0xFFFFFFFF means the real
+      // size lives in the ZIP64 extra field, so taking it literally
+      // reads 4 GiB past the entry. A ZIP64 streaming producer writes
+      // exactly this, and without the check extract() succeeded while
+      // extractStream() threw. See #393.
       const localCompressedSize = this.view.getUint32(pos + 18, true)
-      if (localCompressedSize > 0) {
+      if (localCompressedSize > 0 && localCompressedSize !== ZIP64_SENTINEL) {
         compressedSize = localCompressedSize
       }
       if (compressedSize === 0) {
@@ -430,13 +553,8 @@ export class ZipReader {
     const compressedData = this.data.subarray(dataStart, dataStart + compressedSize)
 
     if (entry.compressionMethod === 0) {
-      // STORE — return raw data as a stream
-      return new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(compressedData)
-          controller.close()
-        },
-      })
+      // STORE — no decompression, but still emitted in pieces
+      return chunkedStream(compressedData)
     }
 
     if (entry.compressionMethod === 8) {
@@ -449,30 +567,31 @@ export class ZipReader {
         })
       }
 
-      if (checkDecompressionStream()) {
+      // Bound the output by the declared uncompressed size (when present)
+      // and the absolute cap — exactly what the buffered path does. Without
+      // it the native DecompressionStream below happily expanded a bomb the
+      // buffered reader rejects.
+      const declaredCap =
+        entry.uncompressedSize > 0
+          ? Math.min(entry.uncompressedSize, this.maxDecompressedBytes)
+          : this.maxDecompressedBytes
+
+      if (canInflateRaw()) {
         const inputStream = new ReadableStream({
           start(controller) {
             controller.enqueue(compressedData)
             controller.close()
           },
         })
-        return inputStream.pipeThrough(
-          new DecompressionStream("deflate-raw"),
-        ) as ReadableStream<Uint8Array>
+        return (
+          inputStream.pipeThrough(
+            new DecompressionStream("deflate-raw"),
+          ) as ReadableStream<Uint8Array>
+        ).pipeThrough(byteLimitStream(declaredCap))
       }
 
       // Fallback: inflate synchronously and emit as stream
-      const declaredCap =
-        entry.uncompressedSize > 0
-          ? Math.min(entry.uncompressedSize, MAX_DECOMPRESSED_BYTES)
-          : MAX_DECOMPRESSED_BYTES
-      const inflated = inflate(compressedData, declaredCap)
-      return new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(inflated)
-          controller.close()
-        },
-      })
+      return chunkedStream(inflate(compressedData, declaredCap))
     }
 
     throw new ZipError(

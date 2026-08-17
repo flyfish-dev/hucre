@@ -1,32 +1,68 @@
 import type { Sheet, CellValue } from "../_types"
 
 export interface MarkdownExportOptions {
-  /** Use first row as header. Default: true */
+  /**
+   * Treat the first row as the table header. Default: true.
+   *
+   * Renamed from `headerRow`, which elsewhere in the library is a 0-based
+   * row *index*. See #365.
+   */
+  hasHeaderRow?: boolean
+  /** @deprecated Renamed to {@link MarkdownExportOptions.hasHeaderRow}. */
   headerRow?: boolean
   /** Alignment per column. Default: left for strings, right for numbers */
   alignment?: Array<"left" | "center" | "right">
   /** Max column width (truncate with ...). Default: 50 */
   maxWidth?: number
+  /**
+   * Escape Markdown's inline syntax inside cells, so a cell reading
+   * `*not emphasis*` renders as those words rather than as emphasis.
+   * Default: true.
+   *
+   * Set false when the cells hold Markdown you want rendered — a column
+   * of `**bold**` labels, say. The table's own structural characters
+   * (pipes, newlines) are escaped either way, because losing those loses
+   * the table. See #474.
+   */
+  escapeInline?: boolean
 }
+
+/**
+ * Characters that change how a table cell renders. `\\` leads, so the
+ * escapes this function adds are not themselves re-escaped.
+ *
+ * `_` is here despite GFM not treating intraword underscores as emphasis:
+ * `_total_` is emphasis and `sub_total` is not, and telling them apart
+ * needs the flanking rules. Escaping both is the honest trade — a cell of
+ * `sub\_total` reads correctly even if it looks noisy in the source, and
+ * `escapeInline: false` is there for anyone who disagrees.
+ */
+const MARKDOWN_INLINE = /[\\`*_[\]<]/g
 
 /**
  * Escape characters that would break a Markdown table cell: pipes (column
  * separators) and newlines (row separators). A literal newline inside a
  * cell is rendered as `<br>` (GFM) so the table structure survives.
+ *
+ * With `escapeInline` (the default) the inline-formatting characters go
+ * too. The `<br>` is inserted after that pass, so it is not escaped by it.
  */
-function escapePipe(str: string): string {
-  return str.replace(/\|/g, "\\|").replace(/\r\n|\r|\n/g, "<br>")
+function escapeCell(str: string, escapeInline: boolean): string {
+  const inline = escapeInline ? str.replace(MARKDOWN_INLINE, "\\$&") : str
+  return inline.replace(/\|/g, "\\|").replace(/\r\n|\r|\n/g, "<br>")
 }
 
 /** Format a cell value as a string for Markdown output */
-function formatCellValue(value: CellValue): string {
+function formatCellValue(value: CellValue, escapeInline: boolean): string {
   if (value === null || value === undefined) return ""
   if (value instanceof Date) {
+    // See #364 — an unparseable Date threw a raw RangeError mid-write.
+    if (Number.isNaN(value.getTime())) return ""
     return value.toISOString().slice(0, 10)
   }
   if (typeof value === "boolean") return String(value)
   if (typeof value === "number") return String(value)
-  return escapePipe(String(value))
+  return escapeCell(String(value), escapeInline)
 }
 
 /** Truncate a string to maxWidth, adding "..." if truncated */
@@ -83,10 +119,14 @@ function padCell(value: string, width: number, align: "left" | "center" | "right
  * Export a sheet as a Markdown table string.
  */
 export function toMarkdown(sheet: Sheet, options?: MarkdownExportOptions): string {
-  const opts: Required<MarkdownExportOptions> = {
-    headerRow: options?.headerRow ?? true,
+  // `headerRow` is omitted: deprecated spelling of `hasHeaderRow`,
+  // folded into it below.
+  const opts: Required<Omit<MarkdownExportOptions, "headerRow">> = {
+    // Accept the deprecated name for one major. See #365.
+    hasHeaderRow: options?.hasHeaderRow ?? options?.headerRow ?? true,
     alignment: options?.alignment ?? [],
     maxWidth: options?.maxWidth ?? 50,
+    escapeInline: options?.escapeInline ?? true,
   }
 
   const rows = sheet.rows
@@ -103,14 +143,14 @@ export function toMarkdown(sheet: Sheet, options?: MarkdownExportOptions): strin
   const formatted: string[][] = rows.map((row) => {
     const result: string[] = []
     for (let c = 0; c < numCols; c++) {
-      const raw = formatCellValue(row[c])
+      const raw = formatCellValue(row[c], opts.escapeInline)
       result.push(truncate(raw, opts.maxWidth))
     }
     return result
   })
 
   // Determine the data start row (skip header if headerRow is true)
-  const dataStartRow = opts.headerRow ? 1 : 0
+  const dataStartRow = opts.hasHeaderRow ? 1 : 0
 
   // Determine alignments
   const alignments: Array<"left" | "center" | "right"> = []
@@ -134,7 +174,7 @@ export function toMarkdown(sheet: Sheet, options?: MarkdownExportOptions): strin
 
   const lines: string[] = []
 
-  if (opts.headerRow) {
+  if (opts.hasHeaderRow) {
     // Header row
     const headerCells = formatted[0].map((val, c) => padCell(val, widths[c], alignments[c]))
     lines.push("|" + headerCells.join("|") + "|")

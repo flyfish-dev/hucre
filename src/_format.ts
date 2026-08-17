@@ -7,6 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────
 
 import { isDateFormat, formatDate, serialToDate, dateToSerial } from "./_date"
+import { InvalidArgumentError } from "./errors"
 
 // ── Locale Definitions ──────────────────────────────────────────────
 
@@ -17,19 +18,127 @@ export interface LocaleFormat {
   thousands: string
   /** Currency symbol */
   currency: string
+  /**
+   * Digits per group, right to left: the first entry is the rightmost
+   * group and the last repeats for everything further left.
+   *
+   * `[3]` for most locales. `[3, 2]` for the Indian system, where
+   * 12,345,678 is written 1,23,45,678 — the separator was already right
+   * there and the positions were not. Read from `Intl`, so any locale
+   * that groups unusually is covered without a table. See #474.
+   */
+  groupSizes: number[]
 }
 
-const LOCALE_MAP: Record<string, LocaleFormat> = {
-  "en-US": { decimal: ".", thousands: ",", currency: "$" },
-  "de-DE": { decimal: ",", thousands: ".", currency: "\u20AC" },
-  "fr-FR": { decimal: ",", thousands: "\u00A0", currency: "\u20AC" },
-  "tr-TR": { decimal: ",", thousands: ".", currency: "\u20BA" },
+/**
+ * Currency symbols hucre has always carried for these four tags.
+ *
+ * The formatter does not read this field and never has — only `decimal`
+ * and `thousands` are used — but `LocaleFormat` is public, so the values
+ * it used to return are kept for the tags that had them.
+ */
+const KNOWN_CURRENCY: Record<string, string> = {
+  "en-US": "$",
+  "de-DE": "\u20AC",
+  "fr-FR": "\u20AC",
+  "tr-TR": "\u20BA",
 }
 
-/** Resolve a locale string to its format definition, or undefined if unsupported. */
+const localeCache = new Map<string, LocaleFormat>()
+
+/**
+ * Resolve a BCP 47 tag to its separators.
+ *
+ * This used to be a four-entry table — `en-US`, `de-DE`, `fr-FR`,
+ * `tr-TR` — and any other tag resolved to `undefined`, which the
+ * formatter treated as "use the defaults". So
+ * `formatValue(1234.5, "#,##0.00", { locale: "es-ES" })` returned
+ * `1,234.50`: an en-US rendering, silently, for a locale the caller had
+ * explicitly asked for. See #439 §R.
+ *
+ * `Intl.NumberFormat` knows every tag, and separators are all the
+ * formatter needs, so the table is gone. A tag `Intl` rejects now throws
+ * rather than being answered wrongly.
+ */
 function resolveLocale(locale?: string): LocaleFormat | undefined {
   if (!locale) return undefined
-  return LOCALE_MAP[locale]
+
+  const cached = localeCache.get(locale)
+  if (cached) return cached
+
+  let parts: Intl.NumberFormatPart[]
+  try {
+    parts = new Intl.NumberFormat(locale).formatToParts(1234567.8)
+  } catch (error) {
+    throw new InvalidArgumentError(
+      `Unusable locale "${locale}". Pass a BCP 47 tag Intl.NumberFormat accepts, ` +
+        "or omit `locale` for the default separators.",
+      { cause: error },
+    )
+  }
+
+  const resolved: LocaleFormat = {
+    decimal: parts.find((p) => p.type === "decimal")?.value ?? ".",
+    thousands: parts.find((p) => p.type === "group")?.value ?? ",",
+    currency: KNOWN_CURRENCY[locale] ?? "",
+    groupSizes: readGroupSizes(locale),
+  }
+  localeCache.set(locale, resolved)
+  return resolved
+}
+
+/**
+ * Ask `Intl` where a locale puts its group separators, by formatting a
+ * number long enough to show three groups and measuring the digit runs.
+ *
+ * Deriving beats tabulating: `en-IN`, `hi-IN`, `bn-IN`, `ne-NP` and the
+ * rest come out right without anyone listing them, and a locale whose
+ * grouping `Intl` later revises follows along.
+ */
+function readGroupSizes(locale: string): number[] {
+  let formatted: string
+  try {
+    formatted = new Intl.NumberFormat(locale, { useGrouping: true }).format(1234567890)
+  } catch {
+    return [3]
+  }
+
+  // Runs of digits, left to right; reverse so index 0 is the rightmost.
+  const runs = (formatted.match(/\d+/g) ?? []).map((r) => r.length).reverse()
+  if (runs.length < 2) return [3]
+
+  // The leftmost run is whatever digits were left over, not a group size.
+  const sizes = runs.slice(0, -1)
+  // Collapse a uniform tail: [3, 3, 3] is [3], [3, 2, 2] is [3, 2].
+  while (sizes.length > 1 && sizes[sizes.length - 1] === sizes[sizes.length - 2]) {
+    sizes.pop()
+  }
+  return sizes.every((n) => n > 0) ? sizes : [3]
+}
+
+/**
+ * Re-group an already-grouped integer string for a locale.
+ *
+ * The formatter groups in threes with `,` before this runs, which is
+ * right for almost every locale and wrong for the Indian system. Anything
+ * that is not plain digits and commas is left alone — a Special format
+ * like `000-00-0000` interleaves literals, and re-grouping those digits
+ * would be nonsense.
+ */
+function regroup(intStr: string, sizes: number[], separator: string): string {
+  if (!/^[\d,]*$/.test(intStr)) return intStr.replace(/,/g, separator)
+
+  const digits = intStr.replace(/,/g, "")
+  if (digits.length === 0) return intStr
+
+  const out: string[] = []
+  let remaining = digits
+  for (let i = 0; remaining.length > 0; i++) {
+    const size = sizes[Math.min(i, sizes.length - 1)]!
+    out.unshift(remaining.slice(-size))
+    remaining = remaining.slice(0, -size)
+  }
+  return out.join(separator)
 }
 
 export interface FormatOptions {
@@ -398,58 +507,176 @@ function formatExponentialString(expStr: string, fmt: string): string {
 
 // ── Fraction Format ─────────────────────────────────────────────────
 
+/** Numerator/denominator part of a fraction format; the denominator may be a literal number ("?/16"). */
+const FRACTION_PARTS = /([?#0]+)\/(\d+|[?#0]+)/
+
 function isFractionFormat(fmt: string): boolean {
-  // Matches patterns like "# ?/?", "# ??/??", "# ?/8", etc.
-  // But not date formats or paths
-  return /[#0?]\s*[?#0]+\/[?#0]+/.test(fmt)
+  // A slash with digit placeholders against it: "# ?/?", "# ??/??", and the
+  // fixed-denominator built-ins "As halves" (`# ?/2`), "As eighths" (`# ?/8`),
+  // "As sixteenths" (`# ??/16`).
+  //
+  // One placeholder either side is enough — "?/?" and "0/2" are as much
+  // fractions as "??/??" is. The old pattern wanted a placeholder *before*
+  // the numerator run, so a one-character numerator never matched and the
+  // format fell through to formatNumber, which renders the "/" as a literal
+  // and loses the numerator: 2.5 under "?/?" came out " /3". See #402.
+  //
+  // Recognising and parsing off the same pattern keeps the two from
+  // disagreeing about what a fraction is. Nothing else is dragged in: dates
+  // are claimed before this is reached and put no placeholder against their
+  // slashes, and an escaped slash ("0\/0") still carries its backslash.
+  return FRACTION_PARTS.test(maskLiterals(fmt))
 }
 
-function formatFraction(value: number, fmt: string): string {
-  const intPart = Math.trunc(value)
-  let frac = Math.abs(value - intPart)
+/**
+ * Blank out quoted runs and escaped characters, keeping the string the
+ * same length so an index into the result still points at the original.
+ *
+ * Fraction detection scans for placeholders around a slash, and a literal
+ * can contain both: `0.00" 0/2"` was read as a fraction spec and rendered
+ * `"3 1/2"` instead of `"3.50 0/2"`. See #429 — a regression from #402,
+ * where unifying detection with the parse regex inherited the parse
+ * regex's blind spot. The old pattern excluded this case by accident,
+ * through the same quirk that made `"?/?"` unrecognisable.
+ *
+ * This shares its definition of "literal" with {@link extractLiterals} —
+ * a quoted run, or a backslash and the character after it. A test pins
+ * the two in agreement, because two implementations of one concept is
+ * what caused #429 in the first place.
+ */
+function maskLiterals(fmt: string): string {
+  let out = ""
+  let i = 0
 
-  if (frac === 0) {
-    // Show integer only for whole numbers
-    const showInt = fmt.includes("#") || /^[0?]/.test(fmt.trim())
-    if (showInt && intPart !== 0) {
-      return String(intPart)
+  while (i < fmt.length) {
+    const ch = fmt[i]
+
+    if (ch === '"') {
+      const close = fmt.indexOf('"', i + 1)
+      // An unterminated quote runs to the end, matching extractLiterals,
+      // which consumes to the end rather than treating the quote as data.
+      const end = close === -1 ? fmt.length : close + 1
+      out += MASK.repeat(end - i)
+      i = end
+      continue
     }
-    return String(intPart) + "      " // padded like Excel
+
+    if (ch === "\\") {
+      // The backslash and whatever it escapes, even at the very end.
+      const span = i + 1 < fmt.length ? 2 : 1
+      out += MASK.repeat(span)
+      i += span
+      continue
+    }
+
+    out += ch
+    i++
   }
 
-  // Determine denominator precision from format
-  const fracMatch = fmt.match(/([?#0]+)\/([?#0]+)/)
+  return out
+}
+
+/** Stands in for a literal character: never a placeholder, never a slash. */
+const MASK = "\u0001"
+
+function formatFraction(value: number, fmt: string): string {
+  // Determine denominator precision from format. Matched against the
+  // masked form so a slash inside a literal cannot be mistaken for the
+  // fraction bar; the mask preserves length, so the index and the
+  // placeholder groups still describe the real format. See #429.
+  const fracMatch = maskLiterals(fmt).match(FRACTION_PARTS)
   if (!fracMatch) {
     return String(value)
   }
 
+  const fracAt = fracMatch.index ?? 0
+
+  // Everything outside the numerator/denominator group is literal text, and
+  // it is read with the machinery the plain number path already uses, so a
+  // quoted run, a "\$" escape and a bare "$" mean here exactly what they mean
+  // under "0.00". Building the output from the digits alone dropped all of it
+  // — "$?/?" rendered as "5/2", and worse, the "-" of a negative section
+  // ("# ?/?;-# ?/?") vanished with it, since that section is handed the
+  // absolute value and the sign lives only in the format. See #426.
+  //
+  // Literals sit *outside* the "?" padding, which belongs to the fraction
+  // rather than to the field: 2.5 under "$??/??" is "$ 5/ 2", not " $5/ 2".
+  // The prefix leads the whole part and the suffix trails the denominator.
+  // The prefix also leads the sign, matching formatNumber's "$-1,234.50".
+  const head = extractLiterals(fmt.slice(0, fracAt))
+  // The tail is all literal: nothing after the denominator has a number to
+  // render, so expandLiterals — quotes and escapes to text — is the whole job.
+  const tail = expandLiterals(fmt.slice(fracAt + fracMatch[0].length))
+
+  // A whole part is only rendered when the format has a placeholder in front
+  // of the fraction — "?" counts just as much as "#" and "0" ("? ?/?" is a
+  // mixed number, "??/??" is improper). Reading it off `head.core` rather
+  // than the raw text keeps a placeholder character that is only literal
+  // ('"#"?/?') from being mistaken for an integer slot.
+  const hasIntPart = /[#0?]/.test(head.core)
+
+  const intPart = Math.trunc(value)
+  // With no whole-part placeholder there is nowhere to put the integer, so
+  // Excel folds it into the numerator: 2.5 under "??/??" is "5/2", not
+  // "1/2". Formatting the remainder alone would drop the whole part
+  // silently — a different number, not a different presentation. See #397.
+  const target = hasIntPart ? Math.abs(value - intPart) : Math.abs(value)
+
   const denomLen = fracMatch[2].length
 
-  // Check for fixed denominator (all digits)
+  // A denominator written in digits is fixed ("?/16"); one written in
+  // placeholders is searched for. "0" and "00" are both at once, but a
+  // literal denominator of zero means nothing, so they parse to 0 and the
+  // guard below sends them to the search — which is where Excel puts them,
+  // since "0" is a placeholder character.
   const fixedDenom = /^\d+$/.test(fracMatch[2]) ? Number.parseInt(fracMatch[2], 10) : 0
 
   let bestNum: number
   let bestDen: number
 
-  if (fixedDenom > 0) {
+  if (target === 0) {
+    bestNum = 0
+    bestDen = fixedDenom > 0 ? fixedDenom : 1
+  } else if (fixedDenom > 0) {
     bestDen = fixedDenom
-    bestNum = Math.round(frac * fixedDenom)
+    bestNum = Math.round(target * fixedDenom)
   } else {
     // Find best fraction with denominator up to 10^denomLen
     const maxDen = Math.pow(10, denomLen) - 1
-    const result = findBestFraction(frac, maxDen)
+    const result = findBestFraction(target, maxDen)
     bestNum = result.num
     bestDen = result.den
   }
 
-  // Build the formatted string
-  const hasIntPart = fmt.includes("#") || fmt.includes("0")
-  const prefix = intPart !== 0 && hasIntPart ? String(intPart) + " " : intPart < 0 ? "-" : ""
+  // Nothing left for the fraction area: either the value is whole, or the
+  // remainder rounded away against a denominator the format fixed (0.1 over
+  // halves). Excel prints the whole part rather than a zero numerator —
+  // "3 0/2" is not something it ever renders. See #397.
+  if (bestNum === 0) {
+    // Whether there is an integer slot is the same question `hasIntPart`
+    // already answered; asking it a second time off the raw format text is
+    // how the two answers drift apart (a "$" prefix defeated the old test).
+    // The blanked fraction area stays between the number and the suffix.
+    if (hasIntPart && intPart !== 0) {
+      return head.prefix + String(intPart) + tail
+    }
+    return head.prefix + String(intPart) + "      " + tail // padded like Excel
+  }
+
+  // Build the formatted string.
+  // The sign has to come from the value: Math.trunc(-0.5) is -0, which is
+  // neither `!== 0` nor `< 0`, so the sign would be lost for -1 < value < 0.
+  // A format that writes its own "-" is left to it, as formatNumber does.
+  const sign = value < 0 && !head.prefix.includes("-") ? "-" : ""
+  // What separates the whole part from the numerator is whatever the format
+  // put there — the space in "# ?/?" is literal text, not punctuation the
+  // formatter owns.
+  const whole = hasIntPart && intPart !== 0 ? String(Math.abs(intPart)) + head.suffix : ""
 
   const numStr = String(bestNum).padStart(fracMatch[1].length, " ")
   const denStr = String(bestDen).padStart(fracMatch[2].length, " ")
 
-  return prefix + numStr + "/" + denStr
+  return head.prefix + sign + whole + numStr + "/" + denStr + tail
 }
 
 function findBestFraction(value: number, maxDen: number): { num: number; den: number } {
@@ -482,15 +709,14 @@ function formatNumber(value: number, fmt: string, locale?: LocaleFormat): string
     return prefix + suffix
   }
 
-  const hasThousands = core.includes(",") && /[#0?],/.test(core)
-  const useThousandSep = hasThousands && !core.match(/,{2,}/) // ,, means scale down
+  // A comma *between* digit placeholders turns on group separators; a comma
+  // *after* the last placeholder scales the value down by 1000 each. The two
+  // are independent — "#,##0,," both groups and divides by a million.
+  const useThousandSep = /[#0?],[#0?]/.test(core)
 
   // Count trailing commas (each divides by 1000)
-  let scaleDown = 0
-  const scaleMatch = core.match(/(,+)(?=[^#0?]*$)/)
-  if (scaleMatch && !useThousandSep) {
-    scaleDown = scaleMatch[1].length
-  }
+  const scaleMatch = core.match(/,+$/)
+  const scaleDown = scaleMatch ? scaleMatch[0].length : 0
 
   let scaledValue = value
   for (let s = 0; s < scaleDown; s++) {
@@ -527,8 +753,11 @@ function formatNumber(value: number, fmt: string, locale?: LocaleFormat): string
   let localizedInt = formattedInt
   let localizedDec = formattedDec
   if (locale) {
-    if (locale.thousands !== "," && useThousandSep) {
-      localizedInt = localizedInt.replace(/,/g, locale.thousands)
+    // Unconditional when the format asked for grouping: the separator and
+    // the positions both come from the locale, and a locale that matches
+    // the defaults regroups to the same string anyway.
+    if (useThousandSep) {
+      localizedInt = regroup(localizedInt, locale.groupSizes, locale.thousands)
     }
     if (locale.decimal !== "." && localizedDec.length > 0) {
       // Replace the leading "." with locale decimal
@@ -538,8 +767,8 @@ function formatNumber(value: number, fmt: string, locale?: LocaleFormat): string
 
   // Combine
   let result = prefix
-  if (isNegative && fmt.indexOf("-") === -1) {
-    // Only add minus if the format doesn't explicitly have one
+  if (isNegative && !prefix.includes("-")) {
+    // Only add minus if the format doesn't already write one itself
     result += "-"
   }
   result += localizedInt + localizedDec + suffix
@@ -594,8 +823,12 @@ function extractLiterals(fmt: string): { prefix: string; suffix: string; core: s
       continue
     }
 
-    // Digit placeholders or format chars
-    if ("#0?.,%Ee+-".includes(ch)) {
+    // Digit placeholders or format chars.
+    // "+" and "-" are deliberately *not* here: Excel treats them as literal
+    // text (the explicit sign of a negative section, for instance), so they
+    // must reach the prefix/suffix rather than being swallowed by `core`,
+    // where nothing would ever render them.
+    if ("#0?.,%Ee".includes(ch)) {
       if (afterDigits && "#0?".includes(ch)) {
         // More digit placeholders after suffix text — unusual but handle it
         core += suffix + ch
@@ -652,29 +885,64 @@ function formatIntegerPart(intStr: string, fmt: string, useThousandSep: boolean)
   const minDigits = (fmt.match(/0/g) || []).length
   const hasHash = fmt.includes("#")
 
-  // Pad with leading zeros if needed
-  let padded = intStr
-  if (padded.length < minDigits) {
-    padded = padded.padStart(minDigits, "0")
+  // If all # and value is 0, show nothing (e.g. "#.00" renders 0.5 as ".50")
+  let digits = intStr
+  if (digits === "0" && minDigits === 0 && hasHash) {
+    digits = ""
   }
 
-  // If all # and value is 0, show nothing (or just 0 if minDigits > 0)
-  if (padded === "0" && minDigits === 0 && hasHash) {
-    padded = ""
+  // Plain run of digit placeholders — pad and group as a single block.
+  if (!/[^0#?]/.test(fmt)) {
+    let padded = digits
+    if (padded.length < minDigits) {
+      padded = padded.padStart(minDigits, "0")
+    }
+    if (useThousandSep && padded.length > 0) {
+      padded = addThousandSeparators(padded)
+    }
+    return padded
   }
 
-  // Add thousand separators
-  if (useThousandSep && padded.length > 0) {
-    padded = addThousandSeparators(padded)
+  // The format interleaves literal characters with digit placeholders —
+  // Excel's Special formats ("000-00-0000", "(000) 000-0000"). Excel fills
+  // placeholders right-to-left, keeps the literals in place, and lets the
+  // leftmost placeholder absorb every surplus digit.
+  const firstPlaceholder = fmt.search(/[0#?]/)
+  const out: string[] = []
+  let d = digits.length - 1
+
+  for (let i = fmt.length - 1; i >= 0; i--) {
+    const ch = fmt[i]
+    if (ch !== "0" && ch !== "#" && ch !== "?") {
+      out.push(ch)
+      continue
+    }
+    if (d >= 0) {
+      if (i === firstPlaceholder) {
+        out.push(digits.slice(0, d + 1))
+        d = -1
+      } else {
+        out.push(digits[d])
+        d--
+      }
+    } else if (ch === "0") {
+      out.push("0")
+    } else if (ch === "?") {
+      out.push(" ")
+    }
   }
 
-  return padded
+  return out.reverse().join("")
 }
 
 function formatDecimalPart(decStr: string, fmt: string): string {
   // The format contains 0, #, ? placeholders
   let result = ""
   const cleanFmt = fmt.replace(/[^0#?]/g, "")
+  // `decStr` comes from toFixed(), so it is always padded out to the full
+  // placeholder count. Trailing zeros there are insignificant digits, which
+  // is what "?" renders as a space.
+  const significant = decStr.replace(/0+$/, "").length
 
   for (let i = 0; i < cleanFmt.length; i++) {
     const placeholder = cleanFmt[i]
@@ -694,7 +962,7 @@ function formatDecimalPart(decStr: string, fmt: string): string {
         break
       case "?":
         // Show digit or space
-        if (i < decStr.length) {
+        if (i < significant) {
           result += digit
         } else {
           result += " "

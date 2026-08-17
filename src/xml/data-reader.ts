@@ -26,7 +26,19 @@ export interface XmlReadOptions {
   /** Transform header keys. */
   transformHeader?: (header: string, index: number) => string
   /** Transform cell values. */
-  transformValue?: (value: CellValue, header: string, rowIndex: number) => CellValue
+  /**
+   * Transform each cell value. The `colIndex` argument was missing here
+   * while every other `transformValue` in the library had it, so a
+   * four-argument callback silently lost its last parameter when moved
+   * to `readXml` — and TypeScript accepts a function that takes fewer
+   * arguments, so nothing flagged it. See #384.
+   */
+  transformValue?: (
+    value: CellValue,
+    header: string,
+    rowIndex: number,
+    colIndex: number,
+  ) => CellValue
   /** Maximum number of rows. */
   maxRows?: number
 }
@@ -38,7 +50,7 @@ export interface XmlReadResult<T extends Record<string, CellValue> = Record<stri
   rowTag: string
 }
 
-interface MiniElement {
+export interface MiniElement {
   tag: string
   local: string
   prefix: string
@@ -47,9 +59,9 @@ interface MiniElement {
   text: string
 }
 
-type MiniNode = MiniElement | { __text: string }
+export type MiniNode = MiniElement | { __text: string }
 
-function splitTag(tag: string): { local: string; prefix: string } {
+export function splitTag(tag: string): { local: string; prefix: string } {
   const colon = tag.indexOf(":")
   if (colon === -1) return { local: tag, prefix: "" }
   return { prefix: tag.slice(0, colon), local: tag.slice(colon + 1) }
@@ -61,10 +73,15 @@ function splitTag(tag: string): { local: string; prefix: string } {
  * picks the most-frequent tag.
  */
 export function readXml<T extends Record<string, CellValue> = Record<string, CellValue>>(
-  input: string,
+  input: string | Uint8Array,
   options?: XmlReadOptions,
 ): XmlReadResult<T> {
-  if (input.trim() === "") {
+  // XML feeds arrive as bytes at least as often as JSON does, and
+  // parseJson has always accepted both — this forced a decode at the
+  // call site for no reason. See #384.
+  const xml = typeof input === "string" ? input : new TextDecoder("utf-8").decode(input)
+
+  if (xml.trim() === "") {
     return { data: [], headers: [], rowTag: options?.rowTag ?? "" }
   }
 
@@ -74,13 +91,13 @@ export function readXml<T extends Record<string, CellValue> = Record<string, Cel
   const textKey = options?.textKey ?? "#text"
 
   const requestedRowTag = options?.rowTag
-  const rowTag = requestedRowTag ?? detectRowTag(input, stripNs)
+  const rowTag = requestedRowTag ?? detectRowTag(xml, stripNs)
 
   if (!rowTag) {
     return { data: [], headers: [], rowTag: "" }
   }
 
-  const rows = collectRows(input, rowTag, stripNs)
+  const rows = collectRows(xml, rowTag, stripNs)
 
   const flatOpts = { attrPrefix, flatten, textKey, stripNs }
   const limit = options?.maxRows ?? Infinity
@@ -123,10 +140,11 @@ export function readXml<T extends Record<string, CellValue> = Record<string, Cel
   for (let r = 0; r < flatRows.length; r++) {
     const src = flatRows[r]!
     const obj: Record<string, CellValue> = {}
-    for (const h of headers) {
+    for (let c = 0; c < headers.length; c++) {
+      const h = headers[c]!
       let val = src[h] ?? null
       if (options?.transformValue) {
-        val = options.transformValue(val, h, r)
+        val = options.transformValue(val, h, r, c)
       }
       obj[h] = val
     }
@@ -177,7 +195,7 @@ function detectRowTag(input: string, stripNs: boolean): string {
 
 // ── Row collection ─────────────────────────────────────────────────────
 
-function collectRows(input: string, rowTag: string, stripNs: boolean): MiniElement[] {
+export function collectRows(input: string, rowTag: string, stripNs: boolean): MiniElement[] {
   const rows: MiniElement[] = []
   // Stack of elements we are currently building. The first entry (when set)
   // is the root row element; nested elements are pushed/popped during traversal.
@@ -241,14 +259,14 @@ function collectRows(input: string, rowTag: string, stripNs: boolean): MiniEleme
 
 // ── Flatten a row element into dot-path keys ───────────────────────────
 
-interface FlattenCtx {
+export interface FlattenCtx {
   attrPrefix: string
   flatten: boolean
   textKey: string
   stripNs: boolean
 }
 
-function elementToFlat(
+export function elementToFlat(
   el: MiniElement,
   ctx: FlattenCtx,
   prefix: string,

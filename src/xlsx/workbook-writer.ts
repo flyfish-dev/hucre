@@ -4,6 +4,8 @@
 import type { WriteSheet, NamedRange } from "../_types"
 import { xmlDocument, xmlElement, xmlSelfClose, xmlEscape } from "../xml/writer"
 import { hashSheetPassword } from "./password"
+import { METADATA_REL_TYPE } from "./metadata"
+import { FPB_REL_TYPE } from "./feature-property-bag"
 
 const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -204,9 +206,6 @@ export function writeWorkbookXml(
 }
 
 const REL_VBA_PROJECT = "http://schemas.microsoft.com/office/2006/relationships/vbaProject"
-const REL_FEATURE_PROPERTY_BAG =
-  "http://schemas.microsoft.com/office/2022/11/relationships/FeaturePropertyBag"
-
 const REL_PERSON = "http://schemas.microsoft.com/office/2017/10/relationships/person"
 const REL_EXTERNAL_LINK =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink"
@@ -253,6 +252,7 @@ export function writeWorkbookRels(
   slicerCacheRels?: ReadonlyArray<CacheRel>,
   timelineCacheRels?: ReadonlyArray<CacheRel>,
   hasCellImages?: boolean,
+  hasMetadata?: boolean,
 ): string {
   const children: string[] = []
 
@@ -300,6 +300,21 @@ export function writeWorkbookRels(
   )
   nextRid++
 
+  // Cell metadata relationship (dynamic arrays). Placed between
+  // sharedStrings/theme and vbaProject, where Excel and XlsxWriter put
+  // it; `computeExternalLinkRelStart` in roundtrip.ts mirrors this
+  // position and has to move with it.
+  if (hasMetadata) {
+    children.push(
+      xmlSelfClose("Relationship", {
+        Id: `rId${nextRid}`,
+        Type: METADATA_REL_TYPE,
+        Target: "metadata.xml",
+      }),
+    )
+    nextRid++
+  }
+
   // VBA project relationship (for macro-enabled workbooks)
   if (hasMacros) {
     children.push(
@@ -317,7 +332,7 @@ export function writeWorkbookRels(
     children.push(
       xmlSelfClose("Relationship", {
         Id: `rId${nextRid}`,
-        Type: REL_FEATURE_PROPERTY_BAG,
+        Type: FPB_REL_TYPE,
         Target: "featurePropertyBag/featurePropertyBag.xml",
       }),
     )

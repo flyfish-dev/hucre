@@ -55,7 +55,14 @@ describe("agile crypto primitive", () => {
     await expect(decryptAgile(enc, "wrong")).rejects.toBeInstanceOf(DecryptionError)
   })
 
-  it("interoperates at Excel's default spin count", { timeout: 30000 }, async () => {
+  // 100,000 spins on each side is 200,000 SHA-512 iterations, and the
+  // budget has to cover the worst case rather than the quiet one: vitest
+  // runs files in parallel, so this shares a machine with the rest of the
+  // suite. 30s was enough in isolation and not under load, so it failed
+  // intermittently — on a test whose subject is not speed. Keeping the
+  // real default matters: this is the only assertion that Excel's own
+  // spin count works end to end.
+  it("interoperates at Excel's default spin count", { timeout: 180_000 }, async () => {
     const payload = new TextEncoder().encode("z".repeat(9000))
     const enc = await encryptAgile(payload, "pw") // default 100000
     expect([...(await decryptAgile(enc, "pw"))]).toEqual([...payload])
@@ -92,8 +99,8 @@ describe("decryption across the read entry points", () => {
 
   it("readObjects() decrypts", async () => {
     const enc = await writeXlsx({ ...book(), encryption: { password: "pw", spinCount: 64 } })
-    const objs = await readObjects<{ Name: string; Score: number }>(enc, { password: "pw" })
-    expect(objs).toEqual([
+    const { data } = await readObjects<{ Name: string; Score: number }>(enc, { password: "pw" })
+    expect(data).toEqual([
       { Name: "Ada", Score: 95 },
       { Name: "Linus", Score: 88 },
     ])

@@ -3,11 +3,12 @@
 // Parses shared strings and styles upfront (small), then streams
 // worksheet rows without buffering the entire sheet in memory.
 
-import type { CellValue, ReadOptions } from "../_types"
+import type { CellValue, ReadOptions, StreamRow } from "../_types"
 import type { SharedString } from "./shared-strings"
 import type { ParsedStyles } from "./styles"
 import type { Relationship } from "./relationships"
 import { EncryptedFileError, ParseError, ZipError } from "../errors"
+import { MAX_COL_INDEX } from "../limits"
 import { isOle2Container } from "../_input"
 import { decryptAgile } from "./crypto/agile"
 import { ZipReader } from "../zip/reader"
@@ -15,20 +16,18 @@ import { ZipStreamReader } from "../zip/stream-reader"
 import { matchesRelType } from "./reader"
 import { parseXml, parseSaxStream, decodeOoxmlEscapes } from "../xml/parser"
 import { parseContentTypes } from "./content-types"
-import { parseRelationships } from "./relationships"
+import { dirname, findRIdAttr, parseRelationships, resolvePath } from "./relationships"
 import { parseSharedStrings } from "./shared-strings"
 import { parseStyles, isDateStyle } from "./styles"
-import { parseCellRef } from "./worksheet"
+import { parseCellRef, parseIsoCellDate } from "./worksheet"
 import { serialToDate } from "../_date"
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export interface StreamRow {
-  /** 0-based row index */
-  index: number
-  /** Cell values for this row */
-  values: CellValue[]
-}
+// StreamRow now lives in _types.ts and is shared with the ODS reader —
+// the two had near-identical shapes under two names. Re-exported here so
+// `import type { StreamRow } from "hucre/xlsx"` keeps working.
+export type { StreamRow } from "../_types"
 
 // ── Range filter ────────────────────────────────────────────────────
 
@@ -69,30 +68,22 @@ const REL_STYLES = "styles"
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function decodeUtf8(data: Uint8Array): string {
+/**
+ * Decode a package part with no string-length ceiling.
+ *
+ * The buffered readers route the same job through `_decode.decodePart`,
+ * which catches V8's `MAX_STRING_LENGTH` and reports it as the #514
+ * `ParseError` naming the part. This path does not, and that is what
+ * `docs/PARITY.md` records — `streamXlsxRows` is the answer *to* the
+ * ceiling for worksheets, since it never builds one string for them.
+ *
+ * The parts decoded here are the small ones (content types, rels, the
+ * workbook, styles); a `sharedStrings.xml` over the ceiling would still
+ * throw V8's raw error. The name is `Unchecked` so a line moved between
+ * the two readers cannot quietly drop the check.
+ */
+function decodeUtf8Unchecked(data: Uint8Array): string {
   return new TextDecoder("utf-8").decode(data)
-}
-
-function resolvePath(base: string, target: string): string {
-  if (target.startsWith("/")) return target.slice(1)
-
-  const baseParts = base.split("/").filter(Boolean)
-  const targetParts = target.split("/").filter(Boolean)
-
-  for (const part of targetParts) {
-    if (part === "..") {
-      baseParts.pop()
-    } else if (part !== ".") {
-      baseParts.push(part)
-    }
-  }
-
-  return baseParts.join("/")
-}
-
-function dirname(path: string): string {
-  const idx = path.lastIndexOf("/")
-  return idx === -1 ? "" : path.slice(0, idx)
 }
 
 // ── Workbook XML Parsing (minimal — just sheet info + date system) ───
@@ -151,15 +142,6 @@ function parseWorkbookXml(
   }
 
   return { sheets, dateSystem }
-}
-
-function findRIdAttr(attrs: Record<string, string>): string | undefined {
-  for (const key of Object.keys(attrs)) {
-    if (key.endsWith(":id") && attrs[key].startsWith("rId")) {
-      return attrs[key]
-    }
-  }
-  return undefined
 }
 
 // ── Resolve target sheet ────────────────────────────────────────────
@@ -229,6 +211,15 @@ function createRowSaxState(): RowSaxState {
 function buildRowFromCells(cells: Array<{ col: number; value: CellValue }>): CellValue[] {
   // Use reduce instead of Math.max(...spread) to avoid RangeError on wide rows (>65K cols)
   const maxCol = cells.reduce((m, c) => (c.col > m ? c.col : m), -1)
+  // The batch reader bound-checks cell coordinates; this one did not, so
+  // `<c r="AAAAAA1">` allocated a 12M-element array per row and a longer
+  // reference reached a raw RangeError, escaping the typed-error
+  // contract. See #363.
+  if (maxCol > MAX_COL_INDEX) {
+    throw new ParseError(
+      `Cell column ${maxCol} is outside the supported sheet bounds (max ${MAX_COL_INDEX + 1})`,
+    )
+  }
   const values: CellValue[] = maxCol >= 0 ? Array.from({ length: maxCol + 1 }, () => null) : []
   for (const cell of cells) {
     values[cell.col] = cell.value
@@ -443,7 +434,7 @@ async function* parseWorksheetRowsStreaming(
   const maxRows = filters.maxRows ?? 0
   const range = filters.range
 
-  const parsePromise = parseSaxStream(cancellable, {
+  const parsePromiseRaw = parseSaxStream(cancellable, {
     onOpenTag(tag, attrs) {
       if (aborted) return
       handleOpenTag(tag, attrs, s)
@@ -460,6 +451,7 @@ async function* parseWorksheetRowsStreaming(
         // worksheet rows are written in ascending order in valid OOXML.
         if (range && row.index > range.endRow) {
           aborted = true
+          stoppedEarly = true
           cancelSource()
           if (resolve) {
             resolve()
@@ -477,17 +469,34 @@ async function* parseWorksheetRowsStreaming(
           }
           if (maxRows > 0 && emittedDataRows >= maxRows) {
             aborted = true
+            stoppedEarly = true
             cancelSource()
           }
         }
       }
     },
-  }).then(() => {
+  })
+  // Both settlements have to wake the consumer loop below. Handling only
+  // fulfilment left `done` false forever on a parse error, so the loop
+  // awaited a promise nobody would ever resolve — the generator hung
+  // instead of surfacing the error. See #363.
+  let parseError: unknown
+  let parseFailed = false
+  // `aborted` is also set by the generator's finally block, so it cannot
+  // tell a deliberate early stop from ordinary completion. Track the
+  // former separately, since only then is a parser error expected.
+  let stoppedEarly = false
+  const wake = (): void => {
     done = true
     if (resolve) {
       resolve()
       resolve = null
     }
+  }
+  const parsePromise = parsePromiseRaw.then(wake, (err: unknown) => {
+    parseError = err
+    parseFailed = true
+    wake()
   })
 
   try {
@@ -508,7 +517,12 @@ async function* parseWorksheetRowsStreaming(
     cancelSource()
   }
 
-  await parsePromise.catch(() => {})
+  await parsePromise
+  // A parse failure used to be swallowed here, so a malformed sheet
+  // looked like a short-but-successful read. Cancellation is different:
+  // when we stopped the source ourselves for maxRows/range, whatever the
+  // parser reports on the way down is expected, not an error.
+  if (parseFailed && !stoppedEarly) throw parseError
 }
 
 // ── Cell value resolution (streaming — no Cell objects) ──────────────
@@ -550,6 +564,22 @@ function resolveStreamCellValue(
     case "e": {
       // Error
       return valueText
+    }
+    case "d": {
+      // ISO 8601 date (ECMA-376 §18.18.11 ST_CellType), which openpyxl
+      // writes whenever `iso_dates=True`. Without this it fell to the
+      // `n` arm, where `Number("2024-03-17")` is NaN and the text came
+      // back as a string — while `readXlsx` returned a `Date` for the
+      // same cell. See #496.
+      //
+      // The value is an instant, not an offset from an epoch, so the
+      // 1904 system does not apply to it.
+      const parsed = parseIsoCellDate(valueText)
+      if (parsed) return parsed
+      // A bare time (`13:45:30`, openpyxl's `datetime.time`) has no day
+      // to anchor it; left as text rather than guessed onto an epoch,
+      // which is what the buffered reader does too.
+      return valueText === "" ? null : valueText
     }
     case "n":
     default: {
@@ -629,9 +659,9 @@ function resolveFromParts(
   const ct = parts.get("[Content_Types].xml")
   const rootRelsBytes = parts.get("_rels/.rels")
   if (!ct || !rootRelsBytes) return null
-  parseContentTypes(decodeUtf8(ct))
+  parseContentTypes(decodeUtf8Unchecked(ct))
 
-  const rootRels = parseRelationships(decodeUtf8(rootRelsBytes))
+  const rootRels = parseRelationships(decodeUtf8Unchecked(rootRelsBytes))
   const workbookRel = rootRels.find((r) => matchesRelType(r.type, REL_WORKBOOK))
   if (!workbookRel) return null
   const workbookPath = workbookRel.target.startsWith("/")
@@ -646,16 +676,22 @@ function resolveFromParts(
     ? `${workbookDir}/_rels/${workbookPath.slice(workbookDir.length + 1)}.rels`
     : `_rels/${workbookPath}.rels`
   const wbRelsBytes = parts.get(workbookRelsPath)
-  const workbookRels = wbRelsBytes ? parseRelationships(decodeUtf8(wbRelsBytes)) : []
+  const workbookRels = wbRelsBytes ? parseRelationships(decodeUtf8Unchecked(wbRelsBytes)) : []
 
-  const { sheets: sheetInfos, dateSystem } = parseWorkbookXml(decodeUtf8(wbBytes), options)
+  const { sheets: sheetInfos, dateSystem } = parseWorkbookXml(decodeUtf8Unchecked(wbBytes), options)
   const targetSheet = resolveTargetSheet(sheetInfos, options?.sheet)
   if (!targetSheet) return null
 
   const sheetRelMap = new Map<string, string>()
+  // A tab that is not a worksheet has no rows. Recognising it here is
+  // what separates "nothing to stream" from "the part is missing", which
+  // is real damage and still throws. See #499.
+  const nonWorksheetRIds = new Set<string>()
   for (const rel of workbookRels) {
     if (matchesRelType(rel.type, REL_WORKSHEET)) {
       sheetRelMap.set(rel.id, resolvePath(workbookDir, rel.target))
+    } else if (matchesRelType(rel.type, "chartsheet") || matchesRelType(rel.type, "dialogsheet")) {
+      nonWorksheetRIds.add(rel.id)
     }
   }
   const wsPath = sheetRelMap.get(targetSheet.rId)
@@ -670,7 +706,7 @@ function resolveFromParts(
     const ssPath = resolvePath(workbookDir, ssRel.target)
     const ssBytes = parts.get(ssPath)
     if (!ssBytes) return null
-    sharedStrings = parseSharedStrings(decodeUtf8(ssBytes))
+    sharedStrings = parseSharedStrings(decodeUtf8Unchecked(ssBytes))
   }
 
   let parsedStyles: ParsedStyles | null = null
@@ -679,7 +715,7 @@ function resolveFromParts(
     const stylesPath = resolvePath(workbookDir, stylesRel.target)
     const stylesBytes = parts.get(stylesPath)
     if (!stylesBytes) return null
-    parsedStyles = parseStyles(decodeUtf8(stylesBytes))
+    parsedStyles = parseStyles(decodeUtf8Unchecked(stylesBytes))
   }
 
   return { wsPath, sharedStrings, parsedStyles, dateSystem }
@@ -701,35 +737,44 @@ async function prepareStreaming(
 ): Promise<PrepareResult> {
   const zr = new ZipStreamReader(input)
   const parts = new Map<string, Uint8Array>()
+  const maxInputBytes = options?.maxInputBytes
   let resolved: ResolvedMeta | null = null
 
-  for (;;) {
-    const entry = await zr.nextEntry()
-    if (!entry) {
-      // Reached the central directory without streaming the target — fall
-      // back so the buffered path handles resolution / "sheet not found".
-      return { mode: "fallback", data: await zr.drainToBuffer() }
-    }
-    if (!entry.streamable) {
-      return { mode: "fallback", data: await zr.drainToBuffer() }
-    }
-
-    if (isWorksheetEntry(entry.name)) {
-      if (!resolved) resolved = resolveFromParts(parts, options)
-      if (!resolved) return { mode: "fallback", data: await zr.drainToBuffer() }
-      if (entry.name === resolved.wsPath) {
-        const wsStream = zr.entryStream(entry)
-        return { mode: "stream", wsStream, meta: resolved }
+  // Anything that escapes this loop abandons the reader mid-archive. Without
+  // the close() the source stayed locked forever — the caller could neither
+  // retry nor release whatever backs the stream.
+  try {
+    for (;;) {
+      const entry = await zr.nextEntry()
+      if (!entry) {
+        // Reached the central directory without streaming the target — fall
+        // back so the buffered path handles resolution / "sheet not found".
+        return { mode: "fallback", data: await zr.drainToBuffer(maxInputBytes) }
       }
-      await zr.skipEntry()
-      continue
-    }
+      if (!entry.streamable) {
+        return { mode: "fallback", data: await zr.drainToBuffer(maxInputBytes) }
+      }
 
-    if (shouldCollectEntry(entry.name)) {
-      parts.set(entry.name, await zr.readEntryBytes(entry))
-    } else {
-      await zr.skipEntry()
+      if (isWorksheetEntry(entry.name)) {
+        if (!resolved) resolved = resolveFromParts(parts, options)
+        if (!resolved) return { mode: "fallback", data: await zr.drainToBuffer(maxInputBytes) }
+        if (entry.name === resolved.wsPath) {
+          const wsStream = zr.entryStream(entry)
+          return { mode: "stream", wsStream, meta: resolved }
+        }
+        await zr.skipEntry()
+        continue
+      }
+
+      if (shouldCollectEntry(entry.name)) {
+        parts.set(entry.name, await zr.readEntryBytes(entry))
+      } else {
+        await zr.skipEntry()
+      }
     }
+  } catch (err) {
+    await zr.close()
+    throw err
   }
 }
 
@@ -777,7 +822,7 @@ export async function* streamXlsxRows(
   // isn't possible — the whole package must be decrypted first).
   if (isOle2Container(data)) {
     if (options?.password) {
-      data = await decryptAgile(data, options.password)
+      data = await decryptAgile(data, options.password, options.maxSpinCount)
     } else {
       throw new EncryptedFileError("xlsx")
     }
@@ -786,7 +831,7 @@ export async function* streamXlsxRows(
   // 1. Open ZIP archive
   let zip: ZipReader
   try {
-    zip = new ZipReader(data)
+    zip = new ZipReader(data, options?.maxDecompressedBytes)
   } catch (err) {
     if (err instanceof ZipError) throw err
     throw new ParseError("Failed to open XLSX file: not a valid ZIP archive", undefined, {
@@ -798,14 +843,14 @@ export async function* streamXlsxRows(
   if (!zip.has("[Content_Types].xml")) {
     throw new ParseError("Invalid XLSX: missing [Content_Types].xml")
   }
-  const contentTypesXml = decodeUtf8(await zip.extract("[Content_Types].xml"))
+  const contentTypesXml = decodeUtf8Unchecked(await zip.extract("[Content_Types].xml"))
   parseContentTypes(contentTypesXml)
 
   // 3. Parse _rels/.rels to find the workbook path
   if (!zip.has("_rels/.rels")) {
     throw new ParseError("Invalid XLSX: missing _rels/.rels")
   }
-  const rootRelsXml = decodeUtf8(await zip.extract("_rels/.rels"))
+  const rootRelsXml = decodeUtf8Unchecked(await zip.extract("_rels/.rels"))
   const rootRels = parseRelationships(rootRelsXml)
   const workbookRel = rootRels.find((r) => matchesRelType(r.type, REL_WORKBOOK))
   if (!workbookRel) {
@@ -824,7 +869,7 @@ export async function* streamXlsxRows(
 
   let workbookRels: Relationship[] = []
   if (zip.has(workbookRelsPath)) {
-    const wbRelsXml = decodeUtf8(await zip.extract(workbookRelsPath))
+    const wbRelsXml = decodeUtf8Unchecked(await zip.extract(workbookRelsPath))
     workbookRels = parseRelationships(wbRelsXml)
   }
 
@@ -832,7 +877,7 @@ export async function* streamXlsxRows(
   if (!zip.has(workbookPath)) {
     throw new ParseError(`Invalid XLSX: missing workbook at ${workbookPath}`)
   }
-  const workbookXml = decodeUtf8(await zip.extract(workbookPath))
+  const workbookXml = decodeUtf8Unchecked(await zip.extract(workbookPath))
   const { sheets: sheetInfos, dateSystem } = parseWorkbookXml(workbookXml, options)
 
   // 6. Parse shared strings (small, needed for cell resolution)
@@ -841,7 +886,7 @@ export async function* streamXlsxRows(
   if (ssRel) {
     const ssPath = resolvePath(workbookDir, ssRel.target)
     if (zip.has(ssPath)) {
-      const ssXml = decodeUtf8(await zip.extract(ssPath))
+      const ssXml = decodeUtf8Unchecked(await zip.extract(ssPath))
       sharedStrings = parseSharedStrings(ssXml)
     }
   }
@@ -852,16 +897,22 @@ export async function* streamXlsxRows(
   if (stylesRel) {
     const stylesPath = resolvePath(workbookDir, stylesRel.target)
     if (zip.has(stylesPath)) {
-      const stylesXml = decodeUtf8(await zip.extract(stylesPath))
+      const stylesXml = decodeUtf8Unchecked(await zip.extract(stylesPath))
       parsedStyles = parseStyles(stylesXml)
     }
   }
 
   // 8. Build rId → worksheet path map
   const sheetRelMap = new Map<string, string>()
+  // A tab that is not a worksheet has no rows. Recognising it here is
+  // what separates "nothing to stream" from "the part is missing", which
+  // is real damage and still throws. See #499.
+  const nonWorksheetRIds = new Set<string>()
   for (const rel of workbookRels) {
     if (matchesRelType(rel.type, REL_WORKSHEET)) {
       sheetRelMap.set(rel.id, resolvePath(workbookDir, rel.target))
+    } else if (matchesRelType(rel.type, "chartsheet") || matchesRelType(rel.type, "dialogsheet")) {
+      nonWorksheetRIds.add(rel.id)
     }
   }
 
@@ -870,6 +921,8 @@ export async function* streamXlsxRows(
   if (!targetSheet) {
     return // No matching sheet — yield nothing
   }
+
+  if (nonWorksheetRIds.has(targetSheet.rId)) return
 
   const wsPath = sheetRelMap.get(targetSheet.rId)
   if (!wsPath || !zip.has(wsPath)) {

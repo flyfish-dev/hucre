@@ -12,18 +12,33 @@ import type {
   CellStyle,
   MergeRange,
   Hyperlink,
+  NamedRange,
 } from "../_types"
 import { ParseError, ZipError } from "../errors"
 import { assertNotEncrypted, readInputToUint8Array } from "../_input"
 import { ZipReader } from "../zip/reader"
+import { decodePart } from "../_decode"
 import { parseXml } from "../xml/parser"
-import { MAX_COL_INDEX, MAX_ROW_INDEX } from "../limits"
+import { parseRange } from "../cell-utils"
+import { parseUtcDefaultDateTime } from "../_date"
+import { MAX_COL_INDEX, MAX_REPEAT_COUNT, MAX_ROW_INDEX, MAX_TOTAL_CELLS } from "../limits"
+
+/**
+ * Bound a repeat count taken from the file so it can drive
+ * `String.repeat` safely. Non-numeric and non-positive values collapse
+ * to 1, matching the ODF default for an omitted `text:c`.
+ */
+function clampRepeat(raw: string | undefined): number {
+  const value = Number(raw ?? "1")
+  if (!Number.isFinite(value) || value < 1) return 1
+  return Math.min(Math.trunc(value), MAX_REPEAT_COUNT)
+}
 import type { XmlElement } from "../xml/parser"
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-function decodeUtf8(data: Uint8Array): string {
-  return new TextDecoder("utf-8").decode(data)
+function decodeUtf8(data: Uint8Array, path = "(unknown)"): string {
+  return decodePart(data, path)
 }
 
 function findChild(el: XmlElement, localName: string): XmlElement | undefined {
@@ -130,6 +145,8 @@ function parseStyles(doc: XmlElement): Map<string, OdsStyleDef> {
  */
 function parseDataStyles(autoStyles: XmlElement): Map<string, string> {
   const out = new Map<string, string>()
+  /** style name → the sections it maps to, by `<style:map>` condition */
+  const mapped = new Map<string, Array<{ condition: string; target: string }>>()
 
   for (const child of autoStyles.children) {
     if (typeof child === "string") continue
@@ -146,19 +163,70 @@ function parseDataStyles(autoStyles: XmlElement): Map<string, string> {
       code = serializeDataStyleChildren(child, "currency")
     } else if (local === "date-style") {
       code = serializeDataStyleChildren(child, "date")
+    } else if (local === "text-style") {
+      code = serializeDataStyleChildren(child, "text")
     } else if (local === "time-style") {
       const truncate = child.attrs["number:truncate-on-overflow"]
       code = serializeDataStyleChildren(child, "time", truncate === "false")
     }
-    if (code) out.set(name, code)
+    if (!code) continue
+    out.set(name, code)
+
+    const maps = findChildren(child, "map")
+    if (maps.length > 0) {
+      mapped.set(
+        name,
+        maps.map((m) => ({
+          condition: m.attrs["style:condition"] ?? "",
+          target: m.attrs["style:apply-style-name"] ?? "",
+        })),
+      )
+    }
+  }
+
+  // Reassemble Excel's `positive;negative;zero` from the styles a
+  // `<style:map>` chains together. The style a cell points at holds the
+  // negative section, and the maps name the styles for the other two — the
+  // inverse of what getOrCreateDataStyleName writes, and of what
+  // LibreOffice writes.
+  for (const [name, maps] of mapped) {
+    let positive: string | undefined
+    let zero: string | undefined
+    for (const { condition, target } of maps) {
+      const code = out.get(target)
+      if (!code) continue
+      if (condition.includes(">")) positive = code
+      else if (condition.includes("=")) zero = code
+    }
+    // Without a section for the values the main style does not cover, the
+    // maps describe something this reader cannot express — keep the main
+    // style's own code rather than inventing sections around it.
+    if (!positive) continue
+    const negative = out.get(name)!
+    out.set(name, zero ? `${positive};${negative};${zero}` : `${positive};${negative}`)
   }
 
   return out
 }
 
+/**
+ * The integer half of a number format, from the digit counts ODF gives.
+ *
+ * `min-integer-digits="0"` means no digit is mandatory — `#` — and one
+ * or more means that many `0`s. Grouping needs three positions before
+ * the separator, so a single mandatory digit is `#,##0` and two is
+ * `#,#00`.
+ */
+function integerPattern(minInteger: number, grouping: boolean): string {
+  if (!grouping) return minInteger <= 0 ? "#" : "0".repeat(minInteger)
+  if (minInteger <= 0) return "#,###"
+  const mandatory = "0".repeat(minInteger)
+  return minInteger >= 3 ? `#,${mandatory}` : `#,${"#".repeat(3 - minInteger)}${mandatory}`
+}
+
 function serializeDataStyleChildren(
   el: XmlElement,
-  kind: "number" | "percentage" | "currency" | "date" | "time",
+  kind: "number" | "percentage" | "currency" | "date" | "time" | "text",
   bracketDuration = false,
 ): string {
   let out = ""
@@ -166,10 +234,69 @@ function serializeDataStyleChildren(
     if (typeof child === "string") continue
     const local = child.local || child.tag
     if (local === "number") {
-      const decimals = parseInt(child.attrs["number:decimal-places"] ?? "0", 10)
+      // Reached while parsing styles.xml, before any cell data.
+      const clamp = (raw: string | undefined, fallback: number): number => {
+        if (raw === undefined) return fallback
+        const n = parseInt(raw, 10)
+        return Number.isFinite(n) ? Math.min(Math.max(n, 0), MAX_REPEAT_COUNT) : fallback
+      }
+
+      const maxDecimals = clamp(child.attrs["number:decimal-places"], 0)
+      // Absent means every decimal is shown, which is what this reader
+      // assumed before it read the attribute at all — so a file written
+      // by a tool that omits it reads exactly as it used to.
+      const minDecimals = Math.min(
+        clamp(child.attrs["number:min-decimal-places"], maxDecimals),
+        maxDecimals,
+      )
+      const minInteger = clamp(child.attrs["number:min-integer-digits"], 1)
       const grouping = child.attrs["number:grouping"] === "true"
-      const integerPart = grouping ? "#,##0" : "0"
-      out += decimals > 0 ? `${integerPart}.${"0".repeat(decimals)}` : integerPart
+
+      // `0` is a digit always shown and `#` one shown only when there is
+      // something to show, so the two counts are the difference between
+      // `0.00` and `#.##`. See #535, which recorded this as a loss.
+      out += integerPattern(minInteger, grouping)
+      if (maxDecimals > 0) {
+        out += `.${"0".repeat(minDecimals)}${"#".repeat(maxDecimals - minDecimals)}`
+      }
+    } else if (local === "scientific-number") {
+      // `<number:scientific-number number:decimal-places="2"
+      //  number:min-integer-digits="1" number:min-exponent-digits="2"/>`
+      // is Excel's `0.00E+00`. The sign is always written: ODF has no
+      // attribute for a bare `E00`, and Excel's own scientific formats
+      // all carry one.
+      const decimals = Math.min(
+        parseInt(child.attrs["number:decimal-places"] ?? "0", 10) || 0,
+        MAX_REPEAT_COUNT,
+      )
+      const integerDigits = Math.min(
+        parseInt(child.attrs["number:min-integer-digits"] ?? "1", 10) || 1,
+        MAX_REPEAT_COUNT,
+      )
+      const exponentDigits = Math.min(
+        parseInt(child.attrs["number:min-exponent-digits"] ?? "2", 10) || 2,
+        MAX_REPEAT_COUNT,
+      )
+      // `##0` is engineering notation — the exponent steps in threes so
+      // the integer part stays between 1 and 999. The interval is the
+      // width of the run; the mandatory digits sit at its right.
+      const interval = Math.min(
+        Math.max(parseInt(child.attrs["number:exponent-interval"] ?? "1", 10) || 1, 1),
+        MAX_REPEAT_COUNT,
+      )
+      const optional = Math.max(interval - integerDigits, 0)
+      // `E+` forces a sign on a positive exponent, `E-` shows one only
+      // when the exponent is negative. Absent means not forced.
+      const sign = child.attrs["number:forced-exponent-sign"] === "true" ? "+" : "-"
+
+      out +=
+        "#".repeat(optional) +
+        "0".repeat(integerDigits) +
+        (decimals > 0 ? `.${"0".repeat(decimals)}` : "") +
+        `E${sign}${"0".repeat(exponentDigits)}`
+    } else if (local === "text-content") {
+      // The placeholder for the cell's own text — Excel's `@`.
+      out += "@"
     } else if (local === "currency-symbol") {
       const text = child.children.filter((c: unknown) => typeof c === "string").join("")
       out += `"${text}"`
@@ -198,6 +325,12 @@ function serializeDataStyleChildren(
       out += child.attrs["number:style"] === "long" ? "mm" : "m"
     } else if (local === "seconds") {
       out += child.attrs["number:style"] === "long" ? "ss" : "s"
+      // `number:decimal-places` on seconds is Excel's `ss.0` / `ss.00`.
+      const places = Math.min(
+        parseInt(child.attrs["number:decimal-places"] ?? "0", 10) || 0,
+        MAX_REPEAT_COUNT,
+      )
+      if (places > 0) out += `.${"0".repeat(places)}`
     } else if (local === "am-pm") {
       out += "AM/PM"
     }
@@ -293,8 +426,10 @@ function collectText(el: XmlElement): string {
       const local = child.local || child.tag
       if (local === "s") {
         // <text:s/> or <text:s text:c="N"/> — space characters
-        const count = Number(child.attrs["text:c"] ?? "1")
-        text += " ".repeat(count > 0 ? count : 1)
+        // Free-form integer from the file — uncapped it reaches a raw
+        // RangeError, or allocates a gigabyte for one cell. See #363.
+        const count = clampRepeat(child.attrs["text:c"])
+        text += " ".repeat(count)
       } else if (local === "line-break") {
         // <text:line-break/> — newline
         text += "\n"
@@ -312,6 +447,34 @@ function collectText(el: XmlElement): string {
 
 // ── Formula Parsing ─────────────────────────────────────────────────
 
+/** A cell, whole-column or whole-row address, as it appears after the dot. */
+const ODS_ADDRESS = /^\$?(?:[A-Za-z]{1,3}(?:\$?\d+)?|\d+)$/
+
+/**
+ * Convert one side of an OpenFormula reference — everything between the
+ * brackets, or between the brackets and the `:` — to its Excel spelling.
+ * Returns `undefined` when the text is not an address, which is the signal
+ * to leave the reference alone rather than mangle it.
+ */
+function odsAddressToExcel(part: string): string | undefined {
+  // The separator is the *last* dot: a sheet name may contain one
+  // (`['Q1.2024'.A1]`), an address never does.
+  const dot = part.lastIndexOf(".")
+  if (dot < 0) return undefined
+  const address = part.slice(dot + 1)
+  if (!ODS_ADDRESS.test(address)) return undefined
+
+  let sheet = part.slice(0, dot)
+  // An external reference (`['budget.ods'#$Sheet1.A1]`) has no Excel
+  // spelling this reader can produce — leave the whole thing verbatim.
+  if (sheet.includes("#")) return undefined
+  // `$Sheet1` marks the sheet absolute; Excel has no notation for that, and
+  // a cross-sheet reference never shifts on copy anyway.
+  if (sheet.startsWith("$")) sheet = sheet.slice(1)
+
+  return sheet ? `${sheet}!${address}` : address
+}
+
 /**
  * Convert an ODS formula to Excel-style formula.
  * ODS: "of:=SUM([.A1:.A10])" → "SUM(A1:A10)"
@@ -323,13 +486,52 @@ function odsFormulaToExcel(formula: string): string {
   else if (f.startsWith("oooc:=")) f = f.slice(6)
   else if (f.startsWith("=")) f = f.slice(1)
 
-  // Convert [.A1:.B2] → A1:B2 and [.A1] → A1
-  f = f.replace(/\[\.([^\]:.]+)(?::\.([^\]]+))?\]/g, (_match, ref1: string, ref2?: string) => {
-    if (ref2) return `${ref1}:${ref2}`
-    return ref1
-  })
+  // Convert [.A1:.B2] → A1:B2, [.A1] → A1, and the cross-sheet forms
+  // LibreOffice writes — [$Sheet2.A1] / [Sheet2.A1] → Sheet2!A1,
+  // [$Sheet2.A1:.B2] → Sheet2!A1:B2. Matching on a literal `[.` (as this
+  // did) decoded only the local forms and left every cross-sheet reference
+  // in the file as raw ODF text. See #405.
+  //
+  // Split on string literals first, as the writer does, so a bracketed
+  // token inside one is left as the text it is.
+  const parts = f.split(/("(?:[^"]|"")*")/)
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) continue
+    parts[i] = parts[i]!.replace(/\[([^\]]*)\]/g, (match, body: string) => {
+      // A sheet name cannot contain `:`, so this only ever splits a range.
+      const halves = body.split(":")
+      if (halves.length > 2) return match
+      const first = odsAddressToExcel(halves[0]!)
+      if (first === undefined) return match
+      if (halves.length === 1) return first
+      const second = odsAddressToExcel(halves[1]!)
+      if (second === undefined) return match
+      return `${first}:${second}`
+    })
+  }
 
-  return f
+  return parts.join("")
+}
+
+// ── Date Parsing ────────────────────────────────────────────────────
+
+/**
+ * Parse an ODF date (`xsd:date` / `xsd:dateTime`), whose zone designator is
+ * optional.
+ *
+ * `new Date(text)` cannot be used directly: ECMAScript reads an unqualified
+ * date-*time* as local but a date-*only* string as UTC. The writer builds
+ * `office:date-value` out of UTC components, so the reader used to shift
+ * every value by the machine's offset — and because the shifted value was
+ * written back out the same way, the error accumulated with each save.
+ * Silent on a UTC machine, one day off after four round trips in Tokyo.
+ * See #415.
+ *
+ * An explicit offset (`...+02:00`, `...Z`) is what the file says and is
+ * honoured; only an unqualified time is taken to mean UTC.
+ */
+export function parseOdsDateTime(text: string): Date | undefined {
+  return parseUtcDefaultDateTime(text)
 }
 
 // ── Cell Value Parsing ──────────────────────────────────────────────
@@ -365,10 +567,7 @@ function parseCellValue(cell: XmlElement): CellValue {
 
     case "date": {
       const dateVal = cell.attrs["office:date-value"]
-      if (dateVal) {
-        const d = new Date(dateVal)
-        if (!Number.isNaN(d.getTime())) return d
-      }
+      if (dateVal) return parseOdsDateTime(dateVal) ?? null
       return null
     }
 
@@ -392,9 +591,81 @@ function parseCellValue(cell: XmlElement): CellValue {
 
 // ── Content XML Parsing ─────────────────────────────────────────────
 
-function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
+/**
+ * `<table:named-expressions>` back into {@link NamedRange}s.
+ *
+ * ODF writes a range `$Sheet1.$A$1:$Sheet1.$B$5`, both halves carrying
+ * the sheet; Excel writes `Sheet1!$A$1:$B$5` with one. A name whose
+ * address does not parse is skipped rather than surfaced half-read.
+ *
+ * `<table:named-expression>` — a formula rather than a range — has no
+ * `NamedRange` to land in and is left alone.
+ */
+/**
+ * The default cell style of each column, expanded by its repeat count.
+ *
+ * `table:default-cell-style-name` names an automatic style in
+ * `content.xml`, which this reader parses — so the format it points at is
+ * reachable. A column naming a style from `styles.xml` instead
+ * (LibreOffice writes `"Default"` on the columns it did not format)
+ * resolves to nothing, which is the right answer: that style *is* the
+ * absence of formatting, and `PARITY.md` records that `styles.xml` is not
+ * opened.
+ */
+function readColumnDefaultStyles(table: XmlElement): Array<string | undefined> {
+  const out: Array<string | undefined> = []
+  for (const column of findChildren(table, "table-column")) {
+    const style = column.attrs["table:default-cell-style-name"]
+    const repeat = Math.min(
+      Math.max(Number(column.attrs["table:number-columns-repeated"] ?? "1") || 1, 1),
+      MAX_COL_INDEX + 1,
+    )
+    for (let i = 0; i < repeat && out.length <= MAX_COL_INDEX; i++) out.push(style)
+  }
+  return out
+}
+
+function parseNamedExpressions(spreadsheet: XmlElement): NamedRange[] | undefined {
+  const block = findChild(spreadsheet, "named-expressions")
+  if (!block) return undefined
+
+  const out: NamedRange[] = []
+  for (const child of findChildren(block, "named-range")) {
+    const name = child.attrs["table:name"]
+    const address = child.attrs["table:cell-range-address"]
+    if (!name || !address) continue
+
+    const range = odsAddressToExcelRange(address)
+    if (range) out.push({ name, range })
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** `$Sheet1.$A$1:$Sheet1.$B$2` -> `Sheet1!$A$1:$B$2`, or undefined. */
+function odsAddressToExcelRange(address: string): string | undefined {
+  const half = /^\$?(?:'([^']*(?:''[^']*)*)'|([^.']+))\.(\$?[A-Z]{1,3}\$?\d+)$/
+  const [start, end] = address.split(":")
+  const a = half.exec(start ?? "")
+  if (!a) return undefined
+
+  const sheet = a[1] !== undefined ? a[1].replace(/''/g, "'") : a[2]!
+  // Quote the sheet the way Excel does when it is not a bare identifier.
+  const qualifier = /^[A-Za-z_][\w.]*$/.test(sheet) ? sheet : `'${sheet.replace(/'/g, "''")}'`
+
+  if (end === undefined) return `${qualifier}!${a[3]}`
+  const b = half.exec(end)
+  if (!b) return undefined
+  return `${qualifier}!${a[3]}:${b[3]}`
+}
+
+function parseContentXml(
+  xml: string,
+  options?: ReadOptions,
+): { sheets: Sheet[]; namedRanges?: NamedRange[] } {
   const doc = parseXml(xml)
   const sheets: Sheet[] = []
+
+  const cellLimit = options?.maxTotalCells ?? MAX_TOTAL_CELLS
 
   // Parse styles for use when readStyles is enabled
   const readStyles = options?.readStyles ?? false
@@ -402,10 +673,10 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
 
   // Navigate: document-content > body > spreadsheet > table
   const body = findChild(doc, "body")
-  if (!body) return sheets
+  if (!body) return { sheets }
 
   const spreadsheet = findChild(body, "spreadsheet")
-  if (!spreadsheet) return sheets
+  if (!spreadsheet) return { sheets }
 
   const tables = findChildren(spreadsheet, "table")
 
@@ -440,9 +711,26 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
     const cells = new Map<string, Cell>()
     const tableRows = findChildren(table, "table-row")
 
+    // LibreOffice puts a column's format on the column rather than on its
+    // cells: `<table:table-column table:default-cell-style-name="ce1"/>`,
+    // where `ce1` names the data style. A date column's `yyyy-mm-dd` lives
+    // there and nowhere else, so a document read without this came back
+    // with its values and none of its formats. See #464.
+    const columnDefaultStyles = readColumnDefaultStyles(table)
+
     let currentRow = 0
+    let pendingEmptyRows = 0
+
+    // `maxRows` and `range` are on the shared `ReadOptions`, whose doc makes
+    // no format-specific claim — but this reader used to read neither, so a
+    // caller bounding a large ODS file got the whole thing and no warning.
+    // See #439 §U. `maxRows` stops the walk; `range` masks afterwards,
+    // matching what readXlsx returns for the same option.
+    const maxRowsLimit = options?.maxRows ?? 0 // 0 = unlimited
+    const rangeFilter = options?.range ? parseRange(options.range) : undefined
 
     for (const tableRow of tableRows) {
+      if (maxRowsLimit > 0 && rows.length >= maxRowsLimit) break
       const rowRepeat = Number(tableRow.attrs["table:number-rows-repeated"] ?? "1")
 
       // Collect cell entries with their repeat counts first,
@@ -458,6 +746,10 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
         hyperlink?: Hyperlink
       }> = []
 
+      // Which column the next entry starts at, so a cell that names no
+      // style can be given its column's default.
+      let colIndex = 0
+
       for (const child of tableRow.children) {
         if (typeof child === "string") continue
         const local = child.local || child.tag
@@ -467,7 +759,9 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
           const colSpan = Number(child.attrs["table:number-columns-spanned"] ?? "1")
           const rowSpan = Number(child.attrs["table:number-rows-spanned"] ?? "1")
           const value = parseCellValue(child)
-          const styleName = child.attrs["table:style-name"]
+          // A cell's own style wins; the column's default only fills in
+          // for cells that named none.
+          const styleName = child.attrs["table:style-name"] ?? columnDefaultStyles[colIndex]
           const formulaAttr = child.attrs["table:formula"]
           const formula = formulaAttr ? odsFormulaToExcel(formulaAttr) : undefined
           const { hyperlink } = extractTextAndHyperlink(child)
@@ -481,6 +775,7 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
             formula,
             hyperlink,
           })
+          colIndex += Number.isFinite(colRepeat) && colRepeat > 0 ? colRepeat : 1
         } else if (local === "covered-table-cell") {
           const colRepeat = Number(child.attrs["table:number-columns-repeated"] ?? "1")
           cellEntries.push({
@@ -490,19 +785,30 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
             rowSpan: 1,
             isCovered: true,
           })
+          // A covered cell still occupies its columns, so the count has
+          // to advance or every default after a merge lands one column
+          // to the left.
+          colIndex += Number.isFinite(colRepeat) && colRepeat > 0 ? colRepeat : 1
         }
       }
 
-      // Trim trailing null/empty entries (avoids expanding huge repeat counts like 16384)
-      while (
-        cellEntries.length > 0 &&
-        cellEntries[cellEntries.length - 1].value === null &&
-        cellEntries[cellEntries.length - 1].colSpan === 1 &&
-        cellEntries[cellEntries.length - 1].rowSpan === 1 &&
-        !cellEntries[cellEntries.length - 1].styleName &&
-        !cellEntries[cellEntries.length - 1].formula &&
-        !cellEntries[cellEntries.length - 1].hyperlink
-      ) {
+      // A style name carries data only when the caller asked for styles
+      // and this reader can resolve it. LibreOffice ends every row with
+      // a default-styled cell repeated to column 16,384; keeping that
+      // unknown style turns five values into 16,384 cells. See #464.
+      while (cellEntries.length > 0) {
+        const last = cellEntries[cellEntries.length - 1]!
+        const hasStyle = readStyles && last.styleName && styleDefs.has(last.styleName)
+        if (
+          last.value !== null ||
+          last.colSpan !== 1 ||
+          last.rowSpan !== 1 ||
+          hasStyle ||
+          last.formula ||
+          last.hyperlink
+        ) {
+          break
+        }
         cellEntries.pop()
       }
 
@@ -572,12 +878,51 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
         }
       }
 
-      // Cap row repeats for empty rows to avoid memory issues
-      // (LibreOffice may emit large row repeats for trailing empty rows).
-      // For non-empty rows, a hostile file can set a huge number-rows-repeated
-      // on a one-cell row to force millions of allocations — clamp to Excel's
-      // row limit.
-      const effectiveRowRepeat = rowData.length > 0 ? Math.min(rowRepeat, MAX_ROW_INDEX + 1) : 0
+      if (rowData.length === 0) {
+        // An empty row is held back rather than pushed. Whether it is data
+        // depends on what comes after it: an interior one carries position
+        // and has to survive, while the run LibreOffice pads the end of a
+        // sheet with — one row repeated a million times — is not. Deciding
+        // that here would need lookahead; deferring costs nothing and keeps
+        // the trailing run from ever being allocated. See #394.
+        // A malformed repeat parses to NaN, and the populated path drops
+        // such a row outright (Math.min(NaN, …) is NaN, so its loop never
+        // runs) — keep NaN out of the accumulator rather than letting it
+        // poison every later flush.
+        if (rowRepeat > 0) pendingEmptyRows += rowRepeat
+        // The row counter still advances: merges and `cells` are keyed off
+        // it, so it has to track the file's own row numbering either way.
+        currentRow += rowRepeat
+        continue
+      }
+
+      // A populated row makes every held-back empty row an interior one, so
+      // flush them at the positions the file gave them. They carry no cells,
+      // which puts them outside the MAX_TOTAL_CELLS guard below — bound them
+      // by the sheet's row limit instead, or a file of nothing but huge
+      // repeated empty rows would allocate without limit.
+      if (pendingEmptyRows > 0) {
+        const flush = Math.min(pendingEmptyRows, MAX_ROW_INDEX + 1 - rows.length)
+        for (let r = 0; r < flush; r++) {
+          rows.push([])
+        }
+        pendingEmptyRows = 0
+      }
+
+      // A hostile file can set a huge number-rows-repeated on a one-cell row
+      // to force millions of allocations — clamp to Excel's row limit.
+      const effectiveRowRepeat = Math.min(rowRepeat, MAX_ROW_INDEX + 1)
+
+      // Each repeat attribute is capped on its own, but the aggregate is
+      // not: one row of 16,384 cells repeated 1,048,576 times is 1.7e10
+      // slots from a couple hundred bytes of content.xml. See #363.
+      const projected = (rows.length + effectiveRowRepeat) * rowData.length
+      if (projected > cellLimit) {
+        throw new ParseError(
+          `Sheet spans ${projected} cells, over the ${cellLimit} limit. ` +
+            "Raise `maxTotalCells` if the sheet really is this large.",
+        )
+      }
 
       for (let r = 0; r < effectiveRowRepeat; r++) {
         rows.push(effectiveRowRepeat === 1 && r === 0 ? rowData : [...rowData])
@@ -587,16 +932,33 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
         }
         currentRow++
       }
-
-      if (effectiveRowRepeat === 0) {
-        // Still advance row counter for empty repeated rows
-        currentRow += rowRepeat
-      }
     }
 
-    // Trim trailing empty rows
+    // Trim trailing empty rows. The walk above no longer pushes any (a run
+    // of empty rows is only flushed once a populated row follows it), so
+    // this is a backstop rather than the mechanism.
     while (rows.length > 0 && rows[rows.length - 1].length === 0) {
       rows.pop()
+    }
+
+    // `maxRows` can overshoot by the tail of a repeated row, since a single
+    // <table-row table:number-rows-repeated="N"> expands after the check.
+    if (maxRowsLimit > 0 && rows.length > maxRowsLimit) rows.length = maxRowsLimit
+
+    // `range` masks rather than drops, so column indexes stay stable and a
+    // row outside the span is present and empty — the same shape readXlsx
+    // returns for the same option.
+    if (rangeFilter) {
+      for (let r = 0; r < rows.length; r++) {
+        const row = rows[r]!
+        const inRowSpan = r >= rangeFilter.startRow && r <= rangeFilter.endRow
+        for (let c = 0; c < row.length; c++) {
+          if (!inRowSpan || c < rangeFilter.startCol || c > rangeFilter.endCol) {
+            row[c] = null
+            cells.delete(`${r},${c}`)
+          }
+        }
+      }
     }
 
     const sheet: Sheet = { name, rows }
@@ -615,7 +977,7 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
   // If filter was applied, remove placeholder sheets with empty rows
   if (options?.sheets !== undefined) {
     const filter = options.sheets
-    return sheets.filter((s, idx) => {
+    const kept = sheets.filter((s, idx) => {
       if (s.rows.length > 0 || s.merges !== undefined || s.cells !== undefined) {
         return true
       }
@@ -629,9 +991,14 @@ function parseContentXml(xml: string, options?: ReadOptions): Sheet[] {
         return false
       })
     })
+    // The filter drops sheets, not names: a range naming a sheet the
+    // caller did not ask for still describes the document.
+    const filteredNames = parseNamedExpressions(spreadsheet)
+    return filteredNames ? { sheets: kept, namedRanges: filteredNames } : { sheets: kept }
   }
 
-  return sheets
+  const namedRanges = parseNamedExpressions(spreadsheet)
+  return namedRanges ? { sheets, namedRanges } : { sheets }
 }
 
 // ── Meta XML Parsing ────────────────────────────────────────────────
@@ -667,14 +1034,16 @@ function parseMetaXml(xml: string): Partial<WorkbookProperties> {
         break
       case "creation-date":
         if (text) {
-          const d = new Date(text)
-          if (!Number.isNaN(d.getTime())) props.created = d
+          // LibreOffice writes these without a zone designator, so they
+          // need the same UTC reading as office:date-value. See #415.
+          const d = parseOdsDateTime(text)
+          if (d) props.created = d
         }
         break
       case "date":
         if (text) {
-          const d = new Date(text)
-          if (!Number.isNaN(d.getTime())) props.modified = d
+          const d = parseOdsDateTime(text)
+          if (d) props.modified = d
         }
         break
     }
@@ -693,7 +1062,7 @@ function parseMetaXml(xml: string): Partial<WorkbookProperties> {
  * because the ZIP central directory lives at the end of the archive.
  */
 export async function readOds(input: ReadInput, options?: ReadOptions): Promise<Workbook> {
-  const data = await readInputToUint8Array(input)
+  const data = await readInputToUint8Array(input, options?.maxInputBytes)
 
   // ODF supports password-encrypted documents via the same OLE2 / CFB
   // envelope Office uses for XLSX. Catch it before the ZIP reader does
@@ -704,7 +1073,7 @@ export async function readOds(input: ReadInput, options?: ReadOptions): Promise<
   // 1. Open ZIP archive
   let zip: ZipReader
   try {
-    zip = new ZipReader(data)
+    zip = new ZipReader(data, options?.maxDecompressedBytes)
   } catch (err) {
     if (err instanceof ZipError) throw err
     throw new ParseError("Failed to open ODS file: not a valid ZIP archive", undefined, {
@@ -730,13 +1099,13 @@ export async function readOds(input: ReadInput, options?: ReadOptions): Promise<
   if (!zip.has("content.xml")) {
     throw new ParseError("Invalid ODS: missing content.xml")
   }
-  const contentXml = decodeUtf8(await zip.extract("content.xml"))
-  const sheets = parseContentXml(contentXml, options)
+  const contentXml = decodeUtf8(await zip.extract("content.xml"), "content.xml")
+  const { sheets, namedRanges } = parseContentXml(contentXml, options)
 
   // 4. Parse meta.xml (optional)
   let properties: WorkbookProperties | undefined
   if (zip.has("meta.xml")) {
-    const metaXml = decodeUtf8(await zip.extract("meta.xml"))
+    const metaXml = decodeUtf8(await zip.extract("meta.xml"), "meta.xml")
     const metaProps = parseMetaXml(metaXml)
     if (Object.keys(metaProps).length > 0) {
       properties = { ...metaProps }
@@ -746,6 +1115,10 @@ export async function readOds(input: ReadInput, options?: ReadOptions): Promise<
   // 5. Build workbook
   const workbook: Workbook = {
     sheets,
+  }
+
+  if (namedRanges) {
+    workbook.namedRanges = namedRanges
   }
 
   if (properties) {

@@ -18,12 +18,25 @@ const crcTable = /* @__PURE__ */ (() => {
   return table
 })()
 
-export function crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
+/** Seed value for an incremental CRC-32 run. */
+export const CRC32_INIT = 0xffffffff
+
+/** Fold one more chunk into a running CRC-32 state. */
+export function crc32Update(state: number, data: Uint8Array): number {
+  let crc = state
   for (let i = 0; i < data.length; i++) {
     crc = crcTable[(crc ^ data[i]) & 0xff] ^ (crc >>> 8)
   }
-  return (crc ^ 0xffffffff) >>> 0
+  return crc >>> 0
+}
+
+/** Turn a running CRC-32 state into the final checksum. */
+export function crc32Final(state: number): number {
+  return (state ^ 0xffffffff) >>> 0
+}
+
+export function crc32(data: Uint8Array): number {
+  return crc32Final(crc32Update(CRC32_INIT, data))
 }
 
 // ── Bit Reader (for inflate) ────────────────────────────────────────
@@ -38,7 +51,7 @@ class BitReader {
   readBits(n: number): number {
     while (this.bitCount < n) {
       if (this.pos >= this.data.length) {
-        throw new Error("Unexpected end of DEFLATE data")
+        throw new ZipError("Unexpected end of DEFLATE data")
       }
       this.bitBuf |= this.data[this.pos++] << this.bitCount
       this.bitCount += 8
@@ -57,7 +70,7 @@ class BitReader {
 
   readByte(): number {
     if (this.pos >= this.data.length) {
-      throw new Error("Unexpected end of DEFLATE data")
+      throw new ZipError("Unexpected end of DEFLATE data")
     }
     return this.data[this.pos++]
   }
@@ -132,7 +145,7 @@ function decodeSymbol(reader: BitReader, tree: HuffmanTree): number {
     code <<= 1
   }
 
-  throw new Error("Invalid Huffman code")
+  throw new ZipError("Invalid Huffman code")
 }
 
 // ── Fixed Huffman Tables (RFC 1951 Section 3.2.6) ───────────────────
@@ -316,7 +329,7 @@ export function inflate(data: Uint8Array, maxBytes: number = MAX_DECOMPRESSED_BY
 
       inflateBlock(litLenTree, distTree)
     } else {
-      throw new Error(`Invalid DEFLATE block type: ${btype}`)
+      throw new ZipError(`Invalid DEFLATE block type: ${btype}`)
     }
   } while (bfinal === 0)
 

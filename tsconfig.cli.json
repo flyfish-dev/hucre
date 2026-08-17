@@ -1,0 +1,37 @@
+{
+  // The files allowed node's ambient types. The CLI is the main occupant,
+  // hence the name, plus the handful of tests that read from disk.
+  //
+  // The CLI used to be excluded from typechecking altogether — `src/cli.ts`
+  // sat in tsconfig.json's `exclude` list, so the one part of hucre that
+  // ships as an executable was the one part `tsc` never looked at. That
+  // is how #357 (a published binary that could not start) got through.
+  // Splitting it into its own project restores the check without letting
+  // `process` and `Buffer` leak into the platform-neutral library.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // The CLI is bundled with `dts: false` — nothing ever emits declarations
+    // for it — so the isolated-declarations rule the library is held to
+    // (see tsconfig.json) would only be annotation busywork here.
+    "isolatedDeclarations": false
+  },
+  "include": [
+    "src/cli.ts",
+    "src/cli",
+    "test/cli.test.ts",
+    "test/threaded-comments-write.test.ts",
+    "test/ods-fidelity.test.ts",
+    "test/parity-statement.test.ts",
+    "test/real-files.test.ts",
+    "test/ods-third-party.test.ts",
+    "test/worksheet-stream-chunks.test.ts",
+    "test/xlsb-short-records.test.ts",
+    "test/xlsx-stream-parity.test.ts",
+    "test/indexed-color-palette.test.ts",
+    "test/ods-column-default-style.test.ts",
+    "test/write-model.test.ts",
+    "test/builder-coverage.test.ts"
+  ],
+  "exclude": []
+}

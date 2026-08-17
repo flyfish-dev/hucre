@@ -27,20 +27,7 @@ import type {
 } from "./types"
 import type { XmlElement } from "../../xml/parser"
 import { xmlElement, xmlSelfClose } from "../../xml/writer"
-
-/**
- * Local copy of `findChild`. The xml/parser module does not export the
- * helper, and the chart-reader / chart-clone files each carry their
- * own copy. Keeping a local definition here avoids a cross-module
- * refactor of the parser surface while still letting these primitives
- * walk a chart subtree.
- */
-function findChild(el: XmlElement, localName: string): XmlElement | undefined {
-  for (const c of el.children) {
-    if (typeof c !== "string" && c.local === localName) return c
-  }
-  return undefined
-}
+import { findChild } from "./util"
 
 // ── Stroke width ──────────────────────────────────────────────────
 //
@@ -235,7 +222,7 @@ export function parseBorderCompoundFromSpPr(parent: XmlElement): ChartLineCompou
  * Recognized values of {@link ChartThemeColorName} — the OOXML
  * `ST_SchemeColorVal` enum on `<a:schemeClr val="..."/>`.
  */
-export const VALID_THEME_COLOR_NAMES: ReadonlySet<ChartThemeColorName> = new Set([
+const VALID_THEME_COLOR_NAMES: ReadonlySet<ChartThemeColorName> = new Set([
   "bg1",
   "tx1",
   "bg2",
@@ -385,13 +372,6 @@ export function buildColorElement(value: ChartColor): string {
     return xmlSelfClose("a:schemeClr", { val: value.theme })
   }
   return xmlElement("a:schemeClr", { val: value.theme }, children)
-}
-
-/**
- * Build a `<a:solidFill>` block wrapping the supplied color reference.
- */
-export function buildSolidFill(value: ChartColor): string {
-  return xmlElement("a:solidFill", undefined, [buildColorElement(value)])
 }
 
 /**

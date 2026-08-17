@@ -24,20 +24,103 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Node 24 is the floor — see CLAUDE.md. `lts/*` is kept alongside
+        # the pinned version so a new LTS shows up here rather than in
+        # someone's install.
+        node: [24, lts/*]
+    name: node ${{ matrix.node }}
     steps:
       - uses: actions/checkout@v5
       - run: corepack enable
       - uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version: ${{ matrix.node }}
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Lint
-        run: pnpm lint
-      - name: Typecheck
-        run: pnpm typecheck
+      # `pnpm test` is lint + typecheck + vitest, so running the first two
+      # again here would double every job's work for nothing.
       - name: Test
         run: pnpm test
       - name: Build
         run: pnpm build
+      - name: Verify packaged artifact
+        run: node scripts/verify-package.mjs
+
+  budgets:
+    # Two numbers that were true and enforced by nothing: 98.8% coverage,
+    # and a bundle size the README only ever compared *against* a
+    # competitor without publishing. Either can slide a release at a time
+    # until someone notices. One job, no matrix — these do not vary by
+    # runtime. See #474.
+    runs-on: ubuntu-latest
+    name: coverage + size
+    steps:
+      - uses: actions/checkout@v5
+      - run: corepack enable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Coverage thresholds
+        run: pnpm coverage
+      - name: Bundle-size budget
+        run: pnpm size
+
+  timezone:
+    # Everything above runs in UTC, which is where a whole class of date bug
+    # hides: #415 was silent in CI for exactly that reason, and the CSV
+    # dateFormat defect in #439 Part 8 was too. One non-UTC job closes it.
+    runs-on: ubuntu-latest
+    name: node lts (TZ=Asia/Tokyo)
+    env:
+      TZ: Asia/Tokyo
+    steps:
+      - uses: actions/checkout@v5
+      - run: corepack enable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  runtime:
+    # Does the *shipped* artifact run where the README says it does?
+    #
+    # Separate from `build` because what users install is dist/, not the
+    # dev setup — and because Bun and Deno are advertised and were never
+    # exercised. Node itself is covered by the matrix above.
+    runs-on: ubuntu-latest
+    name: runtime ${{ matrix.runtime }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [bun, deno]
+    steps:
+      - uses: actions/checkout@v5
+      - run: corepack enable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+      - if: matrix.runtime == 'deno'
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # A smoke test, not the suite: vitest is a Node harness, and the
+      # question here is whether dist/ loads and works on this runtime.
+      - if: matrix.runtime == 'bun'
+        run: bun scripts/smoke.mjs
+      - if: matrix.runtime == 'deno'
+        run: deno run --allow-read scripts/smoke.mjs

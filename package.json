@@ -1,6 +1,6 @@
 {
   "name": "hucre",
-  "version": "0.6.2",
+  "version": "1.1.0",
   "description": "Zero-dependency spreadsheet engine. Read & write XLSX, CSV, ODS. Schema validation, streaming, tree-shakeable. Pure TypeScript, works everywhere.",
   "keywords": [
     "csv",
@@ -35,9 +35,12 @@
     "hucre": "./dist/cli.mjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "MIGRATION.md",
+    "docs/PARITY.md"
   ],
   "type": "module",
+  "sideEffects": false,
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
@@ -72,30 +75,43 @@
     "./xml": {
       "types": "./dist/xml.d.mts",
       "default": "./dist/xml.mjs"
+    },
+    "./ooxml": {
+      "types": "./dist/ooxml.d.mts",
+      "default": "./dist/ooxml.mjs"
     }
   },
   "scripts": {
+    "bench": "node bench/index.mjs",
     "build": "obuild",
+    "verify:package": "pnpm build && node scripts/verify-package.mjs",
+    "coverage": "vitest run --coverage",
+    "size": "pnpm build && node scripts/size.mjs",
+    "size:update": "pnpm build && node scripts/size.mjs --update",
     "dev": "vitest",
     "lint": "oxlint . && oxfmt --check .",
     "lint:fix": "oxlint . --fix && oxfmt .",
     "fmt": "oxfmt .",
     "test": "pnpm lint && pnpm typecheck && vitest run",
-    "typecheck": "tsgo --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.cli.json",
     "release": "pnpm test && pnpm build && bumpp --commit --tag --push --all",
     "prepack": "pnpm build"
   },
   "devDependencies": {
-    "@typescript/native-preview": "7.0.0-dev.20260316.1",
+    "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.10",
-    "bumpp": "^12.0.0",
+    "bumpp": "^12.1.1",
     "citty": "^0.2.2",
     "consola": "^3.4.2",
     "obuild": "^0.4.38",
-    "oxfmt": "^0.59.0",
-    "oxlint": "^1.74.0",
+    "oxfmt": "^0.61.0",
+    "oxlint": "^1.76.0",
+    "rolldown": "^1.2.3",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=24"
   },
   "packageManager": "pnpm@11.15.1"
 }

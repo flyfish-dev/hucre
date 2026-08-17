@@ -1,14 +1,50 @@
 // ── JSON Writer ──────────────────────────────────────────────────────
 
 import type { CellValue, Workbook } from "../_types"
+import { unflattenRow } from "./unflatten"
 
+/**
+ * `Date` values always serialize as ISO strings.
+ *
+ * There used to be an `isoDates` option here, and it never did anything:
+ * `JSON.stringify` calls `Date.prototype.toJSON` *before* consulting the
+ * replacer, so a replacer testing `value instanceof Date` is never
+ * reached. `isoDates: false` produced byte-identical output. Removed
+ * before v1 rather than frozen — and there is no honest alternative
+ * behaviour to give it, since JSON cannot carry a Date at all.
+ */
 export interface JsonWriteOptions {
   /** Pretty-print with 2-space indent. Default: false. */
   pretty?: boolean
   /** Indent string when `pretty` is true. Default: "  ". */
   indent?: string
-  /** Convert `Date` cells to ISO strings. Default: true. */
-  isoDates?: boolean
+  /**
+   * Rebuild dot-path keys into nested objects — the inverse of the reader's
+   * `flatten`. Default: **false**.
+   *
+   * Opt-in, not the default, and the asymmetry is on purpose. `writeJson`
+   * takes any flat row set, most of which never went through `flatten`: a
+   * CSV read, a sheet read, a hand-built array. Spreadsheet headers contain
+   * dots routinely — `Q1.2024`, `v1.2`, `Rate.%` — and turning those into
+   * nested objects by default would be a new silent mangling introduced by
+   * the fix for a silent mangling. It also cannot be proven safe from the
+   * flat data alone, because `flatten` does not escape dots that were
+   * already in a key.
+   *
+   * Turn it on when you flattened on the way in and want the nesting back:
+   * `writeJson(parseJson(text).data, { unflatten: true })`.
+   *
+   * See {@link unflattenRow} for the collision and numeric-segment rules.
+   */
+  unflatten?: boolean
+}
+
+/** Apply the `unflatten` option, or hand the rows straight through. */
+function prepare(
+  data: Record<string, CellValue>[],
+  options?: JsonWriteOptions,
+): readonly unknown[] {
+  return options?.unflatten ? data.map(unflattenRow) : data
 }
 
 /**
@@ -17,8 +53,7 @@ export interface JsonWriteOptions {
 export function writeJson(data: Record<string, CellValue>[], options?: JsonWriteOptions): string {
   const pretty = options?.pretty ?? false
   const indent = options?.indent ?? "  "
-  const isoDates = options?.isoDates ?? true
-  return JSON.stringify(data, isoDates ? dateReplacer : undefined, pretty ? indent : undefined)
+  return JSON.stringify(prepare(data, options), undefined, pretty ? indent : undefined)
 }
 
 /**
@@ -27,27 +62,40 @@ export function writeJson(data: Record<string, CellValue>[], options?: JsonWrite
  */
 export function writeNdjson(
   data: Record<string, CellValue>[],
-  options?: { isoDates?: boolean },
+  options?: Pick<JsonWriteOptions, "unflatten">,
 ): string {
-  const isoDates = options?.isoDates ?? true
   if (data.length === 0) return ""
-  const replacer = isoDates ? dateReplacer : undefined
-  return data.map((row) => JSON.stringify(row, replacer)).join("\n") + "\n"
+  return (
+    prepare(data, options)
+      .map((row) => JSON.stringify(row))
+      .join("\n") + "\n"
+  )
 }
 
 /**
  * Convert a Workbook (e.g. from `readXlsx`) to a JSON string.
  *
- * - Single-sheet workbooks: emit `data` as `[{...}, ...]`
- * - Multi-sheet workbooks: emit `{ "Sheet1": [...], "Sheet2": [...] }`
- *
- * Use `sheet` to pick a specific sheet by index or name.
+ * Use `sheet` to pick a specific sheet by index or name, and `shape` to
+ * decide whether the output shape may depend on how many sheets there are.
  */
 export interface WorkbookToJsonOptions extends JsonWriteOptions {
-  /** Sheet to emit. If omitted, all sheets are emitted as an object. */
+  /** Sheet to emit. If omitted, all sheets are emitted. */
   sheet?: number | string
   /** 0-based header row index. Default: 0. */
   headerRow?: number
+  /**
+   * Output shape when no `sheet` is picked. Default: `"auto"`.
+   *
+   * - `"auto"` — a one-sheet workbook emits a bare `[{...}]`; any other count
+   *   emits `{ "Sheet1": [...], "Sheet2": [...] }`. Convenient, but the shape
+   *   is a function of the *data*, so a consumer written against a one-sheet
+   *   export breaks the day a second sheet appears.
+   * - `"sheets"` — always the keyed object, whatever the sheet count. Pick
+   *   this when something downstream has to parse the result.
+   *
+   * `jsonToWorkbook` reads both.
+   */
+  shape?: "auto" | "sheets"
 }
 
 export function workbookToJson(wb: Workbook, options?: WorkbookToJsonOptions): string {
@@ -68,19 +116,22 @@ export function workbookToJson(wb: Workbook, options?: WorkbookToJsonOptions): s
     return writeJson(sheetToRowObjects(sheet.rows, headerRow), options)
   }
 
-  if (wb.sheets.length === 1) {
+  if ((options?.shape ?? "auto") === "auto" && wb.sheets.length === 1) {
     return writeJson(sheetToRowObjects(wb.sheets[0]!.rows, headerRow), options)
   }
 
-  const all: Record<string, Record<string, CellValue>[]> = {}
+  // Null-prototype for the same reason flatten.ts uses one: a sheet may
+  // legally be named `__proto__`, and on a plain object that key hits the
+  // prototype setter and the sheet vanishes from the output entirely.
+  const all: Record<string, unknown[]> = Object.create(null)
   for (const sheet of wb.sheets) {
-    all[sheet.name] = sheetToRowObjects(sheet.rows, headerRow)
+    const rows = sheetToRowObjects(sheet.rows, headerRow)
+    all[sheet.name] = options?.unflatten ? rows.map(unflattenRow) : rows
   }
 
   const pretty = options?.pretty ?? false
   const indent = options?.indent ?? "  "
-  const isoDates = options?.isoDates ?? true
-  return JSON.stringify(all, isoDates ? dateReplacer : undefined, pretty ? indent : undefined)
+  return JSON.stringify(all, undefined, pretty ? indent : undefined)
 }
 
 function sheetToRowObjects(rows: CellValue[][], headerRowIdx: number): Record<string, CellValue>[] {
@@ -98,9 +149,4 @@ function sheetToRowObjects(rows: CellValue[][], headerRowIdx: number): Record<st
     result.push(obj)
   }
   return result
-}
-
-function dateReplacer(_key: string, value: unknown): unknown {
-  if (value instanceof Date) return value.toISOString()
-  return value
 }
