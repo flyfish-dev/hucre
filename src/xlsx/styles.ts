@@ -59,7 +59,7 @@ export interface CellXf {
 
 // ── Built-in Number Formats ──────────────────────────────────────────
 
-const BUILTIN_NUM_FMTS: Record<number, string> = {
+export const BUILTIN_NUM_FMTS: Record<number, string> = {
   0: "General",
   1: "0",
   2: "0.00",

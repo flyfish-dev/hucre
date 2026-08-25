@@ -13,7 +13,11 @@
       "freeze": null,
       "hiddenRows": [],
       "hiddenColumns": [],
-      "styles": {},
+      "styles": {
+        "C2": "numFmt(yyyy\\-mm\\-dd)",
+        "C3": "numFmt(yyyy\\-mm\\-dd)",
+        "C4": "numFmt(yyyy\\-mm\\-dd)"
+      },
       "columnStyles": {},
       "conditional": [],
       "pageSetup": null,

@@ -39,10 +39,18 @@ const rkInt = (v: number): number[] => u32(((v << 2) | 2) >>> 0)
 const SID = {
   FORMULA: 0x0006,
   EOF: 0x000a,
+  FONT: 0x0031,
+  DEFCOLWIDTH: 0x0055,
+  COLINFO: 0x007d,
   DATEMODE: 0x0022,
+  PALETTE: 0x0092,
+  STANDARDWIDTH: 0x0099,
+  BLANK: 0x0201,
+  DIMENSIONS: 0x0200,
   NUMBER: 0x0203,
   LABEL: 0x0204,
   BOOLERR: 0x0205,
+  ROW: 0x0208,
   RK: 0x027e,
   MULRK: 0x00bd,
   LABELSST: 0x00fd,
@@ -50,6 +58,7 @@ const SID = {
   XF: 0x00e0,
   BOUNDSHEET: 0x0085,
   MERGECELLS: 0x00e5,
+  DEFAULTROWHEIGHT: 0x0225,
   BOF: 0x0809,
 }
 
@@ -115,6 +124,78 @@ function buildXls(opts: { dateFmtId?: number } = {}): Uint8Array {
   return writeCfb([{ name: "Workbook", data: workbookStream }])
 }
 
+function buildStyledXls(): Uint8Array {
+  const font = (name: string, heightTwips: number, color: number, weight: number): number[] =>
+    record(SID.FONT, [
+      ...u16(heightTwips),
+      ...u16(0),
+      ...u16(color),
+      ...u16(weight),
+      ...u16(0),
+      0,
+      2,
+      0,
+      0,
+      ...shortStr(name),
+    ])
+  const xf = (
+    fontIndex: number,
+    alignment: number,
+    border1: number,
+    border2: number,
+    pattern: number,
+  ): number[] =>
+    record(SID.XF, [
+      ...u16(fontIndex),
+      ...u16(0),
+      ...u16(1),
+      alignment,
+      0,
+      0,
+      0x78,
+      ...u32(border1),
+      ...u32(border2),
+      ...u16(pattern),
+    ])
+
+  const sheet = concat([
+    bof(0x0010),
+    record(SID.DEFAULTROWHEIGHT, [...u16(0), ...u16(285)]),
+    record(SID.DEFCOLWIDTH, u16(8)),
+    record(SID.STANDARDWIDTH, u16(9 * 256)),
+    record(SID.COLINFO, [
+      ...u16(0),
+      ...u16(0),
+      ...u16(20.5 * 256),
+      ...u16(1),
+      ...u16(0x0002),
+      ...u16(0),
+    ]),
+    record(SID.DIMENSIONS, [...u32(0), ...u32(1), ...u16(0), ...u16(2), ...u16(0)]),
+    record(SID.ROW, [...u16(0), ...u16(0), ...u16(2), ...u16(600), ...u32(0), ...u32(0x0040)]),
+    record(SID.LABELSST, [...u16(0), ...u16(0), ...u16(1), ...u32(0)]),
+    record(SID.BLANK, [...u16(0), ...u16(1), ...u16(1)]),
+    eof(),
+  ])
+
+  const makeGlobals = (sheetPos: number): Uint8Array =>
+    concat([
+      bof(0x0005),
+      font("Default", 220, 0x7fff, 400),
+      font("Demo", 280, 8, 700),
+      xf(0, 0x20, 0, 0, 0x20c0),
+      // Center + vertical center + wrap, thin borders, solid custom palette fill.
+      xf(1, 0x1a, 0x20401111, 0x04002040, 0x2008),
+      record(SID.PALETTE, [...u16(1), 0x12, 0x34, 0x56, 0]),
+      sstRecord(["Styled"]),
+      record(SID.BOUNDSHEET, [...u32(sheetPos), 0, 0, ...shortStr("Styled")]),
+      eof(),
+    ])
+
+  const globalsLength = makeGlobals(0).length
+  return writeCfb([{ name: "Workbook", data: concat([makeGlobals(globalsLength), sheet]) }])
+}
+
 describe("XLS (BIFF8) reader", () => {
   it("decodes SST labels, RK, MULRK, numbers, bools, errors, dates, and merges", async () => {
     const wb = await readXls(buildXls())
@@ -166,6 +247,31 @@ describe("XLS (BIFF8) reader", () => {
     const wb = await read(buildXls())
     expect(wb.sheets[0].rows[1][0]).toBe("Ada")
     expect(wb.sheets[0].rows[1][1]).toBe(95)
+  })
+
+  it("preserves BIFF column widths, row heights, style-only cells, and cell formatting", async () => {
+    const workbook = await readXls(buildStyledXls(), { readStyles: true })
+    const sheet = workbook.sheets[0]!
+
+    expect(sheet.sheetFormat).toMatchObject({ defaultRowHeight: 14.25, defaultColWidth: 9 })
+    expect(sheet.columns?.[0]).toMatchObject({ width: 20.5 })
+    expect(sheet.rowDefs?.get(0)).toMatchObject({ height: 30, customHeight: true })
+    expect(sheet.cells?.get("0,0")).toMatchObject({
+      value: "Styled",
+      type: "string",
+      style: {
+        font: { name: "Demo", size: 14, bold: true, color: { rgb: "123456" } },
+        fill: { type: "pattern", pattern: "solid", fgColor: { rgb: "123456" } },
+        border: {
+          left: { style: "thin" },
+          right: { style: "thin" },
+          top: { style: "thin" },
+          bottom: { style: "thin" },
+        },
+        alignment: { horizontal: "center", vertical: "center", wrapText: true },
+      },
+    })
+    expect(sheet.cells?.get("0,1")).toMatchObject({ value: null, type: "empty" })
   })
 
   it("accepts BIFF5/7 (0x0500) workbooks through the extended reader", async () => {
