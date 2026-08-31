@@ -196,6 +196,54 @@ function buildStyledXls(): Uint8Array {
   return writeCfb([{ name: "Workbook", data: concat([makeGlobals(globalsLength), sheet]) }])
 }
 
+function buildRichTextXls(): Uint8Array {
+  const font = (name: string, color: number): number[] =>
+    record(SID.FONT, [
+      ...u16(220),
+      ...u16(0),
+      ...u16(color),
+      ...u16(400),
+      ...u16(0),
+      0,
+      2,
+      0,
+      0,
+      ...shortStr(name),
+    ])
+  const text = "BlackRed"
+  const richSst = record(SID.SST, [
+    ...u32(1),
+    ...u32(1),
+    ...u16(text.length),
+    0x08,
+    ...u16(2),
+    ...[...text].map((character) => character.charCodeAt(0)),
+    ...u16(0),
+    ...u16(0),
+    ...u16(5),
+    ...u16(1),
+  ])
+  const sheet = concat([
+    bof(0x0010),
+    record(SID.LABELSST, [...u16(0), ...u16(0), ...u16(0), ...u32(0)]),
+    eof(),
+  ])
+  const makeGlobals = (sheetPos: number): Uint8Array =>
+    concat([
+      bof(0x0005),
+      font("Default", 0x7fff),
+      font("Accent", 8),
+      record(SID.XF, [...u16(0), ...u16(0), ...Array.from({ length: 16 }, () => 0)]),
+      record(SID.PALETTE, [...u16(1), 0xaa, 0x11, 0x22, 0]),
+      richSst,
+      record(SID.BOUNDSHEET, [...u32(sheetPos), 0, 0, ...shortStr("Rich")]),
+      eof(),
+    ])
+
+  const globalsLength = makeGlobals(0).length
+  return writeCfb([{ name: "Workbook", data: concat([makeGlobals(globalsLength), sheet]) }])
+}
+
 describe("XLS (BIFF8) reader", () => {
   it("decodes SST labels, RK, MULRK, numbers, bools, errors, dates, and merges", async () => {
     const wb = await readXls(buildXls())
@@ -272,6 +320,19 @@ describe("XLS (BIFF8) reader", () => {
       },
     })
     expect(sheet.cells?.get("0,1")).toMatchObject({ value: null, type: "empty" })
+  })
+
+  it("preserves BIFF8 SST rich-text font runs", async () => {
+    const workbook = await readXls(buildRichTextXls(), { readStyles: true })
+
+    expect(workbook.sheets[0].cells?.get("0,0")).toMatchObject({
+      value: "BlackRed",
+      type: "richText",
+      richText: [
+        { text: "Black", font: { name: "Default", size: 11 } },
+        { text: "Red", font: { name: "Accent", size: 11, color: { rgb: "AA1122" } } },
+      ],
+    })
   })
 
   it("accepts BIFF5/7 (0x0500) workbooks through the extended reader", async () => {

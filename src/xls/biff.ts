@@ -38,8 +38,7 @@ export const SID = {
   LABELSST: 0x00fd,
   // RSTRING is a BIFF5/BIFF7 record (rich-text cell: rw, col, ixfe, a
   // codepage byte string, then a run count and its runs). BIFF8 dropped it:
-  // rich text moved into the SST, so those cells arrive as LABELSST and
-  // readSstString already skips the runs and yields the plain text. The
+  // rich text moved into the SST, so those cells arrive as LABELSST. The
   // reader rejects anything that is not BIFF8 (see the version gate in
   // reader.ts), so this sid cannot reach a cell handler — listed for
   // recognition only, deliberately not parsed. See #411.
@@ -164,20 +163,34 @@ class BlockStream {
     while (!this.atEnd() && this.remainingInBlock() === 0) this.nextBlock()
   }
   u8(): number {
+    const block = this.blocks[this.bi]
+    if (block && this.pos < block.length) return block[this.pos++]
+    this.ensure()
+    if (this.atEnd()) throw new ParseError("Invalid XLS: truncated shared string table")
     return this.cur()[this.pos++]
   }
   u16(): number {
-    const v = this.cur()[this.pos] | (this.cur()[this.pos + 1] << 8)
-    this.pos += 2
-    return v
+    const block = this.blocks[this.bi]
+    if (block && this.pos + 2 <= block.length) {
+      const value = block[this.pos] | (block[this.pos + 1] << 8)
+      this.pos += 2
+      return value
+    }
+    return this.u8() | (this.u8() << 8)
   }
   u32(): number {
-    const b = this.cur()
-    const v =
-      (b[this.pos] | (b[this.pos + 1] << 8) | (b[this.pos + 2] << 16) | (b[this.pos + 3] << 24)) >>>
-      0
-    this.pos += 4
-    return v
+    const block = this.blocks[this.bi]
+    if (block && this.pos + 4 <= block.length) {
+      const value =
+        (block[this.pos] |
+          (block[this.pos + 1] << 8) |
+          (block[this.pos + 2] << 16) |
+          (block[this.pos + 3] << 24)) >>>
+        0
+      this.pos += 4
+      return value
+    }
+    return (this.u8() | (this.u8() << 8) | (this.u8() << 16) | (this.u8() << 24)) >>> 0
   }
   skip(n: number): void {
     // skip may cross blocks (rich/phonetic trailers), no grbit byte
@@ -201,11 +214,26 @@ class BlockStream {
   }
 }
 
+export interface BiffSstRun {
+  start: number
+  fontIndex: number
+}
+
+export interface BiffSstEntry {
+  text: string
+  runs?: BiffSstRun[]
+}
+
 /**
  * Parse an SST record (plus its following CONTINUE records) into the
  * shared-string array. `blocks` is `[sstData, ...continueDatas]`.
  */
 export function parseSst(blocks: Uint8Array[]): string[] {
+  return parseSstEntries(blocks).map((entry) => entry.text)
+}
+
+/** Parse SST text together with BIFF8 rich-text formatting runs. */
+export function parseSstEntries(blocks: Uint8Array[]): BiffSstEntry[] {
   const s = new BlockStream(blocks)
   s.skip(4) // cstTotal
   const cstUnique = s.u32()
@@ -214,7 +242,7 @@ export function parseSst(blocks: Uint8Array[]): string[] {
   // available bytes is a corrupt / hostile header — cap the loop by the
   // bytes actually present so we don't spin allocating empty strings.
   const maxStrings = Math.min(cstUnique, s.totalBytes())
-  const out: string[] = []
+  const out: BiffSstEntry[] = []
   for (let i = 0; i < maxStrings; i++) {
     s.ensure()
     if (s.atEnd()) break
@@ -223,7 +251,7 @@ export function parseSst(blocks: Uint8Array[]): string[] {
   return out
 }
 
-function readSstString(s: BlockStream): string {
+function readSstString(s: BlockStream): BiffSstEntry {
   const cch = s.u16()
   let grbit = s.u8()
   let compressed = (grbit & 0x01) === 0
@@ -245,7 +273,10 @@ function readSstString(s: BlockStream): string {
     str += String.fromCharCode(compressed ? s.u8() : s.u16())
     read++
   }
-  if (rich) s.skip(cRun * 4)
+  const runs: BiffSstRun[] = []
+  for (let index = 0; index < cRun; index++) {
+    runs.push({ start: s.u16(), fontIndex: s.u16() })
+  }
   if (phonetic) s.skip(cbExt)
-  return str
+  return runs.length > 0 ? { text: str, runs } : { text: str }
 }

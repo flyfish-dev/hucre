@@ -17,6 +17,7 @@ import type {
   FontStyle,
   MergeRange,
   ReadOptions,
+  RichTextRun,
   RowDef,
   Sheet,
   Workbook,
@@ -28,7 +29,15 @@ import { readCfb } from "../xlsx/crypto/cfb"
 import { isBuiltinDateFormatId, isDateFormat, serialToDate } from "../_date"
 import { DEFAULT_INDEXED_PALETTE } from "../xlsx/indexed-palette"
 import { BUILTIN_NUM_FMTS } from "../xlsx/styles"
-import { decodeRk, parseRecords, parseSst, Reader, SID, type BiffRecord } from "./biff"
+import {
+  decodeRk,
+  parseRecords,
+  parseSstEntries,
+  Reader,
+  SID,
+  type BiffRecord,
+  type BiffSstEntry,
+} from "./biff"
 
 const ERROR_TEXT: Record<number, string> = {
   0x00: "#NULL!",
@@ -108,7 +117,7 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
   const xfFmtIds: number[] = []
   const fmtCodes = new Map<number, string>()
   const boundSheets: Array<{ name: string; pos: number; hidden: boolean; veryHidden: boolean }> = []
-  const sst: string[] = []
+  const sst: BiffSstEntry[] = []
   const fontRecords: Uint8Array[] = []
   const xfRecords: Uint8Array[] = []
   let palette = [...DEFAULT_INDEXED_PALETTE]
@@ -168,12 +177,12 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
           if (records[j].id !== SID.CONTINUE) break
           blocks.push(records[j].data)
         }
-        // A loop, not `push(...parseSst(blocks))`: spreading an array as
+        // A loop, not `push(...parseSstEntries(blocks))`: spreading an array as
         // arguments puts one stack slot per element, so a workbook with a
         // few hundred thousand shared strings — an ordinary large .xls —
         // threw `RangeError: Maximum call stack size exceeded`, which the
         // caller reported as "malformed or truncated".
-        for (const s of parseSst(blocks)) sst.push(s)
+        for (const entry of parseSstEntries(blocks)) sst.push(entry)
         break
       }
       default:
@@ -188,10 +197,9 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
   })
 
   const isDate = (ixfe: number): boolean => dateXf[ixfe] === true
-  const styles =
-    biffVersion === 0x0600 && options?.readStyles
-      ? parseBiffStyles(fontRecords, xfRecords, fmtCodes, palette)
-      : undefined
+  const fonts =
+    biffVersion === 0x0600 && options?.readStyles ? parseBiffFonts(fontRecords, palette) : undefined
+  const styles = fonts ? parseBiffStyles(fonts, xfRecords, fmtCodes, palette) : undefined
 
   // ── Sheet substreams ──
   const sheets: Sheet[] = []
@@ -211,6 +219,7 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
         date1904,
         options?.maxTotalCells ?? MAX_TOTAL_CELLS,
         styles,
+        fonts,
         bs.hidden,
         bs.veryHidden,
       ),
@@ -228,11 +237,12 @@ function parseSheet(
   records: BiffRecord[],
   startIdx: number,
   name: string,
-  sst: string[],
+  sst: BiffSstEntry[],
   isDate: (ixfe: number) => boolean,
   date1904: boolean,
   cellLimit: number,
   styles?: CellStyle[],
+  fonts?: Array<FontStyle | undefined>,
   hidden = false,
   veryHidden = false,
 ): Sheet {
@@ -251,7 +261,13 @@ function parseSheet(
   // The XLSB reader already guards its coordinates this way; this one did
   // not. See #363.
   let widestCol = 0
-  const setCell = (row: number, col: number, value: CellValue, ixfe?: number): void => {
+  const setCell = (
+    row: number,
+    col: number,
+    value: CellValue,
+    ixfe?: number,
+    richText?: RichTextRun[],
+  ): void => {
     if (row < 0 || row > MAX_ROW_INDEX) {
       throw new ParseError(
         `Cell row ${row} is outside the supported sheet bounds (max ${MAX_ROW_INDEX + 1})`,
@@ -278,6 +294,10 @@ function parseSheet(
       const cell: Cell = { value, type: cellTypeOf(value) }
       const style = ixfe === undefined ? undefined : styles?.[ixfe]
       if (style && Object.keys(style).length > 0) cell.style = style
+      if (richText && richText.length > 0) {
+        cell.type = "richText"
+        cell.richText = richText
+      }
       cells.set(`${row},${col}`, cell)
     }
   }
@@ -294,7 +314,9 @@ function parseSheet(
         const row = r.u16(),
           col = r.u16()
         const ixfe = r.u16()
-        setCell(row, col, sst[r.u32()] ?? "", ixfe)
+        const entry = sst[r.u32()]
+        const value = entry?.text ?? ""
+        setCell(row, col, value, ixfe, entry ? biffRichText(entry, fonts) : undefined)
         break
       }
       case SID.RK: {
@@ -526,19 +548,54 @@ function parsePalette(data: Uint8Array): string[] {
   return palette
 }
 
-function parseBiffStyles(
+function parseBiffFonts(
   fontRecords: Uint8Array[],
-  xfRecords: Uint8Array[],
-  formats: Map<number, string>,
   palette: string[],
-): CellStyle[] {
+): Array<FontStyle | undefined> {
   const fonts: Array<FontStyle | undefined> = []
   for (const record of fontRecords) {
     // BIFF reserves font index 4 and emits no FONT record for it.
     if (fonts.length === 4) fonts.push(undefined)
     fonts.push(parseBiffFont(record, palette))
   }
+  return fonts
+}
+
+function parseBiffStyles(
+  fonts: Array<FontStyle | undefined>,
+  xfRecords: Uint8Array[],
+  formats: Map<number, string>,
+  palette: string[],
+): CellStyle[] {
   return xfRecords.map((record) => parseBiffXf(record, fonts, formats, palette))
+}
+
+function biffRichText(
+  entry: BiffSstEntry,
+  fonts?: Array<FontStyle | undefined>,
+): RichTextRun[] | undefined {
+  if (!fonts || !entry.runs?.length || entry.text.length === 0) return undefined
+
+  const byStart = new Map<number, number>()
+  for (const run of entry.runs) {
+    if (run.start < 0 || run.start > entry.text.length) continue
+    byStart.set(run.start, run.fontIndex)
+  }
+  if (byStart.size === 0) return undefined
+
+  const starts = [...byStart.keys()].sort((left, right) => left - right)
+  if (starts[0] !== 0) starts.unshift(0)
+  const richText: RichTextRun[] = []
+  for (let index = 0; index < starts.length; index++) {
+    const start = starts[index]
+    const end = starts[index + 1] ?? entry.text.length
+    if (end <= start) continue
+    const text = entry.text.slice(start, end)
+    const fontIndex = byStart.get(start)
+    const font = fontIndex === undefined ? undefined : fonts[fontIndex]
+    richText.push(font ? { text, font } : { text })
+  }
+  return richText.length > 0 ? richText : undefined
 }
 
 function parseBiffFont(data: Uint8Array, palette: string[]): FontStyle {
