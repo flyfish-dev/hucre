@@ -220,6 +220,7 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
         options?.maxTotalCells ?? MAX_TOTAL_CELLS,
         styles,
         fonts,
+        biffVersion,
         bs.hidden,
         bs.veryHidden,
       ),
@@ -243,6 +244,7 @@ function parseSheet(
   cellLimit: number,
   styles?: CellStyle[],
   fonts?: Array<FontStyle | undefined>,
+  biffVersion = 0x0600,
   hidden = false,
   veryHidden = false,
 ): Sheet {
@@ -252,8 +254,22 @@ function parseSheet(
   const columns: NonNullable<Sheet["columns"]> = []
   const rowDefs = new Map<number, RowDef>()
   const sheetFormat: NonNullable<Sheet["sheetFormat"]> = {}
+  let pageSetup: NonNullable<Sheet["pageSetup"]> | undefined
+  let sheetView: NonNullable<Sheet["view"]> | undefined
+  const rowBreaks: number[] = []
+  const colBreaks: number[] = []
+  let fitToPage = false
+  let setupFitWidth: number | undefined
+  let setupFitHeight: number | undefined
   let dimensionLastRow: number | undefined
   let dimensionLastCol: number | undefined
+
+  const ensurePageSetup = (): NonNullable<Sheet["pageSetup"]> => (pageSetup ??= {})
+  const ensureMargins = (): NonNullable<NonNullable<Sheet["pageSetup"]>["margins"]> => {
+    const setup = ensurePageSetup()
+    return (setup.margins ??= {})
+  }
+  const ensureSheetView = (): NonNullable<Sheet["view"]> => (sheetView ??= {})
 
   // BIFF row/col are u16, so each is bounded at 65,535 on its own — but
   // their product is not, and `rows` is a dense rectangle. 65,535 rows of
@@ -419,6 +435,128 @@ function parseSheet(
         }
         break
       }
+      case SID.WINDOW2: {
+        if (rec.data.length >= 2) {
+          const flags = r.u16()
+          const view = ensureSheetView()
+          if ((flags & 0x0002) === 0) view.showGridLines = false
+          if ((flags & 0x0004) === 0) view.showRowColHeaders = false
+          if (flags & 0x0040) view.rightToLeft = true
+          if (flags & 0x0800) view.mode = "pageBreakPreview"
+
+          // Window2 retains a zoom for normal and page-break views. An
+          // immediately associated SCL supersedes the active view's value,
+          // but these fields are the only source when the zoom is 100% or a
+          // producer omitted SCL.
+          if (rec.data.length >= 14) {
+            r.skip(8)
+            const pageBreakZoom = r.u16()
+            const normalZoom = r.u16()
+            const zoom = flags & 0x0800 ? pageBreakZoom : normalZoom
+            if (zoom >= 10 && zoom <= 400) view.zoomScale = zoom
+          }
+        }
+        break
+      }
+      case SID.SCL: {
+        if (rec.data.length >= 4) {
+          const numerator = r.u16()
+          const denominator = r.u16()
+          if (numerator > 0 && denominator > 0) {
+            const zoom = Math.round((numerator / denominator) * 100)
+            if (zoom >= 10 && zoom <= 400) ensureSheetView().zoomScale = zoom
+          }
+        }
+        break
+      }
+      case SID.WSBOOL: {
+        if (rec.data.length >= 2) fitToPage = Boolean(r.u16() & 0x0100)
+        break
+      }
+      case SID.SETUP: {
+        if (rec.data.length >= 34) {
+          const paperSize = r.u16()
+          const scale = r.u16()
+          const pageStart = r.i16()
+          setupFitWidth = r.u16()
+          setupFitHeight = r.u16()
+          const flags = r.u16()
+          const horizontalDpi = r.u16()
+          const verticalDpi = r.u16()
+          const header = r.f64()
+          const footer = r.f64()
+          const copies = r.u16()
+          const setup = ensurePageSetup()
+          const noPrinterSettings = Boolean(flags & 0x0004)
+
+          if (flags & 0x0001) setup.pageOrder = "overThenDown"
+          if (!noPrinterSettings) {
+            if (paperSize > 0) setup.paperSize = paperSize
+            if (scale > 0) setup.scale = scale
+            if ((flags & 0x0040) === 0) {
+              setup.orientation = flags & 0x0002 ? "portrait" : "landscape"
+            }
+            if (horizontalDpi > 0) setup.horizontalDpi = horizontalDpi
+            if (verticalDpi > 0) setup.verticalDpi = verticalDpi
+            if (copies > 0) setup.copies = copies
+          }
+          if (flags & 0x0008) setup.blackAndWhite = true
+          if (flags & 0x0010) setup.draft = true
+          if (flags & 0x0020) {
+            setup.cellComments = flags & 0x0200 ? "atEnd" : "asDisplayed"
+          }
+          const errorMode = (flags >>> 10) & 0x3
+          if (errorMode === 1) setup.errors = "blank"
+          else if (errorMode === 2) setup.errors = "dash"
+          else if (errorMode === 3) setup.errors = "NA"
+          if (flags & 0x0080) {
+            setup.firstPageNumber = pageStart
+            setup.useFirstPageNumber = true
+          }
+          const margins = ensureMargins()
+          margins.header = header
+          margins.footer = footer
+        }
+        break
+      }
+      case SID.LEFTMARGIN:
+        if (rec.data.length >= 8) ensureMargins().left = r.f64()
+        break
+      case SID.RIGHTMARGIN:
+        if (rec.data.length >= 8) ensureMargins().right = r.f64()
+        break
+      case SID.TOPMARGIN:
+        if (rec.data.length >= 8) ensureMargins().top = r.f64()
+        break
+      case SID.BOTTOMMARGIN:
+        if (rec.data.length >= 8) ensureMargins().bottom = r.f64()
+        break
+      case SID.PRINTHEADERS:
+        if (rec.data.length >= 2 && r.u16() !== 0) ensurePageSetup().showRowColHeaders = true
+        break
+      case SID.PRINTGRIDLINES:
+        if (rec.data.length >= 2 && r.u16() !== 0) ensurePageSetup().showGridLines = true
+        break
+      case SID.HCENTER:
+        if (rec.data.length >= 2 && r.u16() !== 0) ensurePageSetup().horizontalCentered = true
+        break
+      case SID.VCENTER:
+        if (rec.data.length >= 2 && r.u16() !== 0) ensurePageSetup().verticalCentered = true
+        break
+      case SID.HORIZONTALPAGEBREAKS: {
+        // BIFF8 has 65,536 rows. A break identifies the first row on the
+        // following page, so zero and values beyond the final row are not
+        // meaningful break positions.
+        appendPageBreaks(rec.data, rowBreaks, 65_535, biffVersion, "horizontal")
+        break
+      }
+      case SID.VERTICALPAGEBREAKS: {
+        // BIFF8 has 256 columns and stores the first column to the right of
+        // the break. Keep malformed values outside that grid out of the
+        // public model.
+        appendPageBreaks(rec.data, colBreaks, 255, biffVersion, "vertical")
+        break
+      }
       case SID.DEFAULTROWHEIGHT: {
         if (rec.data.length >= 4) {
           const flags = r.u16()
@@ -503,14 +641,67 @@ function parseSheet(
   densify(rows, widestCol)
 
   const sheet: Sheet = { name, rows }
+  if (fitToPage) {
+    const setup = ensurePageSetup()
+    setup.fitToPage = true
+    if (setupFitWidth !== undefined) setup.fitToWidth = setupFitWidth
+    if (setupFitHeight !== undefined) setup.fitToHeight = setupFitHeight
+  }
   if (merges.length > 0) sheet.merges = merges
   if (cells?.size) sheet.cells = cells
   if (columns.some(Boolean)) sheet.columns = columns
   if (rowDefs.size) sheet.rowDefs = rowDefs
   if (Object.keys(sheetFormat).length > 0) sheet.sheetFormat = sheetFormat
+  if (pageSetup && Object.keys(pageSetup).length > 0) sheet.pageSetup = pageSetup
+  if (sheetView && Object.keys(sheetView).length > 0) sheet.view = sheetView
+  if (rowBreaks.length > 0) sheet.rowBreaks = [...new Set(rowBreaks)].sort((a, b) => a - b)
+  if (colBreaks.length > 0) sheet.colBreaks = [...new Set(colBreaks)].sort((a, b) => a - b)
   if (hidden) sheet.hidden = true
   if (veryHidden) sheet.veryHidden = true
   return sheet
+}
+
+/**
+ * BIFF8 stores each explicit page break as an index plus a first/last span
+ * (6 bytes). Legacy BIFF5/7 stores the older compact index-only form (2
+ * bytes). The workbook BOF selects the shape: accepting a shorter BIFF8
+ * record as compact data would reinterpret truncated span bytes as breaks.
+ */
+function appendPageBreaks(
+  data: Uint8Array,
+  destination: number[],
+  maximumFirstItemAfterBreak: number,
+  biffVersion: number,
+  axis: "horizontal" | "vertical",
+): void {
+  if (data.length < 2) {
+    throw new ParseError(`Invalid XLS ${axis} page-break record: missing break count`)
+  }
+  const reader = new Reader(data)
+  const declaredCount = reader.u16()
+  if (declaredCount > 1_026) {
+    throw new ParseError(`Invalid XLS ${axis} page-break record: too many breaks`)
+  }
+  const stride = biffVersion === 0x0600 ? 6 : 2
+  const expectedLength = 2 + declaredCount * stride
+  if (data.length !== expectedLength) {
+    throw new ParseError(
+      `Invalid XLS ${axis} page-break record: expected ${expectedLength} bytes, got ${data.length}`,
+    )
+  }
+  for (let index = 0; index < declaredCount; index++) {
+    // HorzBrk.row / VertBrk.col name the first row below, or first column to
+    // the right of, the break. Hucre's public rowBreaks/colBreaks model
+    // predates the XLS reader and stores the zero-based item *before* a break
+    // (the XLSX reader subtracts one and the writer adds one). Keep both
+    // container formats on that established model instead of making renderer
+    // behaviour depend on the source file type.
+    const firstItemAfterBreak = reader.u16()
+    if (firstItemAfterBreak > 0 && firstItemAfterBreak <= maximumFirstItemAfterBreak) {
+      destination.push(firstItemAfterBreak - 1)
+    }
+    if (stride === 6) reader.skip(4)
+  }
 }
 
 function insideDeclaredDimensions(

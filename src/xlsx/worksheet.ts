@@ -671,6 +671,10 @@ function worksheetParser(
         case "sheetView":
           if (!inSheetData) {
             if (!sheetView) sheetView = {}
+            const mode = attrs["view"]
+            if (mode === "pageBreakPreview" || mode === "pageLayout" || mode === "normal") {
+              sheetView.mode = mode
+            }
             if (attrs["showGridLines"] === "0" || attrs["showGridLines"] === "false") {
               sheetView.showGridLines = false
             }
@@ -889,14 +893,16 @@ function worksheetParser(
           break
         case "brk":
           if (inRowBreaks || inColBreaks) {
-            const brkId = attrs["id"]
-            if (brkId) {
-              const index = Number(brkId) - 1 // Convert to 0-based
-              if (inRowBreaks) {
-                rowBreaks.push(index)
-              } else {
-                colBreaks.push(index)
-              }
+            const firstItemAfterBreak = Number(attrs["id"])
+            const maximum = inRowBreaks ? 1_048_575 : 16_383
+            if (
+              Number.isInteger(firstItemAfterBreak) &&
+              firstItemAfterBreak > 0 &&
+              firstItemAfterBreak <= maximum
+            ) {
+              const index = firstItemAfterBreak - 1
+              if (inRowBreaks) rowBreaks.push(index)
+              else colBreaks.push(index)
             }
           }
           break
@@ -1453,10 +1459,10 @@ function worksheetParser(
 
     // Attach page breaks
     if (rowBreaks.length > 0) {
-      sheet.rowBreaks = rowBreaks.sort((a, b) => a - b)
+      sheet.rowBreaks = [...new Set(rowBreaks)].sort((a, b) => a - b)
     }
     if (colBreaks.length > 0) {
-      sheet.colBreaks = colBreaks.sort((a, b) => a - b)
+      sheet.colBreaks = [...new Set(colBreaks)].sort((a, b) => a - b)
     }
 
     // Attach row definitions (height, hidden, outlineLevel)

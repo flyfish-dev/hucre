@@ -82,6 +82,19 @@ const NS_SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/mai
 const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 const NS_X14AC = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
 
+/**
+ * Public page-break indexes identify the item immediately before a break.
+ * Normalize untrusted caller input before converting to SpreadsheetML's
+ * first-item-after-break id: duplicates have no meaning, fractional/negative
+ * positions are invalid, and positions beyond Excel's grid would create a
+ * package that Excel has to repair.
+ */
+function normalizePageBreaks(breaks: number[], maximum: number): number[] {
+  return [
+    ...new Set(breaks.filter((value) => Number.isInteger(value) && value >= 0 && value <= maximum)),
+  ].sort((a, b) => a - b)
+}
+
 // ── Column Letter Conversion ───────────────────────────────────────
 
 /** Convert a 0-based column index to an Excel column letter (A, B, ... Z, AA, AB, ...) */
@@ -410,6 +423,7 @@ export function writeWorksheetXml(
   }
 
   if (sheet.view) {
+    if (sheet.view.mode && sheet.view.mode !== "normal") viewAttrs["view"] = sheet.view.mode
     if (sheet.view.showGridLines === false) viewAttrs["showGridLines"] = 0
     if (sheet.view.showRowColHeaders === false) viewAttrs["showRowColHeaders"] = 0
     if (sheet.view.zoomScale !== undefined) viewAttrs["zoomScale"] = sheet.view.zoomScale
@@ -662,32 +676,36 @@ export function writeWorksheetXml(
 
   // ── Row Breaks ──
   if (sheet.rowBreaks && sheet.rowBreaks.length > 0) {
-    const sorted = [...sheet.rowBreaks].sort((a, b) => a - b)
+    const sorted = normalizePageBreaks(sheet.rowBreaks, 1_048_574)
     const brkElements = sorted.map((row) =>
       xmlSelfClose("brk", { id: row + 1, max: 16383, man: 1 }),
     )
-    parts.push(
-      xmlElement(
-        "rowBreaks",
-        { count: sorted.length, manualBreakCount: sorted.length },
-        brkElements,
-      ),
-    )
+    if (sorted.length > 0) {
+      parts.push(
+        xmlElement(
+          "rowBreaks",
+          { count: sorted.length, manualBreakCount: sorted.length },
+          brkElements,
+        ),
+      )
+    }
   }
 
   // ── Column Breaks ──
   if (sheet.colBreaks && sheet.colBreaks.length > 0) {
-    const sorted = [...sheet.colBreaks].sort((a, b) => a - b)
+    const sorted = normalizePageBreaks(sheet.colBreaks, 16_382)
     const brkElements = sorted.map((col) =>
       xmlSelfClose("brk", { id: col + 1, max: 1048575, man: 1 }),
     )
-    parts.push(
-      xmlElement(
-        "colBreaks",
-        { count: sorted.length, manualBreakCount: sorted.length },
-        brkElements,
-      ),
-    )
+    if (sorted.length > 0) {
+      parts.push(
+        xmlElement(
+          "colBreaks",
+          { count: sorted.length, manualBreakCount: sorted.length },
+          brkElements,
+        ),
+      )
+    }
   }
 
   // ── Drawing (images, text boxes, and/or charts) ──

@@ -805,6 +805,12 @@ export interface SheetProtection {
 // ── Sheet View ─────────────────────────────────────────────────────
 
 export interface SheetView {
+  /**
+   * Worksheet display mode. `pageBreakPreview` is the view that paints
+   * automatic/manual page boundaries and the large page-number labels over
+   * the grid; it is distinct from print headers/footers and background images.
+   */
+  mode?: "normal" | "pageBreakPreview" | "pageLayout"
   showGridLines?: boolean
   showRowColHeaders?: boolean
   zoomScale?: number
@@ -966,9 +972,9 @@ export interface Sheet {
   veryHidden?: boolean
   /** Excel Tables (ListObject) defined on this sheet */
   tables?: TableDefinition[]
-  /** Row page breaks (0-based row indices) */
+  /** Row page breaks (zero-based index of the row immediately before each break) */
   rowBreaks?: number[]
-  /** Column page breaks (0-based column indices) */
+  /** Column page breaks (zero-based index of the column immediately before each break) */
   colBreaks?: number[]
   /** Outline properties (controls summary row/column position) */
   outlineProperties?: OutlineProperties
@@ -1771,9 +1777,9 @@ export interface WriteSheet {
   veryHidden?: boolean
   /** Excel Tables (ListObject) to define on this sheet */
   tables?: TableDefinition[]
-  /** Row page breaks (0-based row indices) */
+  /** Row page breaks (zero-based index of the row immediately before each break) */
   rowBreaks?: number[]
-  /** Column page breaks (0-based column indices) */
+  /** Column page breaks (zero-based index of the column immediately before each break) */
   colBreaks?: number[]
   /** Sheet-wide formatting defaults from sheetFormatPr */
   sheetFormat?: SheetFormat

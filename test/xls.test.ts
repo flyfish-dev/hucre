@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest"
 import { writeCfb } from "../src/xlsx/crypto/cfb"
 import { readXls } from "../src/xls/reader"
 import { read } from "../src/defter"
+import { readXlsx } from "../src/xlsx/reader"
+import { writeXlsx } from "../src/xlsx/writer"
 
 // ── Minimal BIFF8 .xls builder (test-only) ───────────────────────────
 
@@ -39,18 +41,32 @@ const rkInt = (v: number): number[] => u32(((v << 2) | 2) >>> 0)
 const SID = {
   FORMULA: 0x0006,
   EOF: 0x000a,
+  HORIZONTALPAGEBREAKS: 0x001b,
+  VERTICALPAGEBREAKS: 0x001a,
+  LEFTMARGIN: 0x0026,
+  RIGHTMARGIN: 0x0027,
+  TOPMARGIN: 0x0028,
+  BOTTOMMARGIN: 0x0029,
+  PRINTHEADERS: 0x002a,
+  PRINTGRIDLINES: 0x002b,
   FONT: 0x0031,
   DEFCOLWIDTH: 0x0055,
   COLINFO: 0x007d,
+  WSBOOL: 0x0081,
+  HCENTER: 0x0083,
+  VCENTER: 0x0084,
   DATEMODE: 0x0022,
   PALETTE: 0x0092,
   STANDARDWIDTH: 0x0099,
+  SCL: 0x00a0,
+  SETUP: 0x00a1,
   BLANK: 0x0201,
   DIMENSIONS: 0x0200,
   NUMBER: 0x0203,
   LABEL: 0x0204,
   BOOLERR: 0x0205,
   ROW: 0x0208,
+  WINDOW2: 0x023e,
   RK: 0x027e,
   MULRK: 0x00bd,
   LABELSST: 0x00fd,
@@ -62,8 +78,8 @@ const SID = {
   BOF: 0x0809,
 }
 
-const bof = (dt: number): number[] =>
-  record(SID.BOF, [...u16(0x0600), ...u16(dt), ...u16(0), ...u16(0), ...u32(0), ...u32(0)])
+const bof = (dt: number, version = 0x0600): number[] =>
+  record(SID.BOF, [...u16(version), ...u16(dt), ...u16(0), ...u16(0), ...u32(0), ...u32(0)])
 const eof = (): number[] => record(SID.EOF, [])
 
 function sstRecord(strings: string[]): number[] {
@@ -244,6 +260,91 @@ function buildRichTextXls(): Uint8Array {
   return writeCfb([{ name: "Workbook", data: concat([makeGlobals(globalsLength), sheet]) }])
 }
 
+function buildPageBreakPreviewXls(
+  options: {
+    compactLegacyBreaks?: boolean
+    rowBreakIds?: number[]
+    colBreakIds?: number[]
+    includeScl?: boolean
+    pageBreakPreview?: boolean
+    pageBreakZoom?: number
+    normalZoom?: number
+    rowBreakData?: number[]
+    colBreakData?: number[]
+  } = {},
+): Uint8Array {
+  const {
+    compactLegacyBreaks = false,
+    rowBreakIds = [7],
+    colBreakIds = [2],
+    includeScl = true,
+    pageBreakPreview = true,
+    pageBreakZoom = 130,
+    normalZoom = 90,
+    rowBreakData,
+    colBreakData,
+  } = options
+  const version = compactLegacyBreaks ? 0x0500 : 0x0600
+  const breakData = (ids: number[], maximumSpan: number): number[] => [
+    ...u16(ids.length),
+    ...ids.flatMap((id) => [
+      ...u16(id),
+      ...(compactLegacyBreaks ? [] : [...u16(0), ...u16(maximumSpan)]),
+    ]),
+  ]
+  const records = [
+    bof(0x0010, version),
+    // Page Break Preview, grid/headers visible, 60% zoom through SCL.
+    record(SID.WINDOW2, [
+      ...u16(pageBreakPreview ? 0x0eb6 : 0x06b6),
+      ...u16(0),
+      ...u16(0),
+      ...u16(64),
+      ...u16(0),
+      ...u16(pageBreakZoom),
+      ...u16(normalZoom),
+      ...u16(0),
+      ...u16(0),
+    ]),
+    record(SID.WSBOOL, u16(0x0100)),
+    record(SID.LEFTMARGIN, f64(0.75)),
+    record(SID.RIGHTMARGIN, f64(0.75)),
+    record(SID.TOPMARGIN, f64(1)),
+    record(SID.BOTTOMMARGIN, f64(1)),
+    record(SID.PRINTHEADERS, u16(1)),
+    record(SID.PRINTGRIDLINES, u16(1)),
+    record(SID.HCENTER, u16(1)),
+    record(SID.VCENTER, u16(0)),
+    record(SID.SETUP, [
+      ...u16(9),
+      ...u16(100),
+      ...u16(1),
+      ...u16(1),
+      ...u16(2),
+      ...u16(0x0002),
+      ...u16(180),
+      ...u16(180),
+      ...f64(0.5),
+      ...f64(0.5),
+      ...u16(1),
+    ]),
+    record(SID.HORIZONTALPAGEBREAKS, rowBreakData ?? breakData(rowBreakIds, 255)),
+    record(SID.VERTICALPAGEBREAKS, colBreakData ?? breakData(colBreakIds, 65_535)),
+    record(SID.LABEL, [...u16(0), ...u16(0), ...u16(0), ...xlStr("Preview")]),
+    eof(),
+  ]
+  if (includeScl) records.splice(2, 0, record(SID.SCL, [...u16(3), ...u16(5)]))
+  const sheet = concat(records)
+  const makeGlobals = (sheetPos: number): Uint8Array =>
+    concat([
+      bof(0x0005, version),
+      record(SID.BOUNDSHEET, [...u32(sheetPos), 0, 0, ...shortStr("Preview")]),
+      eof(),
+    ])
+  const globalsLength = makeGlobals(0).length
+  return writeCfb([{ name: "Workbook", data: concat([makeGlobals(globalsLength), sheet]) }])
+}
+
 describe("XLS (BIFF8) reader", () => {
   it("decodes SST labels, RK, MULRK, numbers, bools, errors, dates, and merges", async () => {
     const wb = await readXls(buildXls())
@@ -333,6 +434,142 @@ describe("XLS (BIFF8) reader", () => {
         { text: "Red", font: { name: "Accent", size: 11, color: { rgb: "AA1122" } } },
       ],
     })
+  })
+
+  it("preserves BIFF page-break view, zoom, print geometry, and explicit breaks", async () => {
+    const workbook = await readXls(buildPageBreakPreviewXls())
+    const sheet = workbook.sheets[0]!
+
+    expect(sheet.view).toEqual({ mode: "pageBreakPreview", zoomScale: 60 })
+    expect(sheet.pageSetup).toEqual({
+      paperSize: 9,
+      orientation: "portrait",
+      fitToPage: true,
+      fitToWidth: 1,
+      fitToHeight: 2,
+      scale: 100,
+      margins: { left: 0.75, right: 0.75, top: 1, bottom: 1, header: 0.5, footer: 0.5 },
+      showGridLines: true,
+      showRowColHeaders: true,
+      horizontalCentered: true,
+      copies: 1,
+      horizontalDpi: 180,
+      verticalDpi: 180,
+    })
+    // Hucre exposes the zero-based row/column before the break, matching its
+    // long-standing SpreadsheetML reader/writer contract.
+    expect(sheet.rowBreaks).toEqual([6])
+    expect(sheet.colBreaks).toEqual([1])
+  })
+
+  it("preserves compact BIFF5/7 page-break entries", async () => {
+    const sheet = (await readXls(buildPageBreakPreviewXls({ compactLegacyBreaks: true })))
+      .sheets[0]!
+    expect(sheet.rowBreaks).toEqual([6])
+    expect(sheet.colBreaks).toEqual([1])
+  })
+
+  it("uses the active WINDOW2 zoom when an associated SCL is absent", async () => {
+    const preview = (
+      await readXls(
+        buildPageBreakPreviewXls({ includeScl: false, pageBreakZoom: 130, normalZoom: 90 }),
+      )
+    ).sheets[0]!
+    const normal = (
+      await readXls(
+        buildPageBreakPreviewXls({
+          includeScl: false,
+          pageBreakPreview: false,
+          pageBreakZoom: 130,
+          normalZoom: 90,
+        }),
+      )
+    ).sheets[0]!
+
+    expect(preview.view).toMatchObject({ mode: "pageBreakPreview", zoomScale: 130 })
+    expect(normal.view).toEqual({ zoomScale: 90 })
+  })
+
+  it("normalizes BIFF break boundaries, duplicates, and invalid positions", async () => {
+    const sheet = (
+      await readXls(
+        buildPageBreakPreviewXls({
+          rowBreakIds: [0, 1, 1, 65_535],
+          colBreakIds: [0, 1, 1, 255, 256],
+        }),
+      )
+    ).sheets[0]!
+
+    // Raw BIFF values name the first item after a break. Zero cannot name a
+    // preceding item; the maximum values put the break immediately before
+    // the final BIFF8 row/column.
+    expect(sheet.rowBreaks).toEqual([0, 65_534])
+    expect(sheet.colBreaks).toEqual([0, 254])
+  })
+
+  it("keeps empty BIFF break collections absent", async () => {
+    const sheet = (await readXls(buildPageBreakPreviewXls({ rowBreakIds: [], colBreakIds: [] })))
+      .sheets[0]!
+    expect(sheet.rowBreaks).toBeUndefined()
+    expect(sheet.colBreaks).toBeUndefined()
+  })
+
+  it("rejects truncated or overlong BIFF8 horizontal and vertical break records", async () => {
+    const completeHorizontal = [...u16(1), ...u16(7), ...u16(0), ...u16(255)]
+    const completeVertical = [...u16(1), ...u16(2), ...u16(0), ...u16(65_535)]
+
+    await expect(
+      readXls(
+        buildPageBreakPreviewXls({
+          // This has the exact shape of a compact BIFF5/7 entry. A BIFF8
+          // reader must not reinterpret it after the span bytes were lost.
+          rowBreakData: [...u16(1), ...u16(7)],
+        }),
+      ),
+    ).rejects.toThrow(/horizontal page-break record: expected 8 bytes, got 4/)
+    await expect(
+      readXls(
+        buildPageBreakPreviewXls({
+          rowBreakData: [...completeHorizontal, 0],
+        }),
+      ),
+    ).rejects.toThrow(/horizontal page-break record: expected 8 bytes, got 9/)
+    await expect(
+      readXls(
+        buildPageBreakPreviewXls({
+          colBreakData: [...u16(1), ...u16(2)],
+        }),
+      ),
+    ).rejects.toThrow(/vertical page-break record: expected 8 bytes, got 4/)
+    await expect(
+      readXls(
+        buildPageBreakPreviewXls({
+          colBreakData: [...completeVertical, 0],
+        }),
+      ),
+    ).rejects.toThrow(/vertical page-break record: expected 8 bytes, got 9/)
+  })
+
+  it("keeps XLS break semantics when converted through an XLSX round-trip", async () => {
+    const xlsSheet = (
+      await readXls(buildPageBreakPreviewXls({ rowBreakIds: [1, 7], colBreakIds: [1, 2] }))
+    ).sheets[0]!
+    const xlsx = await writeXlsx({
+      sheets: [
+        {
+          name: xlsSheet.name,
+          rows: xlsSheet.rows,
+          rowBreaks: xlsSheet.rowBreaks,
+          colBreaks: xlsSheet.colBreaks,
+        },
+      ],
+    })
+    const roundTripped = (await readXlsx(xlsx)).sheets[0]!
+
+    expect(xlsSheet.rowBreaks).toEqual([0, 6])
+    expect(xlsSheet.colBreaks).toEqual([0, 1])
+    expect(roundTripped.rowBreaks).toEqual(xlsSheet.rowBreaks)
+    expect(roundTripped.colBreaks).toEqual(xlsSheet.colBreaks)
   })
 
   it("accepts BIFF5/7 (0x0500) workbooks through the extended reader", async () => {

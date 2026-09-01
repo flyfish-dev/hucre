@@ -55,6 +55,30 @@ describe("view settings — showGridLines", () => {
   })
 })
 
+describe("view settings — display mode", () => {
+  it("writes pageBreakPreview on sheetView", () => {
+    const xml = writeXml({
+      name: "Preview",
+      rows: [["Data"]],
+      view: { mode: "pageBreakPreview" },
+    })
+    const sheetView = findChild(findChild(parseSheet(xml), "sheetViews"), "sheetView")
+    expect(sheetView.attrs["view"]).toBe("pageBreakPreview")
+  })
+
+  it("round-trips pageLayout and pageBreakPreview", async () => {
+    const data = await writeXlsx({
+      sheets: [
+        { name: "Breaks", rows: [["A"]], view: { mode: "pageBreakPreview" } },
+        { name: "Layout", rows: [["B"]], view: { mode: "pageLayout" } },
+      ],
+    })
+    const workbook = await readXlsx(data)
+    expect(workbook.sheets[0].view?.mode).toBe("pageBreakPreview")
+    expect(workbook.sheets[1].view?.mode).toBe("pageLayout")
+  })
+})
+
 // ── showRowColHeaders Writing Tests ──────────────────────────────────
 
 describe("view settings — showRowColHeaders", () => {
