@@ -148,19 +148,20 @@ export function parseStyles(xml: string): ParsedStyles {
   const normal = elementChildren(doc, "cellStyles")
     .flatMap((el) => elementChildren(el, "cellStyle"))
     .find((el) => el.attrs["builtinId"] === "0")
-  const styleXfs = elementChildren(doc, "cellStyleXfs")
-    .flatMap((el) => elementChildren(el, "xf"))
+  const styleXfs = elementChildren(doc, "cellStyleXfs").flatMap((el) => elementChildren(el, "xf"))
   const xfId = normal ? Number(normal.attrs["xfId"]) : 0
-  const fontId = Number.isInteger(xfId) && xfId >= 0
-    ? Number(styleXfs[xfId]?.attrs["fontId"] ?? 0) : 0
-  const normalFont = (Number.isInteger(fontId) && fontId >= 0 ? fonts[fontId] : undefined) ?? fonts[0]
+  const fontId =
+    Number.isInteger(xfId) && xfId >= 0 ? Number(styleXfs[xfId]?.attrs["fontId"] ?? 0) : 0
+  const normalFont =
+    (Number.isInteger(fontId) && fontId >= 0 ? fonts[fontId] : undefined) ?? fonts[0]
   return { numFmts, fonts, fills, borders, cellXfs, dxfs, normalFont }
 }
 
-
 function elementChildren(parent: XmlElement, local: string): XmlElement[] {
-  return parent.children.filter((child): child is XmlElement =>
-    typeof child !== "string" && (child.local || child.tag) === local)
+  return parent.children.filter(
+    (child): child is XmlElement =>
+      typeof child !== "string" && (child.local || child.tag) === local,
+  )
 }
 
 // ── Indexed colours ──────────────────────────────────────────────────

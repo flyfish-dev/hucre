@@ -180,18 +180,29 @@ export function writeDrawing(
 
     const pic = xmlElement("xdr:pic", undefined, [nvPicPr, blipFill, spPr])
 
-    const anchorTag = kind === "absolute" ? "xdr:absoluteAnchor"
-      : kind === "oneCell" ? "xdr:oneCellAnchor" : "xdr:twoCellAnchor"
+    const anchorTag =
+      kind === "absolute"
+        ? "xdr:absoluteAnchor"
+        : kind === "oneCell"
+          ? "xdr:oneCellAnchor"
+          : "xdr:twoCellAnchor"
     const anchorAttrs = kind === "twoCell" && editAs ? { editAs } : undefined
-    const geometry = kind === "absolute" ? [
-      xmlSelfClose("xdr:pos", { x: imageCoordinate(position?.x), y: imageCoordinate(position?.y) }),
-      xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
-    ] : kind === "oneCell" ? [
-      fromElement,
-      xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
-    ] : [fromElement, toElement]
+    const geometry =
+      kind === "absolute"
+        ? [
+            xmlSelfClose("xdr:pos", {
+              x: imageCoordinate(position?.x),
+              y: imageCoordinate(position?.y),
+            }),
+            xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
+          ]
+        : kind === "oneCell"
+          ? [fromElement, xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu })]
+          : [fromElement, toElement]
     const anchor = xmlElement(anchorTag, anchorAttrs, [
-      ...geometry, pic, xmlSelfClose("xdr:clientData"),
+      ...geometry,
+      pic,
+      xmlSelfClose("xdr:clientData"),
     ])
 
     anchorElements.push(anchor)
@@ -418,12 +429,21 @@ export function writeDrawing(
 /** Do not serialize NaN/Infinity or fractional EMUs from public write inputs. */
 function imageCoordinate(value: number | undefined): number {
   return value !== undefined && Number.isFinite(value) && Number.isSafeInteger(Math.round(value))
-    ? Math.round(value) : 0
+    ? Math.round(value)
+    : 0
 }
 
-function imageExtent(emu: number | undefined, pixels: number | undefined, fallback: number): number {
+function imageExtent(
+  emu: number | undefined,
+  pixels: number | undefined,
+  fallback: number,
+): number {
   if (emu !== undefined && Number.isSafeInteger(emu) && emu >= 0) return emu
   const value = pixels === undefined ? undefined : pixels * EMU_PER_PIXEL
-  return value !== undefined && Number.isFinite(value) && value >= 0
-    && Number.isSafeInteger(Math.round(value)) ? Math.round(value) : fallback
+  return value !== undefined &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    Number.isSafeInteger(Math.round(value))
+    ? Math.round(value)
+    : fallback
 }

@@ -1191,7 +1191,8 @@ function findShapeExtent(shapeEl: {
   const cy = Number(ext.attrs["cy"])
   // A zero / absent extent is a placeholder, not a 0×0 shape — the chart
   // writer emits exactly that. Report nothing rather than a size of 0.
-  if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cy) || !(cx > 0) || !(cy > 0)) return undefined
+  if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cy) || !(cx > 0) || !(cy > 0))
+    return undefined
   return { width: cx / EMU_PER_PIXEL, height: cy / EMU_PER_PIXEL }
 }
 
