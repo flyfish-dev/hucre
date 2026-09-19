@@ -21,6 +21,13 @@ jobs:
           node-version: 24
       - name: Install build dependencies
         run: npm install --ignore-scripts --package-lock=false
+      - name: Check drawing source formatting with actionable diff
+        run: |
+          if ! node_modules/.bin/oxfmt --check src/xlsx/drawing-layout.ts test/drawing-layout.test.ts; then
+            node_modules/.bin/oxfmt src/xlsx/drawing-layout.ts test/drawing-layout.test.ts
+            git diff -- src/xlsx/drawing-layout.ts test/drawing-layout.test.ts
+            exit 1
+          fi
       - name: Check public parser and writer contract
         run: npm run test:drawing-layout
       - name: Type check
