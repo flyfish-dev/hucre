@@ -130,9 +130,14 @@ describe("Excel 365 in-cell and AlternateContent pictures", () => {
     expect(sheet.images?.[0]?.data.at(-1)).toBe(2)
     expect(sheet.images?.[0]?.anchor).toEqual({
       kind: "twoCell",
+      extent: { cx: 2257798, cy: 2562028 },
       from: { row: 8, col: 4, rowOff: 77884, colOff: 636399 },
       to: { row: 19, col: 7, rowOff: 125312, colOff: 36697 },
     })
-    expect(sheet.images?.[0]).toMatchObject({ width: 237, height: 269, altText: "Preview" })
+    expect(sheet.images?.[0]).toMatchObject({
+      width: 2257798 / 9525,
+      height: 2562028 / 9525,
+      altText: "Preview",
+    })
   })
 })

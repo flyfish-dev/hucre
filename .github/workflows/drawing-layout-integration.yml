@@ -1,50 +1,38 @@
 name: Drawing layout integration
 on:
+  pull_request:
   push:
-    branches: [feature/drawing-layout-contract]
+    branches: [main, feature/drawing-layout-contract]
 permissions:
-  contents: write
+  contents: read
+concurrency:
+  group: drawing-layout-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  integrate:
-    if: github.repository == 'flyfish-dev/hucre'
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: feature/drawing-layout-contract
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - name: Install build dependencies without changing the lockfile
+      - name: Install build dependencies
         run: npm install --ignore-scripts --package-lock=false
-      - name: Integrate additive contract expectations
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          if test -f scripts/.drawing-test-contract.patch; then
-            git apply --check scripts/.drawing-test-contract.patch
-            git apply --index scripts/.drawing-test-contract.patch
-            git rm scripts/.drawing-test-contract.patch
-            node_modules/.bin/oxfmt test/coverage-xlsx-reader.test.ts test/excel365-in-cell-images.test.ts test/xlsx-write-read-parity.test.ts
-            git add test/coverage-xlsx-reader.test.ts test/excel365-in-cell-images.test.ts test/xlsx-write-read-parity.test.ts
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'test: expect preserved drawing metadata without weakening parity checks'
-            git push origin HEAD:refs/heads/feature/drawing-layout-contract
-          fi
       - name: Check public parser and writer contract
         run: npm run test:drawing-layout
       - name: Type check
         run: npm run typecheck
       - name: Full library regression suite
         run: node_modules/.bin/vitest run
-      - name: Collect exact source and built runtime for integration checks
+      - name: Preserve exact build and tests for integration verification
         if: always()
         run: |
           git rev-parse HEAD > integration-revision.txt
           tar -czf drawing-layout-runtime.tar.gz src dist scripts docs test package.json build.config.ts tsconfig.json tsconfig.cli.json integration-revision.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: drawing-layout-runtime
