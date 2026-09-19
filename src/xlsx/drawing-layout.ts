@@ -12,8 +12,8 @@ function child(parent: XmlElement | undefined, name: string): XmlElement | undef
 function picture(anchor: XmlElement): XmlElement | undefined {
   const direct = child(anchor, "pic")
   if (direct) return direct
-  // Follow compatibility wrappers only. A grouped child's transform is not
-  // expressed in the anchor's coordinate system and must not leak out here.
+  // Follow compatibility wrappers only. Grouped-child transforms use a
+  // different coordinate system and must not leak into the sheet anchor.
   const pending = [...anchor.children].reverse()
   while (pending.length) {
     const node = pending.pop()
@@ -42,15 +42,11 @@ function pair(node: XmlElement | undefined, a: string, b: string): [number, numb
 /** Preserve file geometry in EMUs; DPI, zoom and grid rounding belong to the renderer. */
 export function readDrawingLayout(anchor: XmlElement): Layout {
   const local = anchor.local || anchor.tag
-  const kind =
-    local === "twoCellAnchor"
-      ? "twoCell"
-      : local === "oneCellAnchor"
-        ? "oneCell"
-        : local === "absoluteAnchor"
-          ? "absolute"
-          : undefined
-  if (!kind) return {}
+  let kind: Layout["kind"]
+  if (local === "twoCellAnchor") kind = "twoCell"
+  else if (local === "oneCellAnchor") kind = "oneCell"
+  else if (local === "absoluteAnchor") kind = "absolute"
+  else return {}
   const result: Layout = { kind }
   const editAs = anchor.attrs["editAs"]
   if (kind === "twoCell" && (editAs === "oneCell" || editAs === "absolute" || editAs === "twoCell")) {
@@ -60,15 +56,10 @@ export function readDrawingLayout(anchor: XmlElement): Layout {
   const ext = kind === "twoCell" ? child(xfrm, "ext") : child(anchor, "ext")
   const size = pair(ext, "cx", "cy")
   if (size && size[0] >= 0 && size[1] >= 0) result.extent = { cx: size[0], cy: size[1] }
-  const pos = pair(
-    kind === "absolute"
-      ? child(anchor, "pos")
-      : editAs === "absolute"
-        ? child(xfrm, "off")
-        : undefined,
-    "x",
-    "y",
-  )
+  let positionNode: XmlElement | undefined
+  if (kind === "absolute") positionNode = child(anchor, "pos")
+  else if (editAs === "absolute") positionNode = child(xfrm, "off")
+  const pos = pair(positionNode, "x", "y")
   if (pos) result.position = { x: pos[0], y: pos[1] }
   return result
 }
