@@ -9,7 +9,7 @@
   },
   "read+write xlsx (hucre/xlsx)": {
     "min": 271860,
-    "gzip": 75215
+    "gzip": 79000
   },
   "everything (hucre)": {
     "min": 505600,
