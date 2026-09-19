@@ -43,6 +43,7 @@ import { parseContentTypes } from "./content-types"
 import { dirname, findRIdAttr, parseRelationships, resolvePath } from "./relationships"
 import { parseSharedStrings } from "./shared-strings"
 import { parseStyles } from "./styles"
+import { readDrawingLayout } from "./drawing-layout"
 import { parseWorksheet, parseWorksheetStream } from "./worksheet"
 import type { WorksheetContext } from "./worksheet"
 import { parseDynamicArrayCellMetadata } from "./metadata"
@@ -785,10 +786,9 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
     workbook.activeSheet = activeSheet
   }
 
-  // The workbook's default font is fonts[0] in styles.xml — the entry
-  // every xf inherits from unless it names another. Surfacing it closes
-  // the WriteOptions.defaultFont round trip.
-  const baseFont = parsedStyles?.fonts[0]
+  // Column-width units use the builtin Normal style, which may reference
+  // any cellStyleXf/font. Keep the font table itself untouched for cell XFs.
+  const baseFont = parsedStyles?.normalFont ?? parsedStyles?.fonts[0]
   if (baseFont && Object.keys(baseFont).length > 0) {
     workbook.defaultFont = baseFont
   }
@@ -989,7 +989,7 @@ async function extractSheetDrawing(
           const img: SheetImage = {
             data,
             type: imageInfo.type,
-            anchor: imageInfo.anchor,
+            anchor: { ...imageInfo.anchor, ...readDrawingLayout(child) },
           }
           if (imageInfo.width !== undefined) img.width = imageInfo.width
           if (imageInfo.height !== undefined) img.height = imageInfo.height
@@ -998,7 +998,7 @@ async function extractSheetDrawing(
           images.push(img)
         }
       }
-    } else if (local === "oneCellAnchor") {
+    } else if (local === "oneCellAnchor" || local === "absoluteAnchor") {
       const imageInfo = parseOneCellAnchor(child, imageRelMap)
       if (imageInfo) {
         const imagePath = imageInfo.mediaPath
@@ -1007,7 +1007,7 @@ async function extractSheetDrawing(
           const img: SheetImage = {
             data,
             type: imageInfo.type,
-            anchor: imageInfo.anchor,
+            anchor: { ...imageInfo.anchor, ...readDrawingLayout(child) },
           }
           if (imageInfo.width !== undefined) img.width = imageInfo.width
           if (imageInfo.height !== undefined) img.height = imageInfo.height
@@ -1191,8 +1191,8 @@ function findShapeExtent(shapeEl: {
   const cy = Number(ext.attrs["cy"])
   // A zero / absent extent is a placeholder, not a 0×0 shape — the chart
   // writer emits exactly that. Report nothing rather than a size of 0.
-  if (!(cx > 0) || !(cy > 0)) return undefined
-  return { width: Math.round(cx / EMU_PER_PIXEL), height: Math.round(cy / EMU_PER_PIXEL) }
+  if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cy) || !(cx > 0) || !(cy > 0)) return undefined
+  return { width: cx / EMU_PER_PIXEL, height: cy / EMU_PER_PIXEL }
 }
 
 /** Parse a twoCellAnchor element that contains a textbox shape (sp with txBox="1") */
@@ -1497,11 +1497,11 @@ function parseOneCellAnchor(
     },
   }
 
-  if (widthEmu > 0) {
-    result.width = Math.round(widthEmu / EMU_PER_PIXEL)
+  if (Number.isSafeInteger(widthEmu) && widthEmu > 0) {
+    result.width = widthEmu / EMU_PER_PIXEL
   }
-  if (heightEmu > 0) {
-    result.height = Math.round(heightEmu / EMU_PER_PIXEL)
+  if (Number.isSafeInteger(heightEmu) && heightEmu > 0) {
+    result.height = heightEmu / EMU_PER_PIXEL
   }
   if (altText) result.altText = altText
   if (title) result.title = title

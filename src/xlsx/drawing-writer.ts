@@ -125,11 +125,15 @@ export function writeDrawing(
       }),
     )
 
-    // Calculate dimensions in EMU
-    const widthEmu = img.width ? img.width * EMU_PER_PIXEL : DEFAULT_WIDTH_EMU
-    const heightEmu = img.height ? img.height * EMU_PER_PIXEL : DEFAULT_HEIGHT_EMU
+    // Prefer exact parser-owned EMUs. Pixel fields remain a compatibility
+    // input for caller-created images; only quantize at XML serialization.
+    const widthEmu = imageExtent(img.anchor.extent?.cx, img.width, DEFAULT_WIDTH_EMU)
+    const heightEmu = imageExtent(img.anchor.extent?.cy, img.height, DEFAULT_HEIGHT_EMU)
+    const kind = img.anchor.kind ?? "twoCell"
+    const editAs = img.anchor.editAs
+    const position = img.anchor.position
 
-    // Build twoCellAnchor element
+    // Retain both markers even when a two-cell container has editAs=oneCell.
     const fromCol = img.anchor.from.col
     const fromRow = img.anchor.from.row
     const toCol = img.anchor.to?.col ?? fromCol + 3
@@ -137,16 +141,16 @@ export function writeDrawing(
 
     const fromElement = xmlElement("xdr:from", undefined, [
       xmlElement("xdr:col", undefined, String(fromCol)),
-      xmlElement("xdr:colOff", undefined, "0"),
+      xmlElement("xdr:colOff", undefined, String(imageCoordinate(img.anchor.from.colOff))),
       xmlElement("xdr:row", undefined, String(fromRow)),
-      xmlElement("xdr:rowOff", undefined, "0"),
+      xmlElement("xdr:rowOff", undefined, String(imageCoordinate(img.anchor.from.rowOff))),
     ])
 
     const toElement = xmlElement("xdr:to", undefined, [
       xmlElement("xdr:col", undefined, String(toCol)),
-      xmlElement("xdr:colOff", undefined, "0"),
+      xmlElement("xdr:colOff", undefined, String(imageCoordinate(img.anchor.to?.colOff))),
       xmlElement("xdr:row", undefined, String(toRow)),
-      xmlElement("xdr:rowOff", undefined, "0"),
+      xmlElement("xdr:rowOff", undefined, String(imageCoordinate(img.anchor.to?.rowOff))),
     ])
 
     const cNvPrAttrs: Record<string, string | number> = {
@@ -168,7 +172,7 @@ export function writeDrawing(
 
     const spPr = xmlElement("xdr:spPr", undefined, [
       xmlElement("a:xfrm", undefined, [
-        xmlSelfClose("a:off", { x: 0, y: 0 }),
+        xmlSelfClose("a:off", { x: imageCoordinate(position?.x), y: imageCoordinate(position?.y) }),
         xmlSelfClose("a:ext", { cx: widthEmu, cy: heightEmu }),
       ]),
       xmlElement("a:prstGeom", { prst: "rect" }, [xmlSelfClose("a:avLst")]),
@@ -176,11 +180,18 @@ export function writeDrawing(
 
     const pic = xmlElement("xdr:pic", undefined, [nvPicPr, blipFill, spPr])
 
-    const anchor = xmlElement("xdr:twoCellAnchor", undefined, [
+    const anchorTag = kind === "absolute" ? "xdr:absoluteAnchor"
+      : kind === "oneCell" ? "xdr:oneCellAnchor" : "xdr:twoCellAnchor"
+    const anchorAttrs = kind === "twoCell" && editAs ? { editAs } : undefined
+    const geometry = kind === "absolute" ? [
+      xmlSelfClose("xdr:pos", { x: imageCoordinate(position?.x), y: imageCoordinate(position?.y) }),
+      xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
+    ] : kind === "oneCell" ? [
       fromElement,
-      toElement,
-      pic,
-      xmlSelfClose("xdr:clientData"),
+      xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
+    ] : [fromElement, toElement]
+    const anchor = xmlElement(anchorTag, anchorAttrs, [
+      ...geometry, pic, xmlSelfClose("xdr:clientData"),
     ])
 
     anchorElements.push(anchor)
@@ -402,4 +413,17 @@ export function writeDrawing(
     images: drawingImages,
     charts: chartList,
   }
+}
+
+/** Do not serialize NaN/Infinity or fractional EMUs from public write inputs. */
+function imageCoordinate(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) && Number.isSafeInteger(Math.round(value))
+    ? Math.round(value) : 0
+}
+
+function imageExtent(emu: number | undefined, pixels: number | undefined, fallback: number): number {
+  if (emu !== undefined && Number.isSafeInteger(emu) && emu >= 0) return emu
+  const value = pixels === undefined ? undefined : pixels * EMU_PER_PIXEL
+  return value !== undefined && Number.isFinite(value) && value >= 0
+    && Number.isSafeInteger(Math.round(value)) ? Math.round(value) : fallback
 }

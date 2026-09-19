@@ -1021,6 +1021,8 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
       const copy = { ...img, data: new Uint8Array(img.data) }
       copy.anchor = { ...img.anchor, from: { ...img.anchor.from } }
       if (img.anchor.to) copy.anchor.to = { ...img.anchor.to }
+      if (img.anchor.extent) copy.anchor.extent = { ...img.anchor.extent }
+      if (img.anchor.position) copy.anchor.position = { ...img.anchor.position }
       return copy
     })
   }

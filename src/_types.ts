@@ -668,6 +668,14 @@ export interface SheetImage {
   type: "png" | "jpeg" | "gif" | "svg" | "webp"
   /** Anchor to cell */
   anchor: {
+    /** Original DrawingML container. Omitted by legacy caller-created models. */
+    kind?: "twoCell" | "oneCell" | "absolute"
+    /** Resizing behavior of a two-cell container; does not discard its markers. */
+    editAs?: "twoCell" | "oneCell" | "absolute"
+    /** Exact saved drawing extent in EMUs (914400 per inch), before display rounding. */
+    extent?: { cx: number; cy: number }
+    /** Sheet-relative position in EMUs for absolute placement. */
+    position?: { x: number; y: number }
     from: { row: number; col: number; rowOff?: number; colOff?: number }
     to?: { row: number; col: number; rowOff?: number; colOff?: number }
   }
