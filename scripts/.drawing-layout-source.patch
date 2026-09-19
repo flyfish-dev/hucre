@@ -1,0 +1,254 @@
+diff --git a/src/_types.ts b/src/_types.ts
+--- a/src/_types.ts
++++ b/src/_types.ts
+@@ -668,6 +668,14 @@
+   type: "png" | "jpeg" | "gif" | "svg" | "webp"
+   /** Anchor to cell */
+   anchor: {
++    /** Original DrawingML container. Omitted by legacy caller-created models. */
++    kind?: "twoCell" | "oneCell" | "absolute"
++    /** Resizing behavior of a two-cell container; does not discard its markers. */
++    editAs?: "twoCell" | "oneCell" | "absolute"
++    /** Exact saved drawing extent in EMUs (914400 per inch), before display rounding. */
++    extent?: { cx: number; cy: number }
++    /** Sheet-relative position in EMUs for absolute placement. */
++    position?: { x: number; y: number }
+     from: { row: number; col: number; rowOff?: number; colOff?: number }
+     to?: { row: number; col: number; rowOff?: number; colOff?: number }
+   }
+diff --git a/src/xlsx/styles.ts b/src/xlsx/styles.ts
+--- a/src/xlsx/styles.ts
++++ b/src/xlsx/styles.ts
+@@ -24,6 +24,8 @@
+ export interface ParsedStyles {
+   numFmts: Map<number, string>
+   fonts: FontStyle[]
++  /** Resolved through builtin Normal → cellStyleXfs → fonts, never by array order. */
++  normalFont?: FontStyle
+   fills: FillStyle[]
+   borders: BorderStyle[]
+   cellXfs: CellXf[]
+@@ -143,7 +145,22 @@
+   const palette = readIndexedPalette(doc)
+   for (const group of [fonts, fills, borders, dxfs]) resolveIndexed(group, palette)
+ 
+-  return { numFmts, fonts, fills, borders, cellXfs, dxfs }
++  const normal = elementChildren(doc, "cellStyles")
++    .flatMap((el) => elementChildren(el, "cellStyle"))
++    .find((el) => el.attrs["builtinId"] === "0")
++  const styleXfs = elementChildren(doc, "cellStyleXfs")
++    .flatMap((el) => elementChildren(el, "xf"))
++  const xfId = normal ? Number(normal.attrs["xfId"]) : 0
++  const fontId = Number.isInteger(xfId) && xfId >= 0
++    ? Number(styleXfs[xfId]?.attrs["fontId"] ?? 0) : 0
++  const normalFont = (Number.isInteger(fontId) && fontId >= 0 ? fonts[fontId] : undefined) ?? fonts[0]
++  return { numFmts, fonts, fills, borders, cellXfs, dxfs, normalFont }
++}
++
++
++function elementChildren(parent: XmlElement, local: string): XmlElement[] {
++  return parent.children.filter((child): child is XmlElement =>
++    typeof child !== "string" && (child.local || child.tag) === local)
+ }
+ 
+ // ── Indexed colours ──────────────────────────────────────────────────
+diff --git a/src/xlsx/reader.ts b/src/xlsx/reader.ts
+--- a/src/xlsx/reader.ts
++++ b/src/xlsx/reader.ts
+@@ -43,6 +43,7 @@
+ import { dirname, findRIdAttr, parseRelationships, resolvePath } from "./relationships"
+ import { parseSharedStrings } from "./shared-strings"
+ import { parseStyles } from "./styles"
++import { readDrawingLayout } from "./drawing-layout"
+ import { parseWorksheet, parseWorksheetStream } from "./worksheet"
+ import type { WorksheetContext } from "./worksheet"
+ import { parseDynamicArrayCellMetadata } from "./metadata"
+@@ -785,10 +786,9 @@
+     workbook.activeSheet = activeSheet
+   }
+ 
+-  // The workbook's default font is fonts[0] in styles.xml — the entry
+-  // every xf inherits from unless it names another. Surfacing it closes
+-  // the WriteOptions.defaultFont round trip.
+-  const baseFont = parsedStyles?.fonts[0]
++  // Column-width units use the builtin Normal style, which may reference
++  // any cellStyleXf/font. Keep the font table itself untouched for cell XFs.
++  const baseFont = parsedStyles?.normalFont ?? parsedStyles?.fonts[0]
+   if (baseFont && Object.keys(baseFont).length > 0) {
+     workbook.defaultFont = baseFont
+   }
+@@ -989,7 +989,7 @@
+           const img: SheetImage = {
+             data,
+             type: imageInfo.type,
+-            anchor: imageInfo.anchor,
++            anchor: { ...imageInfo.anchor, ...readDrawingLayout(child) },
+           }
+           if (imageInfo.width !== undefined) img.width = imageInfo.width
+           if (imageInfo.height !== undefined) img.height = imageInfo.height
+@@ -998,7 +998,7 @@
+           images.push(img)
+         }
+       }
+-    } else if (local === "oneCellAnchor") {
++    } else if (local === "oneCellAnchor" || local === "absoluteAnchor") {
+       const imageInfo = parseOneCellAnchor(child, imageRelMap)
+       if (imageInfo) {
+         const imagePath = imageInfo.mediaPath
+@@ -1007,7 +1007,7 @@
+           const img: SheetImage = {
+             data,
+             type: imageInfo.type,
+-            anchor: imageInfo.anchor,
++            anchor: { ...imageInfo.anchor, ...readDrawingLayout(child) },
+           }
+           if (imageInfo.width !== undefined) img.width = imageInfo.width
+           if (imageInfo.height !== undefined) img.height = imageInfo.height
+@@ -1191,8 +1191,8 @@
+   const cy = Number(ext.attrs["cy"])
+   // A zero / absent extent is a placeholder, not a 0×0 shape — the chart
+   // writer emits exactly that. Report nothing rather than a size of 0.
+-  if (!(cx > 0) || !(cy > 0)) return undefined
+-  return { width: Math.round(cx / EMU_PER_PIXEL), height: Math.round(cy / EMU_PER_PIXEL) }
++  if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cy) || !(cx > 0) || !(cy > 0)) return undefined
++  return { width: cx / EMU_PER_PIXEL, height: cy / EMU_PER_PIXEL }
+ }
+ 
+ /** Parse a twoCellAnchor element that contains a textbox shape (sp with txBox="1") */
+@@ -1497,11 +1497,11 @@
+     },
+   }
+ 
+-  if (widthEmu > 0) {
+-    result.width = Math.round(widthEmu / EMU_PER_PIXEL)
+-  }
+-  if (heightEmu > 0) {
+-    result.height = Math.round(heightEmu / EMU_PER_PIXEL)
++  if (Number.isSafeInteger(widthEmu) && widthEmu > 0) {
++    result.width = widthEmu / EMU_PER_PIXEL
++  }
++  if (Number.isSafeInteger(heightEmu) && heightEmu > 0) {
++    result.height = heightEmu / EMU_PER_PIXEL
+   }
+   if (altText) result.altText = altText
+   if (title) result.title = title
+diff --git a/src/xlsx/drawing-writer.ts b/src/xlsx/drawing-writer.ts
+--- a/src/xlsx/drawing-writer.ts
++++ b/src/xlsx/drawing-writer.ts
+@@ -125,11 +125,15 @@
+       }),
+     )
+ 
+-    // Calculate dimensions in EMU
+-    const widthEmu = img.width ? img.width * EMU_PER_PIXEL : DEFAULT_WIDTH_EMU
+-    const heightEmu = img.height ? img.height * EMU_PER_PIXEL : DEFAULT_HEIGHT_EMU
+-
+-    // Build twoCellAnchor element
++    // Prefer exact parser-owned EMUs. Pixel fields remain a compatibility
++    // input for caller-created images; only quantize at XML serialization.
++    const widthEmu = imageExtent(img.anchor.extent?.cx, img.width, DEFAULT_WIDTH_EMU)
++    const heightEmu = imageExtent(img.anchor.extent?.cy, img.height, DEFAULT_HEIGHT_EMU)
++    const kind = img.anchor.kind ?? "twoCell"
++    const editAs = img.anchor.editAs
++    const position = img.anchor.position
++
++    // Retain both markers even when a two-cell container has editAs=oneCell.
+     const fromCol = img.anchor.from.col
+     const fromRow = img.anchor.from.row
+     const toCol = img.anchor.to?.col ?? fromCol + 3
+@@ -137,16 +141,16 @@
+ 
+     const fromElement = xmlElement("xdr:from", undefined, [
+       xmlElement("xdr:col", undefined, String(fromCol)),
+-      xmlElement("xdr:colOff", undefined, "0"),
++      xmlElement("xdr:colOff", undefined, String(imageCoordinate(img.anchor.from.colOff))),
+       xmlElement("xdr:row", undefined, String(fromRow)),
+-      xmlElement("xdr:rowOff", undefined, "0"),
++      xmlElement("xdr:rowOff", undefined, String(imageCoordinate(img.anchor.from.rowOff))),
+     ])
+ 
+     const toElement = xmlElement("xdr:to", undefined, [
+       xmlElement("xdr:col", undefined, String(toCol)),
+-      xmlElement("xdr:colOff", undefined, "0"),
++      xmlElement("xdr:colOff", undefined, String(imageCoordinate(img.anchor.to?.colOff))),
+       xmlElement("xdr:row", undefined, String(toRow)),
+-      xmlElement("xdr:rowOff", undefined, "0"),
++      xmlElement("xdr:rowOff", undefined, String(imageCoordinate(img.anchor.to?.rowOff))),
+     ])
+ 
+     const cNvPrAttrs: Record<string, string | number> = {
+@@ -168,7 +172,7 @@
+ 
+     const spPr = xmlElement("xdr:spPr", undefined, [
+       xmlElement("a:xfrm", undefined, [
+-        xmlSelfClose("a:off", { x: 0, y: 0 }),
++        xmlSelfClose("a:off", { x: imageCoordinate(position?.x), y: imageCoordinate(position?.y) }),
+         xmlSelfClose("a:ext", { cx: widthEmu, cy: heightEmu }),
+       ]),
+       xmlElement("a:prstGeom", { prst: "rect" }, [xmlSelfClose("a:avLst")]),
+@@ -176,11 +180,18 @@
+ 
+     const pic = xmlElement("xdr:pic", undefined, [nvPicPr, blipFill, spPr])
+ 
+-    const anchor = xmlElement("xdr:twoCellAnchor", undefined, [
++    const anchorTag = kind === "absolute" ? "xdr:absoluteAnchor"
++      : kind === "oneCell" ? "xdr:oneCellAnchor" : "xdr:twoCellAnchor"
++    const anchorAttrs = kind === "twoCell" && editAs ? { editAs } : undefined
++    const geometry = kind === "absolute" ? [
++      xmlSelfClose("xdr:pos", { x: imageCoordinate(position?.x), y: imageCoordinate(position?.y) }),
++      xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
++    ] : kind === "oneCell" ? [
+       fromElement,
+-      toElement,
+-      pic,
+-      xmlSelfClose("xdr:clientData"),
++      xmlSelfClose("xdr:ext", { cx: widthEmu, cy: heightEmu }),
++    ] : [fromElement, toElement]
++    const anchor = xmlElement(anchorTag, anchorAttrs, [
++      ...geometry, pic, xmlSelfClose("xdr:clientData"),
+     ])
+ 
+     anchorElements.push(anchor)
+@@ -403,3 +414,16 @@
+     charts: chartList,
+   }
+ }
++
++/** Do not serialize NaN/Infinity or fractional EMUs from public write inputs. */
++function imageCoordinate(value: number | undefined): number {
++  return value !== undefined && Number.isFinite(value) && Number.isSafeInteger(Math.round(value))
++    ? Math.round(value) : 0
++}
++
++function imageExtent(emu: number | undefined, pixels: number | undefined, fallback: number): number {
++  if (emu !== undefined && Number.isSafeInteger(emu) && emu >= 0) return emu
++  const value = pixels === undefined ? undefined : pixels * EMU_PER_PIXEL
++  return value !== undefined && Number.isFinite(value) && value >= 0
++    && Number.isSafeInteger(Math.round(value)) ? Math.round(value) : fallback
++}
+diff --git a/src/sheet-ops.ts b/src/sheet-ops.ts
+--- a/src/sheet-ops.ts
++++ b/src/sheet-ops.ts
+@@ -1021,6 +1021,8 @@
+       const copy = { ...img, data: new Uint8Array(img.data) }
+       copy.anchor = { ...img.anchor, from: { ...img.anchor.from } }
+       if (img.anchor.to) copy.anchor.to = { ...img.anchor.to }
++      if (img.anchor.extent) copy.anchor.extent = { ...img.anchor.extent }
++      if (img.anchor.position) copy.anchor.position = { ...img.anchor.position }
+       return copy
+     })
+   }
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -95,7 +95,9 @@
+     "test": "pnpm lint && pnpm typecheck && vitest run",
+     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.cli.json",
+     "release": "pnpm test && pnpm build && bumpp --commit --tag --push --all",
+-    "prepack": "pnpm build"
++    "prepack": "npm run build",
++    "prepare": "npm run build",
++    "test:drawing-layout": "npm run build && node --test scripts/verify-drawing-layout.mjs"
+   },
+   "devDependencies": {
+     "@types/node": "^26.1.2",
