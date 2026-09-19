@@ -40,6 +40,7 @@ const rkInt = (v: number): number[] => u32(((v << 2) | 2) >>> 0)
 
 const SID = {
   FORMULA: 0x0006,
+  STRING: 0x0207,
   EOF: 0x000a,
   HORIZONTALPAGEBREAKS: 0x001b,
   VERTICALPAGEBREAKS: 0x001a,
@@ -61,6 +62,7 @@ const SID = {
   SCL: 0x00a0,
   SETUP: 0x00a1,
   BLANK: 0x0201,
+  MULBLANK: 0x00be,
   DIMENSIONS: 0x0200,
   NUMBER: 0x0203,
   LABEL: 0x0204,
@@ -138,6 +140,18 @@ function buildXls(opts: { dateFmtId?: number } = {}): Uint8Array {
   const workbookStream = concat([globals, sheet])
 
   return writeCfb([{ name: "Workbook", data: workbookStream }])
+}
+
+function buildSingleSheetXls(sheetRecords: number[][], globalRecords: number[][] = []): Uint8Array {
+  const sheet = concat([bof(0x0010), ...sheetRecords, eof()])
+  const globals = (sheetPos: number) =>
+    concat([
+      bof(0x0005),
+      ...globalRecords,
+      record(SID.BOUNDSHEET, [...u32(sheetPos), 0, 0, ...shortStr("Cases")]),
+      eof(),
+    ])
+  return writeCfb([{ name: "Workbook", data: concat([globals(globals(0).length), sheet]) }])
 }
 
 function buildStyledXls(): Uint8Array {
@@ -269,6 +283,8 @@ function buildPageBreakPreviewXls(
     pageBreakPreview?: boolean
     pageBreakZoom?: number
     normalZoom?: number
+    setupFlags?: number
+    windowFlags?: number
     rowBreakData?: number[]
     colBreakData?: number[]
   } = {},
@@ -281,6 +297,8 @@ function buildPageBreakPreviewXls(
     pageBreakPreview = true,
     pageBreakZoom = 130,
     normalZoom = 90,
+    setupFlags = 0x0002,
+    windowFlags = pageBreakPreview ? 0x0eb6 : 0x06b6,
     rowBreakData,
     colBreakData,
   } = options
@@ -296,7 +314,7 @@ function buildPageBreakPreviewXls(
     bof(0x0010, version),
     // Page Break Preview, grid/headers visible, 60% zoom through SCL.
     record(SID.WINDOW2, [
-      ...u16(pageBreakPreview ? 0x0eb6 : 0x06b6),
+      ...u16(windowFlags),
       ...u16(0),
       ...u16(0),
       ...u16(64),
@@ -321,7 +339,7 @@ function buildPageBreakPreviewXls(
       ...u16(1),
       ...u16(1),
       ...u16(2),
-      ...u16(0x0002),
+      ...u16(setupFlags),
       ...u16(180),
       ...u16(180),
       ...f64(0.5),
@@ -586,5 +604,210 @@ describe("XLS (BIFF8) reader", () => {
     const data = writeCfb([{ name: "Workbook", data: stream }])
     const workbook = await readXls(data)
     expect(workbook.sheets).toEqual([{ name: "Sheet1", rows: [] }])
+  })
+
+  it("retains the full BIFF print setup flag semantics", async () => {
+    const detailed = (
+      await readXls(
+        buildPageBreakPreviewXls({
+          setupFlags: 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0080 | 0x0200 | 0x0400,
+          includeScl: false,
+        }),
+      )
+    ).sheets[0]!.pageSetup!
+    expect(detailed).toMatchObject({
+      pageOrder: "overThenDown",
+      orientation: "portrait",
+      blackAndWhite: true,
+      draft: true,
+      cellComments: "atEnd",
+      errors: "blank",
+      firstPageNumber: 1,
+      useFirstPageNumber: true,
+    })
+    const noPrinter = (
+      await readXls(
+        buildPageBreakPreviewXls({
+          setupFlags: 0x0004 | 0x0020 | 0x0800,
+        }),
+      )
+    ).sheets[0]!.pageSetup!
+    expect(noPrinter).toMatchObject({ cellComments: "asDisplayed", errors: "dash" })
+    expect(noPrinter.paperSize).toBeUndefined()
+    expect(noPrinter.orientation).toBeUndefined()
+    const noOrientation = (
+      await readXls(
+        buildPageBreakPreviewXls({
+          setupFlags: 0x0040 | 0x0c00,
+        }),
+      )
+    ).sheets[0]!.pageSetup!
+    expect(noOrientation.errors).toBe("NA")
+    expect(noOrientation.orientation).toBeUndefined()
+  })
+
+  it("uses window flags for right-to-left and hidden headers without treating normal view as a page preview", async () => {
+    const sheet = (
+      await readXls(
+        buildPageBreakPreviewXls({
+          pageBreakPreview: false,
+          windowFlags: 0x0040,
+          includeScl: false,
+        }),
+      )
+    ).sheets[0]!
+    expect(sheet.view).toMatchObject({
+      rightToLeft: true,
+      showGridLines: false,
+      showRowColHeaders: false,
+      zoomScale: 90,
+    })
+    expect(sheet.view?.mode).toBeUndefined()
+  })
+
+  it("decodes numeric, boolean, error, string and blank formula caches", async () => {
+    const formula = (row: number, cached: number[]) =>
+      record(SID.FORMULA, [...u16(row), ...u16(0), ...u16(0), ...cached])
+    const special = (kind: number, value: number) => [kind, 0, value, 0, 0, 0, 0xff, 0xff]
+    const data = buildSingleSheetXls([
+      formula(0, f64(3.5)),
+      formula(1, special(1, 1)),
+      formula(2, special(2, 0x07)),
+      formula(3, special(0, 0)),
+      record(SID.STRING, xlStr("cached")),
+      formula(4, special(3, 0)),
+      record(SID.BOOLERR, [...u16(5), ...u16(0), ...u16(0), 0xff, 1]),
+    ])
+    const valueOnly = (await readXls(data)).sheets[0]!
+    expect(valueOnly.rows.slice(0, 6).map((row) => row[0])).toEqual([
+      3.5,
+      true,
+      "#DIV/0!",
+      "cached",
+      null,
+      "#ERR!",
+    ])
+    const styled = (await readXls(data, { readStyles: true })).sheets[0]!
+    expect(styled.cells?.get("4,0")?.type).toBe("empty")
+  })
+
+  it("ignores blank records outside declared dimensions while preserving valid null cells", async () => {
+    const sheet = (
+      await readXls(
+        buildSingleSheetXls(
+          [
+            record(SID.DIMENSIONS, [...u32(0), ...u32(1), ...u16(0), ...u16(1), ...u16(0)]),
+            record(SID.BLANK, [...u16(0), ...u16(0), ...u16(0)]),
+            record(SID.BLANK, [...u16(0), ...u16(1), ...u16(0)]),
+            record(SID.MULBLANK, [...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u16(1)]),
+          ],
+          [record(SID.PALETTE, [0])],
+        ),
+        { readStyles: true },
+      )
+    ).sheets[0]!
+    expect(sheet.rows[0]).toEqual([null])
+    expect(sheet.cells?.has("0,1")).toBe(false)
+  })
+
+  it("decodes BIFF font, alignment, border and pattern variants from independent XFs", async () => {
+    const font = (name: string, underline: number, escapement: number, flags = 0x000a) =>
+      record(SID.FONT, [
+        ...u16(240),
+        ...u16(flags),
+        ...u16(8),
+        ...u16(700),
+        ...u16(escapement),
+        underline,
+        2,
+        1,
+        0,
+        ...shortStr(name),
+      ])
+    const xf = (
+      fontIndex: number,
+      fmt: number,
+      protection: number,
+      alignment: number,
+      rotation: number,
+      indent: number,
+      border1: number,
+      border2: number,
+      colors: number,
+    ) =>
+      record(SID.XF, [
+        ...u16(fontIndex),
+        ...u16(fmt),
+        ...u16(protection),
+        alignment,
+        rotation,
+        indent,
+        0,
+        ...u32(border1),
+        ...u32(border2),
+        ...u16(colors),
+      ])
+    const palette = record(SID.PALETTE, [...u16(2), 0x10, 0x20, 0x30, 0, 0x40, 0x50, 0x60, 0])
+    const sheetRecords = Array.from({ length: 6 }, (_, row) =>
+      record(SID.LABEL, [...u16(row), ...u16(0), ...u16(row), ...xlStr("x")]),
+    )
+    const bytes = buildSingleSheetXls(sheetRecords, [
+      font("Default", 0, 0, 0),
+      font("Double", 2, 1),
+      font("Accounting", 0x21, 2),
+      font("DoubleAccounting", 0x22, 0),
+      font("Skipped4", 1, 0),
+      record(SID.FONT, [0]),
+      xf(0, 0, 1, 0, 0, 0, 0, 0, 0),
+      xf(1, 0, 2, 0x1a, 45, 0x51, 0xc0084321, (1 << 26) | (5 << 21) | (8 << 14) | 8, 8 | (9 << 7)),
+      xf(2, 0, 1, 0, 0, 0x80, 0, 63 << 26, 0),
+      xf(3, 14, 1, 0, 0, 0, 0, 0, 0),
+      xf(5, 0, 1, 0, 0, 0, 0, 0, 0),
+      xf(0, 0, 1, 0, 0, 0, 0, 1 << 26, 0x7f | (0x7f << 7)),
+      palette,
+    ])
+    const cells = (await readXls(bytes, { readStyles: true })).sheets[0]!.cells!
+    const detailed = cells.get("1,0")!.style!
+    expect(detailed.font).toMatchObject({
+      name: "Double",
+      bold: true,
+      italic: true,
+      strikethrough: true,
+      underline: "double",
+      vertAlign: "superscript",
+      family: 2,
+      charset: 1,
+      color: { rgb: "102030" },
+    })
+    expect(detailed.alignment).toMatchObject({
+      horizontal: "center",
+      vertical: "center",
+      wrapText: true,
+      shrinkToFit: true,
+      indent: 1,
+      textRotation: 45,
+      readingOrder: "ltr",
+    })
+    expect(detailed.border?.left?.style).toBe("thin")
+    expect(detailed.border?.diagonalUp).toBe(true)
+    expect(detailed.border?.diagonalDown).toBe(true)
+    expect(detailed.fill).toMatchObject({
+      pattern: "solid",
+      fgColor: { rgb: "102030" },
+      bgColor: { rgb: "405060" },
+    })
+    expect(cells.get("2,0")!.style?.font).toMatchObject({
+      underline: "singleAccounting",
+      vertAlign: "subscript",
+    })
+    expect(cells.get("2,0")!.style?.alignment?.readingOrder).toBe("rtl")
+    expect(cells.get("2,0")!.style?.fill).toBeUndefined()
+    expect(cells.get("3,0")!.style?.font?.underline).toBe("doubleAccounting")
+    expect(cells.get("3,0")!.style?.numFmt).toBeTruthy()
+    expect(cells.get("4,0")!.style?.font?.name).toBe("Skipped4")
+    expect(cells.get("5,0")!.style?.fill).toMatchObject({ pattern: "solid" })
+    const noPaletteFill = cells.get("5,0")!.style?.fill
+    expect(noPaletteFill?.type).toBe("pattern")
+    if (noPaletteFill?.type === "pattern") expect(noPaletteFill.fgColor).toBeUndefined()
   })
 })

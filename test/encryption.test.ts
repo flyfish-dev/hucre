@@ -79,6 +79,34 @@ describe("agile crypto primitive", () => {
 describe("shared Office Agile package", () => {
   const payload = Uint8Array.from({ length: 8_197 }, (_, index) => index % 251)
 
+  it("round-trips raw CBC blocks in a browser-like Web Crypto runtime", async () => {
+    // Node normally takes its no-padding crypto path. Mask only its runtime
+    // marker so this exercises the browser fallback without changing the
+    // system crypto provider or relying on a browser test in coverage CI.
+    const runtime = globalThis as unknown as {
+      process?: { versions?: Record<string, string | undefined> }
+    }
+    const actualProcess = runtime.process
+    const browserLikeProcess = Object.create(actualProcess ?? null) as {
+      versions?: Record<string, string | undefined>
+    }
+    Object.defineProperty(browserLikeProcess, "versions", {
+      value: { ...actualProcess?.versions, node: undefined },
+      configurable: true,
+    })
+    runtime.process = browserLikeProcess
+    try {
+      const encrypted = await encryptOfficeAgilePackage(payload, {
+        password: "web",
+        spinCount: 2,
+        hashAlgorithm: "SHA-256",
+      })
+      expect(await decryptOfficeEncryptedPackage(encrypted, "web", "xlsx")).toEqual(payload)
+    } finally {
+      runtime.process = actualProcess
+    }
+  })
+
   for (const [keyBits, hashAlgorithm] of [
     [128, "SHA-1"],
     [192, "SHA-256"],

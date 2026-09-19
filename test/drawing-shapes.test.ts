@@ -76,6 +76,46 @@ describe("DrawingML basic vector shapes", () => {
     ).toEqual([])
   })
 
+  it("bounds nested groups and rejects non-integer or non-positive child transforms", () => {
+    const wrapper = (inside: string, off = 'x="0" y="0"', ext = 'cx="10" cy="10"') =>
+      `<grpSp><grpSpPr><xfrm><off ${off}/><ext ${ext}/><chOff x="0" y="0"/><chExt cx="10" cy="10"/></xfrm></grpSpPr>${inside}</grpSp>`
+    for (const off of ['x="NaN" y="0"', 'x="9007199254740992" y="0"']) {
+      expect(
+        readDrawingShapePrimitives(
+          parseXml(`<twoCellAnchor>${wrapper(wrapper(rectangle, off))}</twoCellAnchor>`),
+        ),
+      ).toEqual([])
+    }
+    expect(
+      readDrawingShapePrimitives(
+        parseXml(
+          `<twoCellAnchor>${wrapper(wrapper(rectangle, 'x="0" y="0"', 'cx="0" cy="10"'))}</twoCellAnchor>`,
+        ),
+      ),
+    ).toEqual([])
+    let nested = rectangle
+    for (let i = 0; i < 33; i++) nested = wrapper(nested)
+    expect(
+      readDrawingShapePrimitives(parseXml(`<twoCellAnchor>${nested}</twoCellAnchor>`)),
+    ).toEqual([])
+  })
+
+  it("retains safe system colors while ignoring unsupported color and line attributes", () => {
+    const shape = parseXml(`<twoCellAnchor><sp><spPr><prstGeom prst="ellipse"/>
+      <solidFill><sysClr lastClr="123ABC"/></solidFill><ln w="bad"><solidFill><schemeClr val="Bad-Color"/></solidFill></ln>
+      </spPr></sp></twoCellAnchor>`)
+    expect(readDrawingShapePrimitives(shape)).toEqual([
+      {
+        geometry: "ellipse",
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        fill: { rgb: "123ABC" },
+      },
+    ])
+  })
+
   it("reads an anonymous shape alongside a picture and retains it across clone/worker", async () => {
     const original = await writeXlsx({
       sheets: [
@@ -105,9 +145,17 @@ describe("DrawingML basic vector shapes", () => {
         <xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
         <xdr:sp><xdr:spPr><a:prstGeom prst="ellipse"/><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill></xdr:spPr></xdr:sp>
         <xdr:clientData/></xdr:twoCellAnchor>`
+      const oneCell = `<xdr:oneCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:row>4</xdr:row></xdr:from>
+        <xdr:ext cx="952500" cy="190500"/><xdr:sp><xdr:spPr><a:prstGeom prst="rect"/><a:noFill/></xdr:spPr></xdr:sp>
+        <xdr:clientData/></xdr:oneCellAnchor>`
+      const absolute = `<xdr:absoluteAnchor><xdr:pos x="95250" y="190500"/><xdr:ext cx="190500" cy="95250"/>
+        <xdr:sp><xdr:spPr><a:prstGeom prst="ellipse"/><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></xdr:spPr></xdr:sp>
+        <xdr:clientData/></xdr:absoluteAnchor>`
       rebuilt.add(
         path,
-        new TextEncoder().encode(drawing.replace("</xdr:wsDr>", `${shape}</xdr:wsDr>`)),
+        new TextEncoder().encode(
+          drawing.replace("</xdr:wsDr>", `${shape}${oneCell}${absolute}</xdr:wsDr>`),
+        ),
       )
     }
     const workbook = await readXlsx(await rebuilt.build())
@@ -117,6 +165,21 @@ describe("DrawingML basic vector shapes", () => {
         anchor: { kind: "twoCell", from: { row: 2, col: 1 }, to: { row: 3, col: 2 } },
         primitives: [
           { geometry: "ellipse", x: 0, y: 0, width: 1, height: 1, fill: { rgb: "ABCDEF" } },
+        ],
+      },
+      {
+        anchor: { kind: "oneCell", from: { row: 4, col: 3 }, extent: { cx: 952500, cy: 190500 } },
+        primitives: [{ geometry: "rect", x: 0, y: 0, width: 1, height: 1, fill: null }],
+      },
+      {
+        anchor: {
+          kind: "absolute",
+          from: { row: 0, col: 0 },
+          position: { x: 95250, y: 190500 },
+          extent: { cx: 190500, cy: 95250 },
+        },
+        primitives: [
+          { geometry: "ellipse", x: 0, y: 0, width: 1, height: 1, fill: { scheme: "accent1" } },
         ],
       },
     ])
