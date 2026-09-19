@@ -604,7 +604,7 @@ describe("drawing images", () => {
     expect(wb.sheets[0].images![0]).toEqual({
       data: PNG,
       type: "png",
-      anchor: { from: { row: 3, col: 2 } },
+      anchor: { from: { row: 3, col: 2 }, kind: "oneCell", extent: { cx: 952500, cy: 476250 } },
       width: 100,
       height: 50,
       altText: "A logo",

@@ -129,6 +129,7 @@ describe("Excel 365 in-cell and AlternateContent pictures", () => {
     expect(sheet.images).toHaveLength(1)
     expect(sheet.images?.[0]?.data.at(-1)).toBe(2)
     expect(sheet.images?.[0]?.anchor).toEqual({
+      kind: "twoCell",
       from: { row: 8, col: 4, rowOff: 77884, colOff: 636399 },
       to: { row: 19, col: 7, rowOff: 125312, colOff: 36697 },
     })

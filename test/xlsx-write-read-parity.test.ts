@@ -185,7 +185,12 @@ const SHEET_FIELDS: { [K in keyof Required<WriteSheet>]: Entry<WriteSheet[K]> } 
     expected: [
       {
         type: "png",
-        anchor: { from: { row: 4, col: 0 }, to: { row: 9, col: 3 } },
+        anchor: {
+          from: { row: 4, col: 0 },
+          to: { row: 9, col: 3 },
+          kind: "twoCell",
+          extent: { cx: 1143000, cy: 762000 },
+        },
         width: 120,
         height: 80,
         altText: "a chart of nothing",
