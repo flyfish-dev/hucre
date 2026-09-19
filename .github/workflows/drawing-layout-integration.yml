@@ -38,3 +38,35 @@ jobs:
           name: drawing-layout-runtime
           path: drawing-layout-runtime.tar.gz
           retention-days: 3
+  coverage-baseline:
+    name: Measure unchanged base coverage (informational)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the PR base, not the proposed changes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - run: corepack enable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+      - name: Record baseline without changing coverage gates
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          set +e
+          pnpm coverage > "$RUNNER_TEMP/base-coverage.log" 2>&1
+          status=$?
+          set -e
+          tail -180 "$RUNNER_TEMP/base-coverage.log"
+          echo "Unchanged base coverage exit status: $status"
+          {
+            echo '## Unchanged base coverage (informational only)'
+            echo "Revision: $(git rev-parse HEAD)"
+            echo "Coverage exit status: $status"
+            echo 'The main CI coverage job still independently enforces all original thresholds.'
+          } >> "$GITHUB_STEP_SUMMARY"
