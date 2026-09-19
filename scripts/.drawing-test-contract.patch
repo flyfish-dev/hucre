@@ -1,0 +1,35 @@
+diff --git a/test/coverage-xlsx-reader.test.ts b/test/coverage-xlsx-reader.test.ts
+--- a/test/coverage-xlsx-reader.test.ts
++++ b/test/coverage-xlsx-reader.test.ts
+@@ -604,7 +604,7 @@
+     expect(wb.sheets[0].images![0]).toEqual({
+       data: PNG,
+       type: "png",
+-      anchor: { from: { row: 3, col: 2 } },
++      anchor: { from: { row: 3, col: 2 }, kind: "oneCell", extent: { cx: 952500, cy: 476250 } },
+       width: 100,
+       height: 50,
+       altText: "A logo",
+diff --git a/test/excel365-in-cell-images.test.ts b/test/excel365-in-cell-images.test.ts
+--- a/test/excel365-in-cell-images.test.ts
++++ b/test/excel365-in-cell-images.test.ts
+@@ -129,6 +129,7 @@
+     expect(sheet.images).toHaveLength(1)
+     expect(sheet.images?.[0]?.data.at(-1)).toBe(2)
+     expect(sheet.images?.[0]?.anchor).toEqual({
++      kind: "twoCell",
+       from: { row: 8, col: 4, rowOff: 77884, colOff: 636399 },
+       to: { row: 19, col: 7, rowOff: 125312, colOff: 36697 },
+     })
+diff --git a/test/xlsx-write-read-parity.test.ts b/test/xlsx-write-read-parity.test.ts
+--- a/test/xlsx-write-read-parity.test.ts
++++ b/test/xlsx-write-read-parity.test.ts
+@@ -185,7 +185,7 @@
+     expected: [
+       {
+         type: "png",
+-        anchor: { from: { row: 4, col: 0 }, to: { row: 9, col: 3 } },
++        anchor: { from: { row: 4, col: 0 }, to: { row: 9, col: 3 }, kind: "twoCell", extent: { cx: 1143000, cy: 762000 } },
+         width: 120,
+         height: 80,
+         altText: "a chart of nothing",

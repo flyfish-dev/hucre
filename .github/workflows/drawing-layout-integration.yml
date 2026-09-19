@@ -18,16 +18,19 @@ jobs:
           node-version: 24
       - name: Install build dependencies without changing the lockfile
         run: npm install --ignore-scripts --package-lock=false
-      - name: Format only the reviewed changed files
+      - name: Integrate additive contract expectations
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          node_modules/.bin/oxfmt src/_types.ts src/sheet-ops.ts src/xlsx/reader.ts src/xlsx/styles.ts src/xlsx/drawing-writer.ts src/xlsx/drawing-layout.ts scripts/verify-drawing-layout.mjs docs/drawing-layout.md package.json
-          git add src/_types.ts src/sheet-ops.ts src/xlsx/reader.ts src/xlsx/styles.ts src/xlsx/drawing-writer.ts src/xlsx/drawing-layout.ts scripts/verify-drawing-layout.mjs docs/drawing-layout.md package.json
-          if ! git diff --cached --quiet; then
+          if test -f scripts/.drawing-test-contract.patch; then
+            git apply --check scripts/.drawing-test-contract.patch
+            git apply --index scripts/.drawing-test-contract.patch
+            git rm scripts/.drawing-test-contract.patch
+            node_modules/.bin/oxfmt test/coverage-xlsx-reader.test.ts test/excel365-in-cell-images.test.ts test/xlsx-write-read-parity.test.ts
+            git add test/coverage-xlsx-reader.test.ts test/excel365-in-cell-images.test.ts test/xlsx-write-read-parity.test.ts
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'style: format drawing contract changes with repository conventions'
+            git commit -m 'test: expect preserved drawing metadata without weakening parity checks'
             git push origin HEAD:refs/heads/feature/drawing-layout-contract
           fi
       - name: Check public parser and writer contract
@@ -40,7 +43,7 @@ jobs:
         if: always()
         run: |
           git rev-parse HEAD > integration-revision.txt
-          tar -czf drawing-layout-runtime.tar.gz src dist scripts docs package.json build.config.ts tsconfig.json tsconfig.cli.json integration-revision.txt
+          tar -czf drawing-layout-runtime.tar.gz src dist scripts docs test package.json build.config.ts tsconfig.json tsconfig.cli.json integration-revision.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
