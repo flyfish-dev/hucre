@@ -156,8 +156,8 @@ export function fromHtml(html: string, options?: HtmlImportOptions): Sheet {
   // seconds before this counter existed.
   let gridCells = 0
 
-  function spend(): void {
-    if (++gridCells > MAX_TOTAL_CELLS) {
+  function spend(count = 1): void {
+    if ((gridCells += count) > MAX_TOTAL_CELLS) {
       throw new ParseError(`HTML table spans over ${MAX_TOTAL_CELLS} cells`)
     }
   }
@@ -215,21 +215,30 @@ export function fromHtml(html: string, options?: HtmlImportOptions): Sheet {
 
     const value = parseValue(decodeHtmlEntities(currentCellText).trim(), currentCellType)
 
-    // Place the value
-    pushSlot(value)
-
-    // Fill the remaining colspan slots with null. Track the actual grid
-    // column via currentRowCells.length so any cells reserved by an
-    // earlier row's rowspan (occupied) are skipped correctly — the old
-    // arithmetic drifted as nulls were pushed.
-    for (let c = 1; c < currentCellColspan; c++) {
-      while (
-        currentRowCells.length <= MAX_COL_INDEX &&
-        occupied.has(`${currentRow},${currentRowCells.length}`)
-      ) {
+    if (occupied.size === 0 && currentCellColspan > 1) {
+      // The common case has no rowspans. Account for the whole span before
+      // allocating it, then fill its null slots in one array operation.
+      // Per-slot Set lookups and string keys made wide, otherwise ordinary
+      // tables expensive enough to hit the resource test's timeout.
+      const slots = Math.min(currentCellColspan, MAX_COL_INDEX + 1 - col)
+      spend(slots)
+      currentRowCells.push(value)
+      const firstNull = currentRowCells.length
+      currentRowCells.length += slots - 1
+      currentRowCells.fill(null, firstNull)
+    } else {
+      // With rowspans, each occupied column must still be skipped as the
+      // span advances. The grid-column position can diverge from colspan.
+      pushSlot(value)
+      for (let c = 1; c < currentCellColspan; c++) {
+        while (
+          currentRowCells.length <= MAX_COL_INDEX &&
+          occupied.has(`${currentRow},${currentRowCells.length}`)
+        ) {
+          pushSlot(null)
+        }
         pushSlot(null)
       }
-      pushSlot(null)
     }
 
     // Record merge if colspan > 1 or rowspan > 1

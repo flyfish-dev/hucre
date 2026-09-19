@@ -692,6 +692,31 @@ export interface SheetImage {
   title?: string
 }
 
+/** A DrawingML color retained for browser rendering without losing theme semantics. */
+export interface SheetShapeColor {
+  rgb?: string
+  scheme?: string
+}
+
+/** Basic vector geometry, in fractions of its drawing anchor's rectangle. */
+export interface SheetShapePrimitive {
+  geometry: "rect" | "ellipse"
+  x: number
+  y: number
+  width: number
+  height: number
+  fill?: SheetShapeColor | null
+  stroke?: SheetShapeColor | null
+  /** Saved outline width at 96 DPI; zero-width hairlines remain visible. */
+  strokeWidth?: number
+}
+
+/** Read-only DrawingML vector shape or group. Pictures remain in `images`. */
+export interface SheetShape {
+  anchor: SheetImage["anchor"]
+  primitives: SheetShapePrimitive[]
+}
+
 // ── Charts (write/clone surface) ────────────────────────────────────
 //
 // The chart write/clone interfaces have been moved to
@@ -971,6 +996,8 @@ export interface Sheet {
   freezePane?: FreezePane
   splitPane?: SplitPane
   images?: SheetImage[]
+  /** Read-only basic DrawingML vectors (rectangles, ellipses and groups). */
+  shapes?: SheetShape[]
   protection?: SheetProtection
   pageSetup?: PageSetup
   headerFooter?: HeaderFooter

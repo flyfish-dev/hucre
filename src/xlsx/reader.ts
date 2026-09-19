@@ -8,6 +8,7 @@ import type {
   ReadOptions,
   ReadInput,
   SheetImage,
+  SheetShape,
   SheetTextBox,
   NamedRange,
   TableDefinition,
@@ -44,6 +45,7 @@ import { dirname, findRIdAttr, parseRelationships, resolvePath } from "./relatio
 import { parseSharedStrings } from "./shared-strings"
 import { parseStyles } from "./styles"
 import { readDrawingLayout } from "./drawing-layout"
+import { readDrawingShapePrimitives } from "./drawing-shapes"
 import { parseWorksheet, parseWorksheetStream } from "./worksheet"
 import type { WorksheetContext } from "./worksheet"
 import { parseDynamicArrayCellMetadata } from "./metadata"
@@ -540,7 +542,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
     if (info.state === "hidden") sheet.hidden = true
     if (info.state === "veryHidden") sheet.veryHidden = true
 
-    // Extract images and textboxes from drawing if present
+    // Extract pictures, basic vectors and textboxes from drawing if present.
     if (worksheetRels) {
       const drawingRel = worksheetRels.find((r) => matchesRelType(r.type, "drawing"))
       if (drawingRel) {
@@ -548,6 +550,9 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
         const drawing = await extractSheetDrawing(zip, drawingPath)
         if (drawing.images.length > 0) {
           sheet.images = drawing.images
+        }
+        if (drawing.shapes.length > 0) {
+          sheet.shapes = drawing.shapes
         }
         if (drawing.textBoxes.length > 0) {
           sheet.textBoxes = drawing.textBoxes
@@ -889,6 +894,7 @@ interface DrawingChartRef {
 
 interface DrawingExtraction {
   images: SheetImage[]
+  shapes: SheetShape[]
   textBoxes: SheetTextBox[]
   /**
    * Chart parts referenced by this drawing, paired with the cell
@@ -907,7 +913,7 @@ async function extractSheetDrawing(
   zip: ZipReader,
   drawingPath: string,
 ): Promise<DrawingExtraction> {
-  if (!zip.has(drawingPath)) return { images: [], textBoxes: [], chartRefs: [] }
+  if (!zip.has(drawingPath)) return { images: [], shapes: [], textBoxes: [], chartRefs: [] }
 
   const drawingXml = decodeUtf8(await zip.extract(drawingPath), drawingPath)
 
@@ -937,6 +943,7 @@ async function extractSheetDrawing(
   // Parse the drawing XML to find twoCellAnchor and oneCellAnchor elements with images/textboxes
   const doc = parseXml(drawingXml)
   const images: SheetImage[] = []
+  const shapes: SheetShape[] = []
   const textBoxes: SheetTextBox[] = []
   const chartRefs: DrawingChartRef[] = []
 
@@ -980,6 +987,19 @@ async function extractSheetDrawing(
         continue
       }
 
+      const primitives = readDrawingShapePrimitives(child)
+      if (primitives.length > 0) {
+        const from = findChildEl(child, "from")
+        const to = findChildEl(child, "to")
+        const anchor: SheetShape["anchor"] = {
+          ...readDrawingLayout(child),
+          from: from ? parseAnchorPosition(from) : { row: 0, col: 0 },
+        }
+        if (to) anchor.to = parseAnchorPosition(to)
+        shapes.push({ anchor, primitives })
+        continue
+      }
+
       const imageInfo = parseTwoCellAnchor(child, imageRelMap)
       if (imageInfo) {
         // Extract image data from ZIP
@@ -999,6 +1019,16 @@ async function extractSheetDrawing(
         }
       }
     } else if (local === "oneCellAnchor" || local === "absoluteAnchor") {
+      const primitives = readDrawingShapePrimitives(child)
+      if (primitives.length > 0) {
+        const from = findChildEl(child, "from")
+        const anchor: SheetShape["anchor"] = {
+          ...readDrawingLayout(child),
+          from: from ? parseAnchorPosition(from) : { row: 0, col: 0 },
+        }
+        shapes.push({ anchor, primitives })
+        continue
+      }
       const imageInfo = parseOneCellAnchor(child, imageRelMap)
       if (imageInfo) {
         const imagePath = imageInfo.mediaPath
@@ -1019,7 +1049,7 @@ async function extractSheetDrawing(
     }
   }
 
-  return { images, textBoxes, chartRefs }
+  return { images, shapes, textBoxes, chartRefs }
 }
 
 /**

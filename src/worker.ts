@@ -69,6 +69,7 @@ export interface SerializedSheet {
   autoFilter?: Sheet["autoFilter"]
   freezePane?: Sheet["freezePane"]
   images?: SerializedSheetImage[]
+  shapes?: Sheet["shapes"]
   protection?: Sheet["protection"]
   pageSetup?: Sheet["pageSetup"]
   headerFooter?: Sheet["headerFooter"]
@@ -217,6 +218,7 @@ function serializeSheet(sheet: Sheet): SerializedSheet {
   if (sheet.images) {
     out.images = sheet.images.map(serializeImage)
   }
+  if (sheet.shapes) out.shapes = sheet.shapes
 
   if (sheet.protection) out.protection = sheet.protection
   if (sheet.pageSetup) out.pageSetup = sheet.pageSetup
@@ -409,6 +411,7 @@ function deserializeSheet(ss: SerializedSheet): Sheet {
   if (ss.images) {
     sheet.images = ss.images.map(deserializeImage)
   }
+  if (ss.shapes) sheet.shapes = ss.shapes
 
   if (ss.protection) sheet.protection = ss.protection
   if (ss.pageSetup) sheet.pageSetup = ss.pageSetup

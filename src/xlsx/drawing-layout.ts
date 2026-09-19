@@ -55,7 +55,12 @@ export function readDrawingLayout(anchor: XmlElement): Layout {
   ) {
     result.editAs = editAs
   }
-  const xfrm = child(child(picture(anchor), "spPr"), "xfrm")
+  const drawing = picture(anchor) ?? child(anchor, "sp") ?? child(anchor, "grpSp")
+  const properties = child(
+    drawing,
+    (drawing?.local || drawing?.tag) === "grpSp" ? "grpSpPr" : "spPr",
+  )
+  const xfrm = child(properties, "xfrm")
   const ext = kind === "twoCell" ? child(xfrm, "ext") : child(anchor, "ext")
   const size = pair(ext, "cx", "cy")
   if (size && size[0] >= 0 && size[1] >= 0) result.extent = { cx: size[0], cy: size[1] }

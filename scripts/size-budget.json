@@ -4,8 +4,8 @@
     "gzip": 4038
   },
   "readXlsx (hucre/xlsx)": {
-    "min": 138926,
-    "gzip": 39085
+    "min": 147634,
+    "gzip": 42150
   },
   "read+write xlsx (hucre/xlsx)": {
     "min": 271860,

@@ -7,7 +7,14 @@ import { read, readObjects } from "../src/defter"
 import { isOle2Container } from "../src/_input"
 import { DecryptionError, EncryptedFileError } from "../src/errors"
 import { readCfb, writeCfb } from "../src/xlsx/crypto/cfb"
+import { CfbReader } from "../src/xls/cfb"
 import { decryptAgile, encryptAgile } from "../src/xlsx/crypto/agile"
+import {
+  decryptOfficeEncryptedPackage,
+  encryptOfficeAgilePackage,
+  encryptOfficeAgilePackageParts,
+  isOfficeEncryptedPackage,
+} from "../src/crypto/office-crypto"
 import type { CellValue } from "../src/_types"
 
 const FAST = { spinCount: 64 }
@@ -66,6 +73,59 @@ describe("agile crypto primitive", () => {
     const payload = new TextEncoder().encode("z".repeat(9000))
     const enc = await encryptAgile(payload, "pw") // default 100000
     expect([...(await decryptAgile(enc, "pw"))]).toEqual([...payload])
+  })
+})
+
+describe("shared Office Agile package", () => {
+  const payload = Uint8Array.from({ length: 8_197 }, (_, index) => index % 251)
+
+  for (const [keyBits, hashAlgorithm] of [
+    [128, "SHA-1"],
+    [192, "SHA-256"],
+    [256, "SHA-384"],
+    [256, "SHA-512"],
+  ] as const) {
+    it(`round-trips multiple encrypted segments with AES-${keyBits} and ${hashAlgorithm}`, async () => {
+      const encrypted = await encryptOfficeAgilePackage(payload, {
+        password: "secret",
+        spinCount: 8,
+        keyBits,
+        hashAlgorithm,
+      })
+      expect(isOfficeEncryptedPackage(encrypted)).toBe(true)
+      expect(new CfbReader(encrypted).getStream("EncryptedPackage")?.length).toBe(
+        8 + 4_096 * 2 + 16,
+      )
+      expect(await decryptOfficeEncryptedPackage(encrypted, "secret", "xlsb")).toEqual(payload)
+      await expect(
+        decryptOfficeEncryptedPackage(encrypted, "wrong", "xlsb"),
+      ).rejects.toBeInstanceOf(EncryptedFileError)
+    })
+  }
+
+  it("keeps the two encrypted streams available to CFB package writers", async () => {
+    const parts = await encryptOfficeAgilePackageParts(payload.subarray(0, 39), {
+      password: "secret",
+      spinCount: 8,
+    })
+    const container = writeCfb([
+      { name: "EncryptionInfo", data: parts.encryptionInfo },
+      { name: "EncryptedPackage", data: parts.encryptedPackage },
+    ])
+    expect(await decryptOfficeEncryptedPackage(container, "secret", "xls")).toEqual(
+      payload.subarray(0, 39),
+    )
+    await expect(decryptOfficeEncryptedPackage(container, undefined, "xls")).rejects.toBeInstanceOf(
+      EncryptedFileError,
+    )
+  })
+
+  it("does not mistake arbitrary CFB content for an encrypted workbook", () => {
+    expect(isOfficeEncryptedPackage(new Uint8Array(8))).toBe(false)
+    expect(
+      isOfficeEncryptedPackage(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])),
+    ).toBe(false)
+    expect(isOfficeEncryptedPackage(writeCfb([{ name: "Workbook", data: payload }]))).toBe(false)
   })
 })
 

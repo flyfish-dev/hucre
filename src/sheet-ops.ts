@@ -222,16 +222,17 @@ export function insertRows(sheet: Sheet, rowIndex: number, count: number): void 
     sheet.autoFilter.range = shiftRangeRows(sheet.autoFilter.range, rowIndex, count)
   }
 
-  // Update image anchors
-  if (sheet.images) {
-    for (const img of sheet.images) {
-      if (img.anchor.from.row >= rowIndex) {
-        img.anchor.from.row += count
+  // Pictures and vector drawings share the same cell-marker behavior.
+  for (const drawings of [sheet.images, sheet.shapes]) {
+    if (drawings)
+      for (const drawing of drawings) {
+        if (drawing.anchor.from.row >= rowIndex) {
+          drawing.anchor.from.row += count
+        }
+        if (drawing.anchor.to && drawing.anchor.to.row >= rowIndex) {
+          drawing.anchor.to.row += count
+        }
       }
-      if (img.anchor.to && img.anchor.to.row >= rowIndex) {
-        img.anchor.to.row += count
-      }
-    }
   }
 
   // Update row defs
@@ -371,20 +372,25 @@ export function deleteRows(sheet: Sheet, rowIndex: number, count: number): void 
     }
   }
 
-  // Update image anchors
-  if (sheet.images) {
-    sheet.images = sheet.images.filter((img) => {
-      // Remove images whose anchor starts in deleted range
-      return !(img.anchor.from.row >= rowIndex && img.anchor.from.row < deleteEnd)
-    })
-    for (const img of sheet.images) {
-      if (img.anchor.from.row >= deleteEnd) {
-        img.anchor.from.row -= count
+  // A drawing whose first marker is removed leaves the sheet.
+  if (sheet.images)
+    sheet.images = sheet.images.filter(
+      (item) => !(item.anchor.from.row >= rowIndex && item.anchor.from.row < deleteEnd),
+    )
+  if (sheet.shapes)
+    sheet.shapes = sheet.shapes.filter(
+      (item) => !(item.anchor.from.row >= rowIndex && item.anchor.from.row < deleteEnd),
+    )
+  for (const drawings of [sheet.images, sheet.shapes]) {
+    if (drawings)
+      for (const drawing of drawings) {
+        if (drawing.anchor.from.row >= deleteEnd) {
+          drawing.anchor.from.row -= count
+        }
+        if (drawing.anchor.to && drawing.anchor.to.row >= deleteEnd) {
+          drawing.anchor.to.row -= count
+        }
       }
-      if (img.anchor.to && img.anchor.to.row >= deleteEnd) {
-        img.anchor.to.row -= count
-      }
-    }
   }
 
   // Update row defs
@@ -518,16 +524,17 @@ export function insertColumns(sheet: Sheet, colIndex: number, count: number): vo
     sheet.autoFilter.range = shiftRangeCols(sheet.autoFilter.range, colIndex, count)
   }
 
-  // Update image anchors
-  if (sheet.images) {
-    for (const img of sheet.images) {
-      if (img.anchor.from.col >= colIndex) {
-        img.anchor.from.col += count
+  // Pictures and vector drawings share the same cell-marker behavior.
+  for (const drawings of [sheet.images, sheet.shapes]) {
+    if (drawings)
+      for (const drawing of drawings) {
+        if (drawing.anchor.from.col >= colIndex) {
+          drawing.anchor.from.col += count
+        }
+        if (drawing.anchor.to && drawing.anchor.to.col >= colIndex) {
+          drawing.anchor.to.col += count
+        }
       }
-      if (img.anchor.to && img.anchor.to.col >= colIndex) {
-        img.anchor.to.col += count
-      }
-    }
   }
 
   // Update table ranges
@@ -654,19 +661,25 @@ export function deleteColumns(sheet: Sheet, colIndex: number, count: number): vo
     }
   }
 
-  // Update image anchors
-  if (sheet.images) {
-    sheet.images = sheet.images.filter((img) => {
-      return !(img.anchor.from.col >= colIndex && img.anchor.from.col < deleteEnd)
-    })
-    for (const img of sheet.images) {
-      if (img.anchor.from.col >= deleteEnd) {
-        img.anchor.from.col -= count
+  // A drawing whose first marker is removed leaves the sheet.
+  if (sheet.images)
+    sheet.images = sheet.images.filter(
+      (item) => !(item.anchor.from.col >= colIndex && item.anchor.from.col < deleteEnd),
+    )
+  if (sheet.shapes)
+    sheet.shapes = sheet.shapes.filter(
+      (item) => !(item.anchor.from.col >= colIndex && item.anchor.from.col < deleteEnd),
+    )
+  for (const drawings of [sheet.images, sheet.shapes]) {
+    if (drawings)
+      for (const drawing of drawings) {
+        if (drawing.anchor.from.col >= deleteEnd) {
+          drawing.anchor.from.col -= count
+        }
+        if (drawing.anchor.to && drawing.anchor.to.col >= deleteEnd) {
+          drawing.anchor.to.col -= count
+        }
       }
-      if (img.anchor.to && img.anchor.to.col >= deleteEnd) {
-        img.anchor.to.col -= count
-      }
-    }
   }
 
   // Update table ranges
@@ -1025,6 +1038,23 @@ export function cloneSheet(sheet: Sheet, newName: string): Sheet {
       if (img.anchor.position) copy.anchor.position = { ...img.anchor.position }
       return copy
     })
+  }
+
+  if (sheet.shapes) {
+    cloned.shapes = sheet.shapes.map((shape) => ({
+      anchor: {
+        ...shape.anchor,
+        from: { ...shape.anchor.from },
+        ...(shape.anchor.to ? { to: { ...shape.anchor.to } } : {}),
+        ...(shape.anchor.extent ? { extent: { ...shape.anchor.extent } } : {}),
+        ...(shape.anchor.position ? { position: { ...shape.anchor.position } } : {}),
+      },
+      primitives: shape.primitives.map((item) => ({
+        ...item,
+        ...(item.fill ? { fill: { ...item.fill } } : {}),
+        ...(item.stroke ? { stroke: { ...item.stroke } } : {}),
+      })),
+    }))
   }
 
   // Copy protection

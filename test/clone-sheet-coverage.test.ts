@@ -71,6 +71,14 @@ const FULL_SHEET: Required<Sheet> = {
   freezePane: { rows: 1, columns: 1 },
   splitPane: { xSplit: 2000, ySplit: 1000 },
   images: [{ data: PNG, type: "png", anchor: { from: { row: 0, col: 0 } }, altText: "logo" }],
+  shapes: [
+    {
+      anchor: { from: { row: 0, col: 1 }, to: { row: 1, col: 2 } },
+      primitives: [
+        { geometry: "ellipse", x: 0, y: 0, width: 1, height: 1, fill: { rgb: "FFFFFF" } },
+      ],
+    },
+  ],
   protection: { sheet: true, password: "pw", selectLockedCells: false },
   pageSetup: { orientation: "landscape", margins: { top: 1 }, printArea: "A1:B2" },
   headerFooter: { oddHeader: "&LLeft", oddFooter: "&P" },

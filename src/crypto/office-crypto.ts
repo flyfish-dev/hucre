@@ -570,17 +570,28 @@ async function aesCbcDecrypt(
   }
 
   const subtle = cryptoSubtle()
+  if (data.length === 0 || data.length % 16 !== 0) {
+    throw new ParseError("Invalid Agile AES-CBC ciphertext length.")
+  }
   const key = await subtle.importKey(
     "raw",
     keyBytes as unknown as BufferSource,
     { name: "AES-CBC" },
     false,
-    ["decrypt"],
+    ["encrypt", "decrypt"],
+  )
+  // Web Crypto always removes PKCS#7 padding, while Office stores raw CBC
+  // blocks. Append one valid padding block using the last ciphertext block
+  // as its IV so the original blocks decrypt unchanged.
+  const padding = await subtle.encrypt(
+    { name: "AES-CBC", iv: data.subarray(data.length - 16) as unknown as BufferSource },
+    key,
+    new Uint8Array(0),
   )
   const out = await subtle.decrypt(
     { name: "AES-CBC", iv: iv as unknown as BufferSource },
     key,
-    data as unknown as BufferSource,
+    concat([data, new Uint8Array(padding)]) as unknown as BufferSource,
   )
   return new Uint8Array(out)
 }
@@ -611,12 +622,15 @@ async function aesCbcEncrypt(
     false,
     ["encrypt"],
   )
+  const padded = data.length % 16 === 0 ? data : padOrTruncate(data, align(data.length, 16))
   const out = await subtle.encrypt(
     { name: "AES-CBC", iv: iv as unknown as BufferSource },
     key,
-    data as unknown as BufferSource,
+    padded as unknown as BufferSource,
   )
-  return new Uint8Array(out)
+  // Web Crypto adds a PKCS#7 block even when the input is already aligned.
+  // Office records the raw CBC blocks only, with its own final-block fill.
+  return new Uint8Array(out).subarray(0, padded.length)
 }
 
 async function nodeCrypto(): Promise<null | {

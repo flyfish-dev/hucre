@@ -46,6 +46,7 @@ const SHEET_DROPS: Record<string, string> = {
   slicers: NO_AUTHORING_API,
   timelines: NO_AUTHORING_API,
   threadedComments: NO_AUTHORING_API,
+  shapes: NO_AUTHORING_API,
   charts:
     "the read model (`Chart`) and the write model (`SheetChart`) are different types, and only 7 of the 16 readable kinds can be authored. Convert with `cloneChart` if you need them.",
   pivotTables:
@@ -121,6 +122,7 @@ export function toWriteSheet(sheet: Sheet, onDrop?: (drop: WriteModelDrop) => vo
     slicers: _slicers,
     timelines: _timelines,
     threadedComments: _threadedComments,
+    shapes: _shapes,
     charts: _charts,
     pivotTables: _pivotTables,
     // `Sheet.cells` is `Map<string, Cell>` and `WriteSheet.cells` is
