@@ -10,6 +10,7 @@
     "import",
     "ods",
     "parse",
+    "read",
     "spreadsheet",
     "tree-shakeable",
     "typescript",
@@ -29,9 +30,7 @@
     "type": "git",
     "url": "git+https://github.com/productdevbook/hucre.git"
   },
-  "funding": {
-    "url": "https://github.com/sponsors/productdevbook"
-  },
+  "funding": "https://github.com/sponsors/productdevbook",
   "bin": {
     "hucre": "./dist/cli.mjs"
   },
