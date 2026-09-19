@@ -10,7 +10,6 @@
     "import",
     "ods",
     "parse",
-    "read",
     "spreadsheet",
     "tree-shakeable",
     "typescript",
@@ -30,7 +29,9 @@
     "type": "git",
     "url": "git+https://github.com/productdevbook/hucre.git"
   },
-  "funding": "https://github.com/sponsors/productdevbook",
+  "funding": {
+    "url": "https://github.com/sponsors/productdevbook"
+  },
   "bin": {
     "hucre": "./dist/cli.mjs"
   },
@@ -95,6 +96,7 @@
     "test": "pnpm lint && pnpm typecheck && vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.cli.json",
     "release": "pnpm test && pnpm build && bumpp --commit --tag --push --all",
+    "prepare": "npm run build",
     "prepack": "pnpm build"
   },
   "devDependencies": {
