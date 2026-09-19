@@ -34,13 +34,11 @@ jobs:
         run: npm run typecheck
       - name: Full library regression suite
         run: node_modules/.bin/vitest run
-      - name: Preserve exact build and tests for integration verification
-        if: always()
+      - name: Preserve successful source and build for integration verification
         run: |
           git rev-parse HEAD > integration-revision.txt
           tar -czf drawing-layout-runtime.tar.gz src dist scripts docs test package.json build.config.ts tsconfig.json tsconfig.cli.json integration-revision.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
         with:
           name: drawing-layout-runtime
           path: drawing-layout-runtime.tar.gz

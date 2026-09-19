@@ -49,7 +49,10 @@ export function readDrawingLayout(anchor: XmlElement): Layout {
   else return {}
   const result: Layout = { kind }
   const editAs = anchor.attrs["editAs"]
-  if (kind === "twoCell" && (editAs === "oneCell" || editAs === "absolute" || editAs === "twoCell")) {
+  if (
+    kind === "twoCell" &&
+    (editAs === "oneCell" || editAs === "absolute" || editAs === "twoCell")
+  ) {
     result.editAs = editAs
   }
   const xfrm = child(child(picture(anchor), "spPr"), "xfrm")
