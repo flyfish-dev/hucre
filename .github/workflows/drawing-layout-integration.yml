@@ -1,0 +1,49 @@
+name: Drawing layout integration
+on:
+  push:
+    branches: [feature/drawing-layout-contract]
+permissions:
+  contents: write
+jobs:
+  integrate:
+    if: github.repository == 'flyfish-dev/hucre'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/drawing-layout-contract
+          fetch-depth: 2
+      - name: Apply reviewed source delta to this feature branch only
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if test -f scripts/.drawing-layout-source.patch; then
+            git apply --check scripts/.drawing-layout-source.patch
+            git apply --index scripts/.drawing-layout-source.patch
+            git rm scripts/.drawing-layout-source.patch
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m 'fix: preserve exact DrawingML placement and Normal font references'
+            git push origin HEAD:refs/heads/feature/drawing-layout-contract
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install build dependencies without changing the lockfile
+        run: npm install --ignore-scripts --package-lock=false
+      - name: Check public parser and writer contract
+        run: npm run test:drawing-layout
+      - name: Type check
+        run: npm run typecheck
+      - name: Collect exact source and built runtime for integration checks
+        if: always()
+        run: |
+          git rev-parse HEAD > integration-revision.txt
+          tar -czf drawing-layout-runtime.tar.gz src dist scripts docs package.json build.config.ts tsconfig.json tsconfig.cli.json integration-revision.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drawing-layout-runtime
+          path: drawing-layout-runtime.tar.gz
+          retention-days: 3
