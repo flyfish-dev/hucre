@@ -7,6 +7,7 @@ import {
   parseCellImages,
   assembleCellImages,
   REL_CELL_IMAGES,
+  isCellImagesRelationship,
 } from "../src/xlsx/cell-images-reader"
 import { writeContentTypes } from "../src/xlsx/content-types-writer"
 import { writeWorkbookRels } from "../src/xlsx/workbook-writer"
@@ -90,6 +91,8 @@ const SAMPLE_CELL_IMAGES_RELS = `<?xml version="1.0" encoding="UTF-8" standalone
 async function buildXlsxWithCellImages(opts?: {
   /** Override the second image bytes — used to verify dedupe doesn't merge. */
   secondPng?: Uint8Array
+  relationshipType?: string
+  targetMode?: string
 }): Promise<Uint8Array> {
   const z = new ZipWriter()
 
@@ -129,7 +132,7 @@ async function buildXlsxWithCellImages(opts?: {
     encoder.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-  <Relationship Id="rId2" Type="${REL_CELL_IMAGES}" Target="cellimages.xml"/>
+  <Relationship Id="rId2" Type="${opts?.relationshipType ?? REL_CELL_IMAGES}" Target="cellimages.xml"${opts?.targetMode ? ` TargetMode="${opts.targetMode}"` : ""}/>
 </Relationships>`),
   )
 
@@ -256,6 +259,36 @@ describe("assembleCellImages", () => {
 // ── readXlsx integration ────────────────────────────────────────────
 
 describe("readXlsx — cellimages integration", () => {
+  // 独立构造两种 WPS 关系，不依赖真实客户文件或图片 ID。
+  for (const relationshipType of [
+    REL_CELL_IMAGES,
+    "http://www.wps.cn/officeDocument/2020/cellImage",
+  ]) {
+    it(`resolves images and cell anchors for ${relationshipType}`, async () => {
+      const wb = await readXlsx(await buildXlsxWithCellImages({ relationshipType }))
+      expect(wb.cellImages).toHaveLength(2)
+      expect(wb.sheets[0].cells?.get("0,0")?.imageId).toBe("ID_FIRST")
+      expect(wb.cellImages?.[0].data).toEqual(fakePng(1))
+    })
+  }
+
+  it("does not treat external or unrelated image registries as package parts", async () => {
+    expect(isCellImagesRelationship("https://example.test/cellImage")).toBe(false)
+    const wb = await readXlsx(await buildXlsxWithCellImages({ targetMode: "External" }))
+    expect(wb.cellImages).toBeUndefined()
+    expect(wb.sheets[0].cells?.get("0,0")?.imageId).toBeUndefined()
+  })
+
+  it("keeps WPS 2020 image references after a read/edit/save cycle", async () => {
+    const input = await buildXlsxWithCellImages({
+      relationshipType: "http://www.wps.cn/officeDocument/2020/cellImage",
+    })
+    const opened = await openXlsx(input)
+    const reread = await readXlsx(await saveXlsx(opened))
+    expect(reread.cellImages).toHaveLength(2)
+    expect(reread.sheets[0].cells?.get("0,0")?.imageId).toBe("ID_FIRST")
+  })
+
   it("attaches workbook.cellImages with binaries and types resolved", async () => {
     const buf = await buildXlsxWithCellImages()
     const wb = await readXlsx(buf)

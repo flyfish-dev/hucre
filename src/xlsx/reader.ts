@@ -29,7 +29,7 @@ import {
   assembleCellImages,
   parseCellImages,
   parseDispImageId,
-  REL_CELL_IMAGES,
+  isCellImagesRelationship,
 } from "./cell-images-reader"
 import { parseExcelRichValueImages } from "./rich-value-images-reader"
 import { attachPivotCacheFields, parsePivotCacheDefinition, parsePivotTable } from "./pivot-reader"
@@ -290,7 +290,9 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
   // formulas. Real-world XLSX files produced by WPS / Kingsoft Office
   // routinely carry this part and recent Excel versions round-trip it.
   let cellImages: CellImage[] | undefined
-  const cellImagesRel = workbookRels.find((r) => r.type === REL_CELL_IMAGES)
+  const cellImagesRel = workbookRels.find(
+    (r) => isCellImagesRelationship(r.type) && r.targetMode !== "External",
+  )
   if (cellImagesRel) {
     const cellImagesPath = resolvePath(workbookDir, cellImagesRel.target)
     if (zip.has(cellImagesPath)) {
@@ -305,7 +307,7 @@ export async function readXlsx(input: ReadInput, options?: ReadOptions): Promise
       if (zip.has(ciRelsPath)) {
         const ciRelsXml = decodeUtf8(await zip.extract(ciRelsPath), ciRelsPath)
         for (const rel of parseRelationships(ciRelsXml)) {
-          if (!matchesRelType(rel.type, "image")) continue
+          if (!matchesRelType(rel.type, "image") || rel.targetMode === "External") continue
           const mediaPath = resolvePath(ciDir, rel.target)
           if (!zip.has(mediaPath)) continue
           const ext = mediaPath.split(".").pop()?.toLowerCase() ?? ""

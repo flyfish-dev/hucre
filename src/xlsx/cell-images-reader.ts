@@ -24,6 +24,14 @@ import { childElements, findChild } from "../xml/tree"
 /** Relationship type that points from `workbook.xml.rels` at `cellimages.xml`. */
 export const REL_CELL_IMAGES = "http://www.wps.cn/officeDocument/2017/relationships/cellimage"
 
+/**
+ * WPS 的两个已知版本使用不同的关系 URI，但均指向同一种单元格图片部件。
+ * 只接受明确的关系类型，不按文件名或任意 /cellImage 后缀猜测，避免误读外部关系。
+ */
+export function isCellImagesRelationship(type: string): boolean {
+  return type === REL_CELL_IMAGES || type === "http://www.wps.cn/officeDocument/2020/cellImage"
+}
+
 /** A single entry parsed from `xl/cellimages.xml` minus the binary. */
 export interface ParsedCellImageRef {
   /** DISPIMG id — value of the `name` attribute on `xdr:cNvPr`. */
