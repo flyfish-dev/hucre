@@ -163,6 +163,7 @@ export async function writeXlsx(options: WriteOptions): Promise<WriteOutput> {
         sheet.textBoxes,
         sheet.charts,
         globalChartIndex,
+        sheet,
       )
       drawingResults.push(result)
       drawingIndices.push(i + 1) // 1-based drawing index matches sheet index

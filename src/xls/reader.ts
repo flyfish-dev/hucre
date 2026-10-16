@@ -28,6 +28,7 @@ import { readInputToUint8Array } from "../_input"
 import { readCfb } from "../xlsx/crypto/cfb"
 import { isBuiltinDateFormatId, isDateFormat, serialToDate } from "../_date"
 import { DEFAULT_INDEXED_PALETTE } from "../xlsx/indexed-palette"
+import { readXlsPicturePool, readXlsSheetImages } from "./drawings"
 import { BUILTIN_NUM_FMTS } from "../xlsx/styles"
 import {
   decodeRk,
@@ -203,6 +204,7 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
 
   // ── Sheet substreams ──
   const sheets: Sheet[] = []
+  const picturePool = biffVersion === 0x0600 ? readXlsPicturePool(records, gi) : []
   for (const bs of boundSheets) {
     const startIdx = offsetToIndex.get(bs.pos)
     if (startIdx === undefined) {
@@ -225,6 +227,10 @@ function parseWorkbookRecords(stream: Uint8Array, options?: ReadOptions): Workbo
         bs.veryHidden,
       ),
     )
+    if (picturePool.length) {
+      const images = readXlsSheetImages(records, startIdx, picturePool)
+      if (images.length) sheets[sheets.length - 1]!.images = images
+    }
   }
 
   // Some minimal BIFF5/7 producers omit BOUNDSHEET for an otherwise valid,

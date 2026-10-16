@@ -711,17 +711,20 @@ No writer exists for either. What the readers surface is narrower than
 XLSX, which matters because converting to XLSX can only carry what was
 read:
 
-|                                                 | XLS (BIFF8) | XLSB |
-| ----------------------------------------------- | ----------- | ---- |
-| Sheet names, strings, numbers, booleans, errors | yes         | yes  |
-| Dates, honouring the file's 1900/1904 flag      | yes         | yes  |
-| Formula **values** (never the formula text)     | yes         | yes  |
-| Merges                                          | yes         | yes  |
-| Everything else on `Sheet` / `Workbook`         | no          | no   |
+|                                                       | XLS (BIFF8) | XLSB |
+| ----------------------------------------------------- | ----------- | ---- |
+| Sheet names, strings, numbers, booleans, errors       | yes         | yes  |
+| Dates, honouring the file's 1900/1904 flag            | yes         | yes  |
+| Formula **values** (never the formula text)           | yes         | yes  |
+| Merges                                                | yes         | yes  |
+| OfficeArt embedded PNG/JPEG pictures and cell anchors | yes         | no   |
 
-So **XLS/XLSB → XLSX is a values-and-names conversion**. Every formula
-becomes a hard-coded value, styles and dimensions are dropped, hidden
-sheets become visible, and workbook properties and named ranges are lost.
+XLS/XLSB → XLSX carries only the properties read into the model, not every
+Office record. Formula text is not reconstructed. The BIFF8 image reader
+retains relative cell offsets and fixed/moving/resizable policies; the XLSX
+writer normalizes these offsets to EMUs. Unsupported BIFF8 image records
+keep their picture-pool slots so later pictures cannot acquire the wrong
+bitmap. This path does not decode WMF/EMF/DIB, groups or linked pictures.
 
 BIFF5 and BIFF7 are rejected outright rather than misread — only BIFF8
 (Excel 97-2003) is supported.

@@ -3,7 +3,12 @@
 // for embedding images, text boxes, and native charts in XLSX
 // worksheets.
 
-import type { SheetChart, SheetImage, SheetTextBox } from "../_types"
+import type { Sheet, SheetChart, SheetImage, SheetTextBox } from "../_types"
+
+type DrawingSheetGeometry = Pick<
+  Sheet,
+  "columns" | "rowDefs" | "sheetFormat" | "defaultColWidth" | "defaultRowHeight"
+>
 import { xmlDocument, xmlElement, xmlSelfClose, xmlEscape } from "../xml/writer"
 
 // ── Namespaces ───────────────────────────────────────────────────────
@@ -95,13 +100,18 @@ export function writeDrawing(
   textBoxes?: SheetTextBox[],
   charts?: SheetChart[],
   chartStartIndex: number = 1,
+  sourceSheet?: DrawingSheetGeometry,
 ): DrawingResult {
   const drawingImages: DrawingImage[] = []
   const relElements: string[] = []
   const anchorElements: string[] = []
 
   for (let i = 0; i < images.length; i++) {
-    const img = images[i]
+    const original = images[i]
+    const img =
+      original.anchor.offsetUnit === "biff8"
+        ? { ...original, anchor: biffAnchorToEmu(original.anchor, sourceSheet) }
+        : original
     const imageIndex = imageStartIndex + i
     const rId = `rId${i + 1}`
     const ext = IMAGE_EXTENSIONS[img.type] ?? "png"
@@ -423,6 +433,57 @@ export function writeDrawing(
     drawingRels,
     images: drawingImages,
     charts: chartList,
+  }
+}
+
+/** XLS → XLSX 写入时明确切换坐标单位；读取/预览仍保留原始相对偏移。 */
+function biffAnchorToEmu(
+  anchor: SheetImage["anchor"],
+  sheet?: DrawingSheetGeometry,
+): SheetImage["anchor"] {
+  if (!sheet) throw new Error("Writing a BIFF image requires its source worksheet geometry")
+  const columnSize = (index: number): number => {
+    const width =
+      sheet.columns?.[index]?.width ??
+      sheet.sheetFormat?.defaultColWidth ??
+      sheet.defaultColWidth ??
+      8.43
+    return Math.max(0, Math.floor(((256 * width + Math.floor(128 / 7)) / 256) * 7)) * EMU_PER_PIXEL
+  }
+  const defaultHeight = sheet.sheetFormat?.defaultRowHeight ?? sheet.defaultRowHeight ?? 15
+  const point = (value: SheetImage["anchor"]["from"]): SheetImage["anchor"]["from"] => {
+    const row = sheet.rowDefs?.get(value.row)
+    const height = row?.height ?? defaultHeight
+    return {
+      row: value.row,
+      col: value.col,
+      colOff: Math.round(((value.colOff ?? 0) / 1024) * columnSize(value.col)),
+      rowOff: Math.round(((value.rowOff ?? 0) / 256) * height * 12700),
+    }
+  }
+  const from = point(anchor.from),
+    to = anchor.to ? point(anchor.to) : undefined
+  const origin = (value: SheetImage["anchor"]["from"]): { x: number; y: number } => {
+    let x = value.colOff ?? 0,
+      y = value.row * defaultHeight * 12700 + (value.rowOff ?? 0)
+    // XLS 最多 256 列；稀疏行高只遍历保存的覆盖项，不按百万行展开坐标数组。
+    for (let column = 0; column < value.col; column++) x += columnSize(column)
+    for (const [row, definition] of sheet.rowDefs ?? [])
+      if (row < value.row && definition.height != null)
+        y += (definition.height - defaultHeight) * 12700
+    return { x, y }
+  }
+  const first = origin(from),
+    last = to ? origin(to) : undefined
+  return {
+    ...anchor,
+    offsetUnit: "emu",
+    from,
+    ...(to ? { to } : {}),
+    ...(last
+      ? { extent: { cx: Math.max(0, last.x - first.x), cy: Math.max(0, last.y - first.y) } }
+      : {}),
+    ...(anchor.editAs === "absolute" ? { position: first } : {}),
   }
 }
 

@@ -668,6 +668,8 @@ export interface SheetImage {
   type: "png" | "jpeg" | "gif" | "svg" | "webp"
   /** Anchor to cell */
   anchor: {
+    /** XLS 原生偏移：列宽的 1/1024、行高的 1/256；未声明时沿用 DrawingML EMU。 */
+    offsetUnit?: "emu" | "biff8"
     /** Original DrawingML container. Omitted by legacy caller-created models. */
     kind?: "twoCell" | "oneCell" | "absolute"
     /** Resizing behavior of a two-cell container; does not discard its markers. */

@@ -715,12 +715,17 @@ Decodes the shared-string table (with CONTINUE spanning), RK / MULRK /
 number / boolean / error cells, labels, cached formula values, dates, and
 merged cells. Read-only.
 
-Both legacy readers surface sheet names, cell values, and merges — and
-nothing else. Formulas arrive as their **cached value**, never as formula
-text; styles, column widths, row heights, sheet visibility, named ranges
-and workbook properties are not read. Converting `.xls` / `.xlsb` to
-`.xlsx` through hucre is therefore a values-and-sheet-names conversion,
-not a faithful copy.
+BIFF8 embedded PNG/JPEG drawings are available in `sheet.images`. Repeated
+uses share the picture bytes, while each instance retains its own cell
+anchors, signed offsets and movement/resizing policy. `anchor.offsetUnit`
+is `"biff8"`: column offsets are fractions of 1/1024 of the owning column
+and row offsets are fractions of 1/256 of the owning row. DrawingML anchors
+continue to use EMUs. WMF, EMF, DIB, grouped drawings and linked pictures
+are not decoded by this BIFF8 image path.
+
+The legacy readers do not preserve every Office feature. Formulas arrive
+as cached values rather than formula text; conversion to XLSX carries only
+the modelled properties and is not a full-fidelity copy of the original.
 
 ### ODS (OpenDocument)
 

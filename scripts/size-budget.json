@@ -13,7 +13,7 @@
   },
   "everything (hucre)": {
     "min": 505600,
-    "gzip": 144358
+    "gzip": 147456
   },
   "writeXlsx (hucre)": {
     "min": 137825,
